@@ -44,6 +44,13 @@ pub(crate) struct RawEvidenceList {
     pub(crate) count: usize,
 }
 
+/// 和 C++ 的 `Backlinks` 布局相同。
+#[repr(C)]
+pub(crate) struct RawBacklinks {
+    pub(crate) dependents: *const RawNodeList,
+    pub(crate) related_by: *const RawNodeList,
+}
+
 /// 和 C++ 的 `Node` 布局相同，正好占一条缓存行。
 #[repr(C, align(64))]
 pub(crate) struct RawNode {
@@ -52,7 +59,7 @@ pub(crate) struct RawNode {
     pub(crate) title: *const u8,
     pub(crate) description: *const u8,
     pub(crate) evidence: *const RawEvidenceList,
-    pub(crate) dependents: *const RawNodeList,
+    pub(crate) backlinks: *const RawBacklinks,
     pub(crate) id_len: u32,
     pub(crate) title_len: u32,
     pub(crate) description_len: u32,
@@ -69,7 +76,7 @@ pub(crate) struct RawLayout {
     pub(crate) node_title: usize,
     pub(crate) node_description: usize,
     pub(crate) node_evidence: usize,
-    pub(crate) node_dependents: usize,
+    pub(crate) node_backlinks: usize,
     pub(crate) node_id_len: usize,
     pub(crate) node_title_len: usize,
     pub(crate) node_description_len: usize,
@@ -82,6 +89,9 @@ pub(crate) struct RawLayout {
     pub(crate) evidence_node: usize,
     pub(crate) evidence_start: usize,
     pub(crate) evidence_end: usize,
+    pub(crate) backlinks_size: usize,
+    pub(crate) backlinks_dependents: usize,
+    pub(crate) backlinks_related_by: usize,
 }
 
 unsafe extern "C" {
@@ -96,6 +106,7 @@ unsafe extern "C" {
         evidence_count: usize,
         related_capacity: usize,
         dependents_capacity: usize,
+        related_by_capacity: usize,
     ) -> *mut RawNode;
     pub(crate) fn mw_node_set_related(
         node: *mut RawNode,
@@ -110,6 +121,11 @@ unsafe extern "C" {
     pub(crate) fn mw_node_set_dependents(
         node: *mut RawNode,
         dependents: *const *mut RawNode,
+        count: usize,
+    );
+    pub(crate) fn mw_node_set_related_by(
+        node: *mut RawNode,
+        related_by: *const *mut RawNode,
         count: usize,
     );
     pub(crate) fn mw_node_free(node: *mut RawNode);
@@ -132,7 +148,7 @@ mod tests {
             node_title: offset_of!(RawNode, title),
             node_description: offset_of!(RawNode, description),
             node_evidence: offset_of!(RawNode, evidence),
-            node_dependents: offset_of!(RawNode, dependents),
+            node_backlinks: offset_of!(RawNode, backlinks),
             node_id_len: offset_of!(RawNode, id_len),
             node_title_len: offset_of!(RawNode, title_len),
             node_description_len: offset_of!(RawNode, description_len),
@@ -145,6 +161,9 @@ mod tests {
             evidence_node: offset_of!(RawEvidence, node),
             evidence_start: offset_of!(RawEvidence, start),
             evidence_end: offset_of!(RawEvidence, end),
+            backlinks_size: size_of::<RawBacklinks>(),
+            backlinks_dependents: offset_of!(RawBacklinks, dependents),
+            backlinks_related_by: offset_of!(RawBacklinks, related_by),
         };
 
         assert_eq!(unsafe { mw_layout() }, expected);

@@ -92,7 +92,12 @@ impl<'m> NodeRef<'m> {
 
     /// 证据里引用了这个节点的节点。修改这个节点时，它们需要复查。
     pub fn dependents(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
-        node_list(self.raw().dependents)
+        node_list(unsafe { (*self.raw().backlinks).dependents })
+    }
+
+    /// `related` 里有这个节点的节点。删除这个节点时要清理它们。
+    pub fn related_by(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
+        node_list(unsafe { (*self.raw().backlinks).related_by })
     }
 
     /// 这条知识依据的节点，直接沿地址到达。
@@ -245,8 +250,8 @@ impl Memory {
         }
         let ParsedKnowledge { catalog, nodes } = parsed;
 
-        // 被依赖关系从证据反推，创建节点时就要知道数量。
-        let dependents = dependents_by_id(&nodes);
+        // 反向关系从证据和关联反推，创建节点时就要知道数量。
+        let backlinks = ReverseLinks::new(&nodes);
 
         // 先放进结构体：中途失败时由 Drop 释放已创建的节点。
         let mut memory = Self {
@@ -255,8 +260,11 @@ impl Memory {
         };
         // 先创建所有节点，再连接它们，这样节点之间可以直接存地址。
         for node in &nodes {
-            let count = dependents.get(node.id.as_str()).map_or(0, Vec::len);
-            let raw = new_node(node, count)?;
+            let raw = new_node(
+                node,
+                reverse_ids(&backlinks.dependents, &node.id).len(),
+                reverse_ids(&backlinks.related_by, &node.id).len(),
+            )?;
             memory.index.insert(node.id.clone(), raw);
         }
 
@@ -276,10 +284,14 @@ impl Memory {
             }
 
             addresses.clear();
-            if let Some(ids) = dependents.get(node.id.as_str()) {
-                addresses.extend(ids.iter().map(|id| memory.index[*id].as_ptr()));
-            }
+            let dependents = reverse_ids(&backlinks.dependents, &node.id);
+            addresses.extend(dependents.iter().map(|id| memory.index[*id].as_ptr()));
             unsafe { ffi::mw_node_set_dependents(raw, addresses.as_ptr(), addresses.len()) };
+
+            addresses.clear();
+            let related_by = reverse_ids(&backlinks.related_by, &node.id);
+            addresses.extend(related_by.iter().map(|id| memory.index[*id].as_ptr()));
+            unsafe { ffi::mw_node_set_related_by(raw, addresses.as_ptr(), addresses.len()) };
         }
         Ok(memory)
     }
@@ -381,26 +393,57 @@ impl Memory {
     }
 }
 
-/// 反推每个节点被哪些节点依赖。一个节点多次引用同一个依据时只算一次。
-fn dependents_by_id(nodes: &[Node]) -> HashMap<&str, Vec<&str>> {
-    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-    for node in nodes {
-        let mut seen = HashSet::new();
-        for evidence in &node.evidence {
-            if let Evidence::Node { id } = evidence
-                && seen.insert(id.as_str())
-            {
-                dependents
-                    .entry(id.as_str())
-                    .or_default()
-                    .push(node.id.as_str());
-            }
-        }
-    }
-    dependents
+/// 从证据和关联反推的反向关系：节点地址到指向它的节点。
+struct ReverseLinks<'a> {
+    dependents: HashMap<&'a str, Vec<&'a str>>,
+    related_by: HashMap<&'a str, Vec<&'a str>>,
 }
 
-fn new_node(node: &Node, dependents_count: usize) -> Result<NonNull<RawNode>, Error> {
+impl<'a> ReverseLinks<'a> {
+    fn new(nodes: &'a [Node]) -> Self {
+        let mut links = Self {
+            dependents: HashMap::new(),
+            related_by: HashMap::new(),
+        };
+        for node in nodes {
+            let based_on = node.evidence.iter().filter_map(|evidence| match evidence {
+                Evidence::Node { id } => Some(id.as_str()),
+                Evidence::Source { .. } => None,
+            });
+            add_reverse(&mut links.dependents, &node.id, based_on);
+            add_reverse(
+                &mut links.related_by,
+                &node.id,
+                node.related.iter().map(String::as_str),
+            );
+        }
+        links
+    }
+}
+
+/// 记录 `from` 指向 `targets`。同一个节点多次指向同一个目标时只算一次。
+fn add_reverse<'a>(
+    reverse: &mut HashMap<&'a str, Vec<&'a str>>,
+    from: &'a str,
+    targets: impl Iterator<Item = &'a str>,
+) {
+    let mut seen = HashSet::new();
+    for target in targets {
+        if seen.insert(target) {
+            reverse.entry(target).or_default().push(from);
+        }
+    }
+}
+
+fn reverse_ids<'r, 'a>(reverse: &'r HashMap<&'a str, Vec<&'a str>>, id: &str) -> &'r [&'a str] {
+    reverse.get(id).map_or(&[], Vec::as_slice)
+}
+
+fn new_node(
+    node: &Node,
+    dependents_count: usize,
+    related_by_count: usize,
+) -> Result<NonNull<RawNode>, Error> {
     let mut evidence = Vec::with_capacity(node.evidence.len());
     for entry in &node.evidence {
         let (kind, id, start, end) = match entry {
@@ -428,6 +471,7 @@ fn new_node(node: &Node, dependents_count: usize) -> Result<NonNull<RawNode>, Er
             evidence.len(),
             node.related.len(),
             dependents_count,
+            related_by_count,
         )
     };
     NonNull::new(raw).ok_or(Error::OutOfMemory)
@@ -1164,7 +1208,54 @@ mod tests {
     }
 
     #[test]
-    fn dependents_are_not_part_of_the_stored_node() {
+    fn related_by_is_the_reverse_of_related() {
+        let memory = build(
+            &["a"],
+            vec![
+                node("a", &["b", "c"]),
+                // 重复关联同一个节点只算一次。
+                node("b", &["c", "c"]),
+                node("c", &["a"]),
+            ],
+        )
+        .unwrap();
+
+        let ids = |id| -> Vec<String> {
+            memory
+                .node(id)
+                .unwrap()
+                .related_by()
+                .map(|node| node.id().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("a"), ["c"]);
+        assert_eq!(ids("b"), ["a"]);
+        assert_eq!(ids("c"), ["a", "b"]);
+    }
+
+    #[test]
+    fn related_and_derivation_are_tracked_separately() {
+        // b 既和 a 相关，又依据 a；c 只和 a 相关；d 只依据 a。
+        let mut b = based_on("b", &["a"]);
+        b.related = vec!["a".into()];
+        let mut c = node("c", &["a"]);
+        c.related = vec!["a".into()];
+        let memory = build(
+            &["a", "b", "c", "d"],
+            vec![node("a", &[]), b, c, based_on("d", &["a"])],
+        )
+        .unwrap();
+
+        let a = memory.node("a").unwrap();
+
+        let related_by: Vec<&str> = a.related_by().map(NodeRef::id).collect();
+        let dependents: Vec<&str> = a.dependents().map(NodeRef::id).collect();
+        assert_eq!(related_by, ["b", "c"]);
+        assert_eq!(dependents, ["b", "d"]);
+    }
+
+    #[test]
+    fn backlinks_are_not_part_of_the_stored_node() {
         let original = based_on("结论", &["依据"]);
         let memory = build(&["依据", "结论"], vec![node("依据", &[]), original.clone()]).unwrap();
 
