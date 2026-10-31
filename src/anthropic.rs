@@ -33,8 +33,14 @@ struct Failure {
 }
 
 impl AnthropicModel {
-    /// 创建客户端，并向 Models API 查询该模型的上下文上限。
-    pub fn connect(base_url: &str, api_key: &str, model: &str) -> Result<Self, Error> {
+    /// 创建客户端。未指定 `context_limit` 时向 Models API 查询；
+    /// 不提供该接口的兼容服务需要显式指定。
+    pub fn connect(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        context_limit: Option<usize>,
+    ) -> Result<Self, Error> {
         // 状态码自行处理，才能读到错误响应里的说明。
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -47,7 +53,10 @@ impl AnthropicModel {
             model: model.to_owned(),
             context_limit: 0,
         };
-        this.context_limit = this.fetch_context_limit()?;
+        this.context_limit = match context_limit {
+            Some(limit) => limit,
+            None => this.fetch_context_limit()?,
+        };
         Ok(this)
     }
 
@@ -109,11 +118,6 @@ impl Model for AnthropicModel {
     }
 
     fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
-        #[derive(Deserialize)]
-        struct Choice {
-            ids: Vec<NodeId>,
-        }
-
         let body = json!({
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
@@ -134,7 +138,7 @@ impl Model for AnthropicModel {
                 },
             },
         });
-        let text = with_retries(|| {
+        with_retries(|| {
             let response = self
                 .post("/v1/messages")
                 .header("anthropic-beta", FALLBACK_BETA)
@@ -143,10 +147,8 @@ impl Model for AnthropicModel {
             if !response.status().is_success() {
                 return Err(status_failure(response));
             }
-            read_stream(response.into_body().into_reader())
-        })?;
-        let choice: Choice = parse_json(&text)?;
-        Ok(choice.ids)
+            parse_choice(&read_stream(response.into_body().into_reader())?)
+        })
     }
 }
 
@@ -257,6 +259,28 @@ fn read_stream(reader: impl Read) -> Result<String, Failure> {
             retryable: true,
         }),
     }
+}
+
+/// 解析模型的选择结果。部分兼容服务会忽略输出格式约束，所以容忍代码块包裹，
+/// 其他格式问题交给重试。
+fn parse_choice(text: &str) -> Result<Vec<NodeId>, Failure> {
+    #[derive(Deserialize)]
+    struct Choice {
+        ids: Vec<NodeId>,
+    }
+
+    let text = text.trim();
+    let body = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .unwrap_or(text);
+    serde_json::from_str::<Choice>(body)
+        .map(|choice| choice.ids)
+        .map_err(|e| Failure {
+            message: format!("无法解析模型的选择结果：{e}"),
+            retryable: true,
+        })
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, Error> {
@@ -393,7 +417,7 @@ mod tests {
             user: "用户".into(),
         };
 
-        let model = AnthropicModel::connect(&url, "key", "m").unwrap();
+        let model = AnthropicModel::connect(&url, "key", "m", None).unwrap();
         assert_eq!(model.context_limit(), 1000);
         assert_eq!(model.count_tokens(&prompt).unwrap(), 42);
         assert_eq!(model.choose(&prompt).unwrap(), ["a", "b"]);
@@ -434,9 +458,48 @@ mod tests {
             (200, json!({ "max_input_tokens": 7 }).to_string()),
         ]);
 
-        let model = AnthropicModel::connect(&url, "key", "m").unwrap();
+        let model = AnthropicModel::connect(&url, "key", "m", None).unwrap();
 
         assert_eq!(model.context_limit(), 7);
+    }
+
+    #[test]
+    fn explicit_context_limit_skips_the_models_api() {
+        // 没有可连接的服务器：只要发出请求就会失败。
+        let model = AnthropicModel::connect("http://127.0.0.1:1", "key", "m", Some(9)).unwrap();
+
+        assert_eq!(model.context_limit(), 9);
+    }
+
+    #[test]
+    fn parse_choice_accepts_plain_and_fenced_json() {
+        for text in [
+            r#"{"ids":["a"]}"#,
+            "  {\"ids\":[\"a\"]}\n",
+            "```json\n{\"ids\":[\"a\"]}\n```",
+            "```\n{\"ids\":[\"a\"]}\n```",
+        ] {
+            assert_eq!(parse_choice(text).ok().unwrap(), ["a"], "{text}");
+        }
+        assert!(parse_choice("a").err().unwrap().retryable);
+    }
+
+    #[test]
+    fn retries_when_the_model_ignores_the_output_format() {
+        let (url, _requests) = serve(vec![
+            (200, sse(&[text_delta("a"), stop("end_turn")])),
+            (
+                200,
+                sse(&[text_delta(r#"{"ids":["a"]}"#), stop("end_turn")]),
+            ),
+        ]);
+        let model = AnthropicModel::connect(&url, "key", "m", Some(100)).unwrap();
+        let prompt = Prompt {
+            system: "系统",
+            user: "用户".into(),
+        };
+
+        assert_eq!(model.choose(&prompt).unwrap(), ["a"]);
     }
 
     #[test]
@@ -446,7 +509,9 @@ mod tests {
             json!({ "error": { "message": "密钥无效" } }).to_string(),
         )]);
 
-        let err = AnthropicModel::connect(&url, "key", "m").err().unwrap();
+        let err = AnthropicModel::connect(&url, "key", "m", None)
+            .err()
+            .unwrap();
 
         let message = err.to_string();
         assert!(

@@ -11,7 +11,10 @@ const USAGE: &str = "\
 环境变量：
   ANTHROPIC_API_KEY   必填
   ANTHROPIC_BASE_URL  可选，默认 https://api.anthropic.com
-  MEMWEAVE_MODEL      可选，默认 claude-opus-5-5";
+  MEMWEAVE_MODEL      可选，默认 claude-opus-5-5
+  MEMWEAVE_CONTEXT_LIMIT
+                      可选，模型的输入 token 上限；默认从 Models API 查询，
+                      服务不提供该接口时必填";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -42,8 +45,24 @@ fn run(kb: &str, query: &str) -> Result<String, String> {
     let base_url = env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
     let model_name = env::var("MEMWEAVE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
 
+    let context_limit = match env::var("MEMWEAVE_CONTEXT_LIMIT") {
+        Ok(value) => Some(
+            value
+                .parse()
+                .map_err(|_| format!("MEMWEAVE_CONTEXT_LIMIT 不是有效的数字：{value}"))?,
+        ),
+        Err(_) => None,
+    };
+
     let model =
-        AnthropicModel::connect(&base_url, &api_key, &model_name).map_err(|e| e.to_string())?;
+        AnthropicModel::connect(&base_url, &api_key, &model_name, context_limit).map_err(|e| {
+            match context_limit {
+                Some(_) => e.to_string(),
+                None => {
+                    format!("无法查询模型的上下文上限，可设置 MEMWEAVE_CONTEXT_LIMIT 指定：{e}")
+                }
+            }
+        })?;
     let tree = retrieve(&FsStore::new(kb), &model, query).map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())
 }

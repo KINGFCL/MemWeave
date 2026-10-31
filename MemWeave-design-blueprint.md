@@ -110,13 +110,29 @@ src/
 
 ## 7. 模型接入
 
-默认使用 Claude API 和 `claude-opus-5-5`，可以用环境变量更换模型：
+默认使用 Claude API 和 `claude-opus-5-5`，可以用环境变量更换模型或改用 Anthropic 兼容服务：
 
-- 上下文上限：启动时从 `GET /v1/models/{id}` 的 `max_input_tokens` 读取。
+- 上下文上限：优先取 `MEMWEAVE_CONTEXT_LIMIT`，否则启动时从 `GET /v1/models/{id}` 的 `max_input_tokens` 读取。
 - token 计数：`POST /v1/messages/count_tokens`。计数请求不包含输出格式定义，这部分很小，可以忽略。
-- 选择结果：`POST /v1/messages`，流式读取，用 JSON Schema 约束输出为 `{"ids": [...]}`，推理强度为 `high`。
+- 选择结果：`POST /v1/messages`，流式读取，用 JSON Schema 约束输出为 `{"ids": [...]}`，推理强度为 `high`。部分兼容服务会忽略这个约束，所以提示词里也要求只输出 JSON。
 - 拒绝处理：开启服务端回退（`fallbacks: "default"`），模型拒绝时由 API 换模型重试；最终仍被拒绝则报错。
-- 重试：连接错误、408、409、429、5xx 和流中断最多重试 2 次。其余错误直接报错。
+- 重试：连接错误、408、409、429、5xx、流中断和选择结果无法解析时最多重试 2 次。其余错误直接报错。
+
+### 用 DeepSeek 验证
+
+DeepSeek 的 Anthropic 兼容地址不提供 Models API，需要指定上下文上限：
+
+```bash
+export ANTHROPIC_API_KEY=...
+export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+export MEMWEAVE_MODEL=deepseek-flash
+export MEMWEAVE_CONTEXT_LIMIT=100000
+cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
+```
+
+这里的 `100000` 只是验证用的取值，不代表模型的真实上限。
+
+它的计数接口可用，但会忽略 `output_config.format` 和 `fallbacks`，也就是没有输出格式保证和服务端回退。
 
 ## 8. 命令行
 
@@ -127,7 +143,7 @@ cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据�
 
 结果以 JSON 输出到标准输出，包含 `query`、`roots`（知识树）和 `rejected`（读过但被丢弃的节点）。树上每个节点包含完整内容、`children` 和 `references`。
 
-可选环境变量：`ANTHROPIC_BASE_URL`、`MEMWEAVE_MODEL`。
+可选环境变量：`ANTHROPIC_BASE_URL`、`MEMWEAVE_MODEL`、`MEMWEAVE_CONTEXT_LIMIT`。
 
 ## 9. 暂不实现
 
