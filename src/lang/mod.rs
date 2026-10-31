@@ -14,6 +14,7 @@ pub mod parser;
 
 use crate::memory::Memory;
 use crate::source::SourceStore;
+use crate::timeline;
 use diagnostic::{Diagnostic, render};
 use journal::Journal;
 
@@ -26,14 +27,15 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const SPEC: &str = r####"用下面的语言操作记忆。每条语句占一行，# 开头是注释。节点用文本地址引用。
 
 读取：
-catalog show                             查看总表：每个领域的名字、描述和代表节点
+catalog show                             查看工作板、最近行为和总表：每个领域的名字、描述和代表节点
 show 节点, 节点                           查看节点的全部内容：标题、描述、所有关系和证据原文
 links 节点 [depth N] [limit N] [offset N] 沿关联往外看，默认 depth 1，limit 50。没看完时用 offset 接着看
 evidence 节点, 节点                       沿依据一路追到原文：依据节点的标题和描述，以及所有原文
-based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
-related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
+based_by 节点, 节点                       只列出基于这个节点推导的节点，删除节点前用它查依赖
+related_by 节点, 节点                     只列出关联了这个节点的节点，可以用来反向探索
 full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
 check                                    列出从总表走不到的节点和没有代表的板块
+timeline [limit N] [offset N] [node 节点] 时间线，从新到旧。node 只看这个节点的历史
 
 修改：
 add 节点                                  新增由别的节点推出的知识
@@ -71,6 +73,21 @@ cite 节点 source sha256:... 起始..结束     让节点引用已有原文的�
 uncite 节点 source sha256:... 起始..结束   去掉节点对这段原文的引用，地址和范围抄 show 的输出
 export "路径"                             把当前记忆导出成新的知识库目录，只带节点引用到的原文
 
+工作板：
+goal create 目标 "标题"                    新建目标，一次写完步骤，第一步自动开始
+  desc """为什么要做、做到什么算完成"""
+  step "步骤"
+  step "步骤"
+end
+step done 目标 编号                        完成这一步，下一步自动开始
+step start 目标 编号                       切到这一步，原来进行中的回到未开始
+step block 目标 编号 """卡在哪里"""
+step add 目标 "步骤" [after 编号]
+step remove 目标 编号
+goal done 目标 """结果"""                  结束目标，所有步骤都要完成
+goal drop 目标 """为什么放弃"""
+log """做了什么"""                         记下记忆之外的行为，比如跑了测试
+
 规则：
 - add 必须有 title、desc、based_on。
 - source 必须有 title、desc，至少一段原文。要记下对话或工具结果里的新内容，就用它。
@@ -107,6 +124,8 @@ pub struct Session<'a> {
     mode: Mode,
     journal: Option<&'a Journal>,
     output_limit: usize,
+    /// 固定的时间，测试用。没有时取当前时间。
+    fixed_time: Option<Option<u64>>,
 }
 
 impl<'a> Session<'a> {
@@ -117,6 +136,7 @@ impl<'a> Session<'a> {
             mode,
             journal: None,
             output_limit: MAX_OUTPUT_BYTES,
+            fixed_time: None,
         }
     }
 
@@ -129,6 +149,12 @@ impl<'a> Session<'a> {
     /// 设置输出的上限，默认是 256 KiB。工具调用的结果比命令行的输出更容易超过客户端的限制。
     pub fn with_output_limit(mut self, bytes: usize) -> Self {
         self.output_limit = bytes;
+        self
+    }
+
+    /// 用固定的时间代替当前时间。
+    pub fn with_time(mut self, at: Option<u64>) -> Self {
+        self.fixed_time = Some(at);
         self
     }
 
@@ -172,10 +198,12 @@ impl<'a> Session<'a> {
             };
         }
 
+        let at = self.fixed_time.unwrap_or_else(timeline::now);
+
         // 先落盘再执行：执行到一半崩溃时，重启后重放能恢复。
         if let Some(journal) = self.journal
             && statements.iter().any(|s| s.statement.writes())
-            && let Err(error) = journal.append(script)
+            && let Err(error) = journal.append(script, at)
         {
             return Output {
                 ok: false,
@@ -183,7 +211,7 @@ impl<'a> Session<'a> {
             };
         }
 
-        match exec::execute(&statements, self.memory, self.sources) {
+        match exec::execute(&statements, self.memory, self.sources, at) {
             Ok(report) if report.failures == 0 => Output {
                 ok: true,
                 text: limit_report(&report, &statements, self.output_limit),
@@ -214,7 +242,7 @@ impl Session<'_> {
     /// 重放日志里的一段脚本，只执行其中的写语句。
     ///
     /// 读语句对恢复记忆没有作用，还可能因为来源损坏而失败，不能让它们妨碍知识库加载。
-    pub fn replay(&mut self, script: &str) -> Output {
+    pub fn replay(&mut self, script: &str, at: Option<u64>) -> Output {
         let (tokens, mut errors) = lexer::tokenize(script);
         let (mut statements, parse_errors) = parser::parse(tokens);
         errors.extend(parse_errors);
@@ -235,7 +263,7 @@ impl Session<'_> {
                 text: error.to_string(),
             };
         }
-        match exec::execute(&statements, self.memory, self.sources) {
+        match exec::execute(&statements, self.memory, self.sources, at) {
             Ok(report) => Output {
                 ok: true,
                 text: report.text,

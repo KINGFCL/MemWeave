@@ -2,7 +2,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use super::journal::Journal;
+use super::journal::{Journal, load_current};
 use super::*;
 use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, Section};
 use crate::parse::ParsedKnowledge;
@@ -10,6 +10,8 @@ use crate::source::in_memory::InMemorySources;
 use crate::source::source_id;
 
 const TEXT: &str = "一段原文，用来当证据。";
+/// 2026-10-31T11:52Z。
+const FIXED_TIME: u64 = 1_793_447_520;
 
 fn sources() -> InMemorySources {
     let mut sources = InMemorySources::new();
@@ -41,6 +43,7 @@ fn memory() -> Memory {
         id: "ownership".into(),
     }];
     let catalog = Catalog {
+        goals: Vec::new(),
         sections: vec![Section {
             name: "Rust".into(),
             description: String::new(),
@@ -90,7 +93,9 @@ fn fails(memory: &mut Memory, script: &str, code: &str) -> String {
 }
 
 /// 记忆的全部内容，用来确认它有没有变。
-fn snapshot(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
+type Snapshot = (Vec<Node>, Vec<String>, Catalog, Vec<crate::timeline::Event>);
+
+fn snapshot(memory: &Memory) -> Snapshot {
     let mut nodes: Vec<Node> = memory.nodes().map(|n| n.to_node()).collect();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let mut backlinks: Vec<String> = memory
@@ -102,7 +107,12 @@ fn snapshot(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
         })
         .collect();
     backlinks.sort();
-    (nodes, backlinks, memory.catalog().clone())
+    (
+        nodes,
+        backlinks,
+        memory.catalog().clone(),
+        memory.timeline().to_vec(),
+    )
 }
 
 fn add_script(id: &str) -> String {
@@ -745,7 +755,17 @@ fn random_statement(random: &mut Random, source: &str) -> String {
     let a = IDS[random.next() % IDS.len()];
     let b = IDS[random.next() % IDS.len()];
     let c = IDS[random.next() % IDS.len()];
-    match random.next() % 25 {
+    match random.next() % 35 {
+        25 => format!("goal create {a} \"标题\"\n desc \"描述\"\n step \"一\"\n step \"二\"\nend"),
+        26 => format!("goal done {a} \"结果\""),
+        27 => format!("goal drop {a} \"原因\""),
+        28 => format!("step add {a} \"新步骤\" after {}", 1 + random.next() % 3),
+        29 => format!("step done {a} {}", 1 + random.next() % 3),
+        30 => format!("step start {a} {}", 1 + random.next() % 3),
+        31 => format!("step block {a} {} \"卡住\"", 1 + random.next() % 3),
+        32 => format!("step remove {a} {}", 1 + random.next() % 3),
+        33 => format!("log \"做了{b}\""),
+        34 => "timeline limit 3".to_owned(),
         20 => format!("cite {a} text \"\"\"原文{b}\"\"\""),
         21 => format!("cite {a} source {source} 0..3"),
         22 => format!("cite {a} source {source} 3..6"),
@@ -1010,7 +1030,9 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
                 script.push('\n');
             }
 
-            let output = Session::new(&mut live, &store, Mode::ReadWrite).run(&script);
+            let output = Session::new(&mut live, &store, Mode::ReadWrite)
+                .with_time(Some(FIXED_TIME))
+                .run(&script);
 
             assert!(!output.text.contains("E900"), "{script}\n{}", output.text);
             if output.ok {
@@ -1024,7 +1046,8 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
 
         let mut restarted = memory();
         for script in &scripts {
-            let output = Session::new(&mut restarted, &store, Mode::ReadWrite).replay(script);
+            let output = Session::new(&mut restarted, &store, Mode::ReadWrite)
+                .replay(script, Some(FIXED_TIME));
             assert!(output.ok, "{script}\n{}", output.text);
         }
         assert_eq!(snapshot(&restarted), snapshot(&live));
@@ -1625,7 +1648,7 @@ fn catalog_changes_are_replayed() {
 }
 
 /// 比较两份记忆。反向列表的顺序由加载顺序决定，这里只比内容。
-fn same_content(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
+fn same_content(memory: &Memory) -> Snapshot {
     let mut nodes: Vec<Node> = memory.nodes().map(|n| n.to_node()).collect();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let mut backlinks: Vec<String> = memory
@@ -1639,12 +1662,17 @@ fn same_content(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
         })
         .collect();
     backlinks.sort();
-    (nodes, backlinks, memory.catalog().clone())
+    (
+        nodes,
+        backlinks,
+        memory.catalog().clone(),
+        memory.timeline().to_vec(),
+    )
 }
 
 fn load_exported(target: &std::path::Path) -> Memory {
     let sources = crate::source::file::FileSources::new(target);
-    Memory::load(&crate::parse::json::JsonParser, &sources, target).unwrap()
+    load_current(&crate::parse::json::JsonParser, &sources, target).unwrap()
 }
 
 fn export_to(target: &std::path::Path) -> String {
@@ -1941,10 +1969,9 @@ fn load_current_includes_the_journal() {
         crate::lang::journal::load_current(&crate::parse::json::JsonParser, &exported, &target)
             .unwrap();
     assert_eq!(loaded.node("ownership").unwrap().title(), "新标题");
-    assert_eq!(
-        load_exported(&target).node("ownership").unwrap().title(),
-        "所有权"
-    );
+    // 只读快照，看不到日志里的修改。
+    let snapshot_only = Memory::load(&crate::parse::json::JsonParser, &exported, &target).unwrap();
+    assert_eq!(snapshot_only.node("ownership").unwrap().title(), "所有权");
 }
 
 fn demo_path() -> &'static std::path::Path {
@@ -2039,6 +2066,7 @@ fn pages_reach_edges_beyond_the_largest_limit() {
     let mut nodes = vec![node("hub", &related)];
     nodes.extend(targets.iter().map(|id| node(id, &[])));
     let catalog = Catalog {
+        goals: Vec::new(),
         sections: vec![Section {
             name: "大".into(),
             description: String::new(),
@@ -2544,6 +2572,16 @@ fn show_and_evidence_accept_several_nodes() {
     );
     assert_eq!(together, apart);
     assert!(together.ok, "{}", together.text);
+    let together = read(
+        &mut memory,
+        "based_by entry, ownership\nrelated_by entry, ownership",
+    );
+    let apart = read(
+        &mut memory,
+        "based_by entry\nbased_by ownership\nrelated_by entry\nrelated_by ownership",
+    );
+    assert_eq!(together, apart);
+    assert!(together.ok, "{}", together.text);
 
     let text = fails(&mut memory, "show entry, ghost", "E201");
     assert!(text.contains("第 1 行第 13 列"), "{text}");
@@ -2643,6 +2681,299 @@ fn the_failure_summary_survives_truncation() {
     assert!(!output.ok);
     assert!(
         output.text.ends_with("其余语句都已执行。"),
+        "{}",
+        output.text
+    );
+}
+
+const GOAL: &str =
+    "goal create publish \"发布\"\n desc \"发布新版本\"\n step \"跑回归\"\n step \"升版本\"\nend";
+
+#[test]
+fn the_board_shows_progress_and_survives_a_restart() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&format!("{GOAL}\nstep done publish 1\ncatalog show"));
+
+    assert!(output.ok, "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains("created goal publish\n当前第 1 步：跑回归"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("done step 1\n当前第 2 步：升版本"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("工作板\ngoal publish \"发布\"\n  desc: \"发布新版本\"\n  [x] 1 \"跑回归\"\n  [>] 2 \"升版本\"\n最近行为\n"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("总表\nsection \"Rust\""),
+        "{}",
+        output.text
+    );
+
+    // 重启后接着做。
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    let output = Session::new(&mut restarted, &store, Mode::ReadWrite)
+        .run("step done publish 2\ngoal done publish \"\"\"发布成功\"\"\"\ncatalog show");
+    assert!(output.ok, "{}", output.text);
+    assert!(
+        output.text.contains("学到了以后用得上的东西"),
+        "{}",
+        output.text
+    );
+    assert!(!output.text.contains("工作板"), "{}", output.text);
+    assert!(
+        output.text.contains("goal done publish：发布成功"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn board_statements_are_checked_like_a_compiler() {
+    let mut memory = memory();
+
+    fails(&mut memory, "goal", "E102");
+    let text = fails(&mut memory, "goal crate g \"t\"", "E101");
+    assert!(text.contains("你是不是想写 goal create？"), "{text}");
+    fails(&mut memory, "goal create g \"t\"\n desc \"d\"", "E103");
+    fails(&mut memory, "goal create g \"t\"\n note \"x\"\nend", "E104");
+    fails(
+        &mut memory,
+        "goal create g \"t\"\n desc \"d\"\n desc \"e\"\nend",
+        "E105",
+    );
+    fails(&mut memory, "goal create g \"t\"\nend", "E206");
+    fails(&mut memory, "goal done 没有 \"r\"", "E218");
+    fails(&mut memory, "step done 没有 1", "E218");
+    fails(&mut memory, "step", "E102");
+    let text = fails(&mut memory, "step finish g 1", "E101");
+    assert!(text.contains("可用的操作"), "{text}");
+    fails(&mut memory, "step done g", "E102");
+    fails(&mut memory, "log", "E102");
+    fails(&mut memory, "log \"  \"", "E206");
+    fails(&mut memory, "timeline limit 0", "E109");
+    fails(&mut memory, "timeline node", "E102");
+
+    ok(&mut memory, GOAL);
+    fails(&mut memory, GOAL, "E219");
+    let text = fails(&mut memory, "step done publish 9", "E220");
+    assert!(text.contains("现有的步骤：1、2"), "{text}");
+    let text = fails(&mut memory, "goal done publish \"r\"", "E221");
+    assert!(text.contains("没完成的步骤：1、2"), "{text}");
+    fails(&mut memory, "step start publish 1", "E222");
+
+    // 检查能看到前面语句的结果。
+    ok(
+        &mut memory,
+        "step done publish 1\nstep done publish 2\ngoal done publish \"r\"",
+    );
+    fails(&mut memory, "step done publish 1", "E218");
+    ok(
+        &mut memory,
+        &format!("{GOAL}\ngoal drop publish \"r\"\n{GOAL}\ngoal drop publish \"r\""),
+    );
+    // 只读会话不能改工作板，但可以看时间线。
+    let output = read(&mut memory, "log \"x\"\nstep done publish 1\ntimeline");
+    assert!(output.text.contains("共 2 个错误"), "{}", output.text);
+    assert!(read(&mut memory, "timeline").ok);
+}
+
+#[test]
+fn the_timeline_records_what_happened_and_when() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let run = |memory: &mut Memory, script: &str, at: u64| {
+        let output = Session::new(memory, &store, Mode::ReadWrite)
+            .with_time(Some(at))
+            .run(script);
+        assert!(output.ok, "{}", output.text);
+        output.text
+    };
+
+    let text = run(&mut memory, "timeline", 0);
+    assert!(text.contains("时间线上没有记录"), "{text}");
+
+    run(
+        &mut memory,
+        "set ownership desc \"新\"\nshow ownership",
+        FIXED_TIME,
+    );
+    run(&mut memory, "log \"\"\"跑了回归\"\"\"", FIXED_TIME + 60);
+    run(&mut memory, "link borrowing -> entry", FIXED_TIME + 120);
+    // 读语句和失败的脚本不记。
+    run(
+        &mut memory,
+        "show entry\ncheck\ncatalog show",
+        FIXED_TIME + 180,
+    );
+    let before = memory.timeline().len();
+    let output = Session::new(&mut memory, &store, Mode::ReadWrite).run("link ghost -> entry");
+    assert!(!output.ok);
+    assert_eq!(memory.timeline().len(), before);
+
+    let text = run(&mut memory, "timeline", 0);
+    assert_eq!(
+        text,
+        "2026-10-31T11:54Z link borrowing -> entry\n2026-10-31T11:53Z log 跑了回归\n2026-10-31T11:52Z set ownership desc\n"
+    );
+    let text = run(&mut memory, "timeline limit 1", 0);
+    assert!(
+        text.contains("共 3 条，这里是第 1–1 条，下一段用 offset 1"),
+        "{text}"
+    );
+    assert!(text.contains("link borrowing"), "{text}");
+    let text = run(&mut memory, "timeline limit 2 offset 1", 0);
+    assert!(text.contains("这里是第 2–3 条，后面没有了"), "{text}");
+    let text = run(&mut memory, "timeline offset 9", 0);
+    assert!(text.contains("已经超过末尾"), "{text}");
+    let text = run(&mut memory, "timeline node ownership", 0);
+    assert_eq!(text, "2026-10-31T11:52Z set ownership desc\n");
+
+    // 总表里只放最近几条，长内容截短。
+    for index in 0..7 {
+        run(
+            &mut memory,
+            &format!("log \"{index}{}\"", "长".repeat(100)),
+            FIXED_TIME + 300,
+        );
+    }
+    let text = run(&mut memory, "catalog show", 0);
+    assert_eq!(text.matches("2026-10-31T11:57Z log").count(), 5, "{text}");
+    assert!(text.contains("…"), "{text}");
+    assert!(!text.contains("跑了回归"), "{text}");
+}
+
+#[test]
+fn nodes_show_when_they_were_created_and_updated() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let run = |memory: &mut Memory, script: &str, at: u64| {
+        let output = Session::new(memory, &store, Mode::ReadWrite)
+            .with_time(Some(at))
+            .run(script);
+        assert!(output.ok, "{}", output.text);
+        output.text
+    };
+
+    let text = run(&mut memory, "show ownership", 0);
+    assert!(
+        text.contains("  created: 未知\n  updated: 未知\n"),
+        "{text}"
+    );
+
+    run(&mut memory, &format!("{}\n", add_script("新")), FIXED_TIME);
+    run(&mut memory, "set 新 desc \"改\"", FIXED_TIME + 60);
+    let text = run(&mut memory, "show 新", 0);
+    assert!(
+        text.contains("  created: 2026-10-31T11:52Z\n  updated: 2026-10-31T11:53Z\n"),
+        "{text}"
+    );
+    // 被 related_by 改动的节点也算更新。
+    let text = run(&mut memory, "show entry", 0);
+    assert!(
+        text.contains("  created: 未知\n  updated: 2026-10-31T11:52Z\n"),
+        "{text}"
+    );
+    // 删除后重建，时间重新算；删除的历史还在。
+    run(&mut memory, "remove 新", FIXED_TIME + 120);
+    run(&mut memory, &add_script("新"), FIXED_TIME + 180);
+    let text = run(&mut memory, "show 新", 0);
+    assert!(text.contains("  created: 2026-10-31T11:55Z"), "{text}");
+    let text = run(&mut memory, "timeline node 新", 0);
+    assert_eq!(text.lines().count(), 4, "{text}");
+}
+
+#[test]
+fn old_journals_without_times_still_load() {
+    let (dir, store) = file_store();
+    fs::write(
+        dir.path().join("journal.jsonl"),
+        "{\"script\":\"set entry title \\\"旧\\\"\"}\n",
+    )
+    .unwrap();
+    let mut memory = memory();
+
+    Journal::new(dir.path())
+        .replay(&mut memory, &store)
+        .unwrap();
+
+    assert_eq!(memory.node("entry").unwrap().title(), "旧");
+    assert_eq!(memory.timeline()[0].at, None);
+    let output = read(&mut memory, "timeline");
+    assert!(
+        output.text.contains("未知 set entry title"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn times_come_from_the_journal_not_the_clock() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .with_time(Some(FIXED_TIME))
+        .run("log \"很早以前\"");
+    assert!(output.ok, "{}", output.text);
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+
+    assert_eq!(restarted.timeline()[0].at, Some(FIXED_TIME));
+}
+
+#[test]
+fn export_carries_the_board_and_timeline() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+    let script = format!(
+        "{GOAL}\nstep done publish 1\nset entry desc \"新\"\n{}",
+        export_to(&target)
+    );
+
+    let output = Session::new(&mut memory, &store, Mode::ReadWrite)
+        .with_time(Some(FIXED_TIME))
+        .run(&script);
+
+    assert!(output.ok, "{}", output.text);
+    let exported = load_exported(&target);
+    assert_eq!(exported.catalog().goals, memory.catalog().goals);
+    assert_eq!(exported.timeline(), memory.timeline());
+    assert_eq!(exported.node_times("entry").updated, Some(FIXED_TIME));
+}
+
+#[test]
+fn referring_to_a_node_created_later_says_so() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let script = format!(
+        "source 乙\n title \"t\"\n desc \"d\"\n text \"原文乙\"\n related 甲\n related_by entry\nend\n{}",
+        add_script("甲")
+    );
+
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.text.contains("error[E201]"), "{}", output.text);
+    assert!(
+        output.text.contains("甲 在这段脚本后面才新建"),
         "{}",
         output.text
     );

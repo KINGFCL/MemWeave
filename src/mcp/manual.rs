@@ -3,13 +3,14 @@
 use crate::lang::SPEC;
 
 /// 主题和对应的内容。`language` 的语法部分直接来自 [`SPEC`]。
-pub const TOPICS: [&str; 6] = [
-    "overview", "recall", "write", "repair", "language", "errors",
+pub const TOPICS: [&str; 7] = [
+    "overview", "recall", "write", "work", "repair", "language", "errors",
 ];
 
 const OVERVIEW: &str = include_str!("manual/overview.md");
 const RECALL: &str = include_str!("manual/recall.md");
 const WRITE: &str = include_str!("manual/write.md");
+const WORK: &str = include_str!("manual/work.md");
 const REPAIR: &str = include_str!("manual/repair.md");
 const LANGUAGE: &str = include_str!("manual/language.md");
 const ERRORS: &str = include_str!("manual/errors.md");
@@ -20,6 +21,7 @@ pub fn topic(name: &str) -> Option<String> {
         "overview" => Some(OVERVIEW.to_owned()),
         "recall" => Some(RECALL.to_owned()),
         "write" => Some(WRITE.to_owned()),
+        "work" => Some(WORK.to_owned()),
         "repair" => Some(REPAIR.to_owned()),
         "language" => Some(format!("# 语言参考\n\n{SPEC}\n{LANGUAGE}")),
         "errors" => Some(ERRORS.to_owned()),
@@ -31,11 +33,16 @@ pub fn topic(name: &str) -> Option<String> {
 pub const INSTRUCTIONS: &str = "\
 这是你的长期记忆，不是搜索引擎。没有相似度检索：能不能想起一件事，靠你自己从总表出发沿关联走图，读完节点后自己判断。
 
-第一次使用，先调用 memory_manual 读 overview，再读 recall 和 write。说明书写明了系统的原理和各种情况的处理方式，照做，不用自己设计。
+第一次使用，先调用 memory_manual 读 overview，再读 recall、write 和 work。说明书写明了系统的原理和各种情况的处理方式，照做，不用自己设计。
+
+每次工具调用的结果都附带当前的工作板、最近行为和总表。总表是你的工作台：目标、步骤、做到哪了、做过什么、记忆里有什么，都在上面，由你主动维护。
 
 必须遵守：
-- 记忆不会自己出现，你不查就想不起来。任务可能用到过往知识时，拿不准也要先用 memory_read 执行 catalog show，再一层一层 show 节点，不要凭印象回答。
+- 开始工作先调用一次 memory_read 看工作板，有没完成的目标就接着做。多步任务先 goal create 拆步骤，每做完一步当场 step done，别的重要操作用 log 记下。
+- 记忆不会自己出现，你不查就想不起来。任务可能用到过往知识时，拿不准也要查，不要凭印象回答。
+- 查什么、怎么查、查到什么时候为止，都由你决定：先看工作板和已知地址的节点，带着这些信息看总表选入口，一层一层读，觉得信息够了就停下来自己推理。只知道一个词时，也从总表进入。
 - 用户说了长期有用的事实或偏好，或者纠正了你，就用 memory_write 记下，并用一句话告诉用户。写之前先查，已有节点就更新，不要建重复的。
+- 发现信息之间有关系就主动 link，发现能得出新结论就主动 add 并写清依据，不用等用户要求，然后用一句话告诉用户。
 - 重要结论用 evidence 追到原文。text 只放用户原话或文件、工具返回的真实内容，逐字照抄，你自己的结论不是原文。
 - 两条记忆矛盾时，说明矛盾并问用户，不要悄悄选一个，也不要自己改。
 - 只有用户要求，或者已确认错误时才删除。
@@ -50,9 +57,12 @@ catalog show                  总表：每个领域的描述和代表节点。�
 show 节点, 节点               节点的全部内容。一层一层读
 evidence 节点, 节点           沿依据一路追到原文
 links 节点 [depth N] [limit N] [offset N]  沿关联看结构
-based_by 节点 / related_by 节点  谁依据它 / 谁关联它
+based_by 节点, 节点 / related_by 节点, 节点  谁依据它 / 谁关联它
 full_source 节点 [offset N] [limit N]  完整的原始文件
 check                         走不到的节点和没有代表的板块
+timeline [limit N] [offset N] [node 节点]  时间线，从新到旧
+
+结果都附带当前的工作板和总表。查什么、查到什么时候为止由你决定，知道地址就直接 show，不知道就从总表进入。
 
 例子：
 catalog show
@@ -70,6 +80,10 @@ base 结论 on 依据 / unbase 结论 on 依据
 cite 节点 text \"\"\"原文\"\"\" / cite 节点 source sha256:... 起始..结束 / uncite 节点 source sha256:... 起始..结束
 catalog create \"板块\" desc \"\"\"描述\"\"\" / describe / rename / delete / add 节点 to \"板块\" / remove 节点 from \"板块\"
 export \"路径\"
+goal create 目标 \"标题\" / desc \"\"\"...\"\"\" / step \"步骤\" / end
+step done|start|remove 目标 编号 / step block 目标 编号 \"\"\"原因\"\"\" / step add 目标 \"步骤\" [after 编号]
+goal done 目标 \"\"\"结果\"\"\" / goal drop 目标 \"\"\"原因\"\"\"
+log \"\"\"做了什么\"\"\"
 
 新节点在脚本结束前必须接入图：写 related_by、link 或 catalog add。text 只放用户原话或文件、工具返回的真实内容，不放你自己的结论。text 逐字保存；内容含三个连续引号时，用四个引号包住。
 
@@ -83,9 +97,9 @@ end";
 
 /// 说明书工具的描述。
 pub const MANUAL_DESCRIPTION: &str = "\
-读长期记忆的说明书：系统的原理、用法、示例，以及各种情况该怎么处理。第一次使用记忆前必须读 overview、recall 和 write。
+读长期记忆的说明书：系统的原理、用法、示例，以及各种情况该怎么处理。第一次使用记忆前必须读 overview、recall、write 和 work。
 
-主题：overview 原理和总览；recall 怎么回忆；write 什么该记、怎么记；repair 纠正、矛盾、删除、导出；language 指令的完整写法；errors 报错怎么处理。不写 topic 时返回 overview。";
+主题：overview 原理和总览；recall 怎么回忆；write 什么该记、怎么记；work 工作板、时间线和经验；repair 纠正、矛盾、删除、导出；language 指令的完整写法；errors 报错怎么处理。不写 topic 时返回 overview。";
 
 #[cfg(test)]
 mod tests {
@@ -131,6 +145,7 @@ mod tests {
     fn empty_knowledge_base(dir: &Path) {
         let parsed = ParsedKnowledge {
             catalog: Catalog {
+                goals: Vec::new(),
                 sections: Vec::new(),
             },
             nodes: Vec::new(),
@@ -232,7 +247,7 @@ mod tests {
         for code in [
             "E101", "E102", "E103", "E104", "E105", "E106", "E109", "E201", "E204", "E205", "E206",
             "E207", "E208", "E209", "E210", "E211", "E212", "E213", "E214", "E215", "E216", "E217",
-            "E301", "E302", "E900", "E901", "E902",
+            "E218", "E219", "E220", "E221", "E222", "E301", "E302", "E900", "E901", "E902",
         ] {
             assert!(errors.contains(code), "没有解释 {code}");
         }

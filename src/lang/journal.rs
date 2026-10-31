@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::memory::Memory;
 use crate::parse::Parser;
 use crate::source::SourceStore;
+use crate::timeline;
 
 /// 知识库的写入权。写脚本是基于加载时的状态检查的，加载之后到写完日志之间不能有别的进程写入。
 /// 文件关闭时自动释放，进程崩溃也一样。
@@ -46,6 +47,9 @@ pub fn load_current(
     knowledge_base: &Path,
 ) -> Result<Memory, Error> {
     let mut memory = Memory::load(parser, sources, knowledge_base)?;
+    for event in timeline::read(knowledge_base)? {
+        memory.record(event);
+    }
     Journal::new(knowledge_base).replay(&mut memory, sources)?;
     Ok(memory)
 }
@@ -53,6 +57,9 @@ pub fn load_current(
 #[derive(Serialize, Deserialize)]
 struct Entry {
     script: String,
+    /// 这段脚本执行的时间。旧日志没有这一项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<u64>,
 }
 
 /// 知识库目录下的 `journal.jsonl`。
@@ -68,9 +75,10 @@ impl Journal {
     }
 
     /// 追加一段脚本，并确保已经落到磁盘上。
-    pub fn append(&self, script: &str) -> Result<(), Error> {
+    pub fn append(&self, script: &str, at: Option<u64>) -> Result<(), Error> {
         let mut line = serde_json::to_string(&Entry {
             script: script.to_owned(),
+            at,
         })
         .expect("字符串总是可以序列化");
         line.push('\n');
@@ -107,7 +115,8 @@ impl Journal {
                     )));
                 }
             };
-            let output = Session::new(memory, sources, Mode::ReadWrite).replay(&entry.script);
+            let output =
+                Session::new(memory, sources, Mode::ReadWrite).replay(&entry.script, entry.at);
             if !output.ok {
                 return Err(Error::Save(format!(
                     "{} 第 {} 行重放失败：\n{}",

@@ -1,10 +1,12 @@
 //! 语法分析：把词组成语句。出错后跳到下一行继续，这样一次能报告所有语法错误。
 
+use crate::board::BoardOp;
+
 use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-pub(crate) const KEYWORDS: [&str; 19] = [
+pub(crate) const KEYWORDS: [&str; 23] = [
     "catalog",
     "check",
     "export",
@@ -24,6 +26,10 @@ pub(crate) const KEYWORDS: [&str; 19] = [
     "unbase",
     "cite",
     "uncite",
+    "goal",
+    "step",
+    "log",
+    "timeline",
 ];
 const ADD_CLAUSES: [&str; 8] = [
     "title",
@@ -55,6 +61,10 @@ const MAX_SOURCE_LIMIT: usize = 128 * 1024;
 const DEFAULT_LINK_LIMIT: usize = 50;
 const MAX_LINK_LIMIT: usize = 1000;
 const MAX_LINK_DEPTH: usize = 5;
+const DEFAULT_TIMELINE_LIMIT: usize = 50;
+const MAX_TIMELINE_LIMIT: usize = 1000;
+const GOAL_COMMANDS: [&str; 3] = ["create", "done", "drop"];
+const STEP_COMMANDS: [&str; 5] = ["add", "start", "done", "block", "remove"];
 
 pub fn parse(tokens: Vec<Token>) -> (Vec<Located>, Vec<Diagnostic>) {
     let mut parser = Parser {
@@ -118,8 +128,8 @@ impl Parser {
             "check" => Statement::Check,
             "show" => self.for_each_name(Statement::Show)?,
             "evidence" => self.for_each_name(Statement::Evidence)?,
-            "based_by" => Statement::BasedBy(self.name("节点地址")?),
-            "related_by" => Statement::RelatedBy(self.name("节点地址")?),
+            "based_by" => self.for_each_name(Statement::BasedBy)?,
+            "related_by" => self.for_each_name(Statement::RelatedBy)?,
             "remove" => Statement::Remove(self.name("节点地址")?),
             "links" => self.links()?,
             "link" => {
@@ -141,6 +151,10 @@ impl Parser {
             }
             "full_source" => self.full_source()?,
             "cite" => self.cite()?,
+            "goal" => self.goal(token)?,
+            "step" => self.step(token)?,
+            "log" => Statement::Log(self.label("要记下的内容")?),
+            "timeline" => self.timeline()?,
             "uncite" => {
                 let id = self.name("节点地址")?;
                 self.expect_word("source", "写法：uncite 节点 source sha256:... 起始..结束")?;
@@ -156,7 +170,7 @@ impl Parser {
                     Diagnostic::new("E101", token.span, format!("没有 {other} 这条指令"));
                 error = if SEARCH_WORDS.contains(&other) {
                     error.with_hint(
-                        "这里没有搜索，也不能列出所有节点。从 catalog show 开始，沿关联一层层走",
+                        "这里没有搜索，也不能列出所有节点。想查一个词，就想它属于哪个领域，从 catalog show 开始，沿关联一层层走",
                     )
                 } else {
                     match closest(other, KEYWORDS.into_iter()) {
@@ -169,6 +183,165 @@ impl Parser {
         };
         self.end_of_line()?;
         Ok(statement)
+    }
+
+    /// 取出 `keyword` 后面的操作名。
+    fn command(&mut self, keyword: &Token, name: &str, commands: &[&str]) -> Result<String, Skip> {
+        let Some(token) = self.peek_word() else {
+            return self.fail(
+                Diagnostic::new("E102", keyword.span, format!("{name} 后面要写操作"))
+                    .with_hint(format!("可用的操作：{}", commands.join("、"))),
+            );
+        };
+        let command = word_of(&token);
+        if !commands.contains(&command.as_str()) {
+            let hint = match closest(&command, commands.iter().copied()) {
+                Some(suggestion) => format!("你是不是想写 {name} {suggestion}？"),
+                None => format!("可用的操作：{}", commands.join("、")),
+            };
+            return self.fail(
+                Diagnostic::new(
+                    "E101",
+                    token.span,
+                    format!("{name} 没有 {command} 这个操作"),
+                )
+                .with_hint(hint),
+            );
+        }
+        self.position += 1;
+        Ok(command)
+    }
+
+    fn goal(&mut self, keyword: &Token) -> Result<Statement, Skip> {
+        let command = self.command(keyword, "goal", &GOAL_COMMANDS)?;
+        let id = self.name("目标地址")?.text;
+        Ok(Statement::Board(match command.as_str() {
+            "create" => return self.goal_create(id),
+            "done" => BoardOp::GoalDone {
+                id,
+                result: self.text()?,
+            },
+            _ => BoardOp::GoalDrop {
+                id,
+                reason: self.text()?,
+            },
+        }))
+    }
+
+    fn goal_create(&mut self, id: String) -> Result<Statement, Skip> {
+        let title = self.text()?;
+        self.end_of_line()?;
+        let mut description = None;
+        let mut steps = Vec::new();
+        loop {
+            self.skip_newlines();
+            let Some(token) = self.peek_word() else {
+                return self.fail(
+                    Diagnostic::new("E103", self.current_span(), "goal create 没有写 end")
+                        .with_hint(
+                            "写法：goal create 地址 \"标题\"，下面写 desc 和 step，最后写 end",
+                        ),
+                );
+            };
+            self.position += 1;
+            match word_of(&token).as_str() {
+                "end" => {
+                    return Ok(Statement::Board(BoardOp::GoalCreate {
+                        id,
+                        title,
+                        description: description.unwrap_or_default(),
+                        steps,
+                    }));
+                }
+                "desc" => {
+                    let value = self.text()?;
+                    self.once(&mut description, value, token.span, "desc")?;
+                }
+                "step" => steps.push(self.text()?),
+                other => {
+                    return self.fail(
+                        Diagnostic::new(
+                            "E104",
+                            token.span,
+                            format!("goal create 没有 {other} 这个子句"),
+                        )
+                        .with_hint("可以写 desc、step、end"),
+                    );
+                }
+            }
+            self.end_of_line()?;
+        }
+    }
+
+    fn step(&mut self, keyword: &Token) -> Result<Statement, Skip> {
+        let command = self.command(keyword, "step", &STEP_COMMANDS)?;
+        let goal = self.name("目标地址")?.text;
+        Ok(Statement::Board(match command.as_str() {
+            "add" => {
+                let text = self.text()?;
+                let after = match self.peek_word() {
+                    Some(token) if word_of(&token) == "after" => {
+                        self.position += 1;
+                        Some(self.number("步骤号")?)
+                    }
+                    _ => None,
+                };
+                BoardOp::StepAdd { goal, text, after }
+            }
+            "start" => BoardOp::StepStart {
+                goal,
+                number: self.number("步骤号")?,
+            },
+            "done" => BoardOp::StepDone {
+                goal,
+                number: self.number("步骤号")?,
+            },
+            "block" => BoardOp::StepBlock {
+                goal,
+                number: self.number("步骤号")?,
+                reason: self.text()?,
+            },
+            _ => BoardOp::StepRemove {
+                goal,
+                number: self.number("步骤号")?,
+            },
+        }))
+    }
+
+    fn timeline(&mut self) -> Result<Statement, Skip> {
+        let mut limit = DEFAULT_TIMELINE_LIMIT;
+        let mut offset = 0;
+        let mut node = None;
+        while let Some(token) = self.peek_word() {
+            let span = token.span;
+            match word_of(&token).as_str() {
+                "limit" => {
+                    self.position += 1;
+                    limit = self.number("数量")?;
+                    if limit == 0 || limit > MAX_TIMELINE_LIMIT {
+                        return self.fail(Diagnostic::new(
+                            "E109",
+                            span,
+                            format!("limit 必须在 1 到 {MAX_TIMELINE_LIMIT} 之间"),
+                        ));
+                    }
+                }
+                "offset" => {
+                    self.position += 1;
+                    offset = self.number("起始位置")?;
+                }
+                "node" => {
+                    self.position += 1;
+                    node = Some(self.name("节点地址")?);
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::Timeline {
+            limit,
+            offset,
+            node,
+        })
     }
 
     fn cite(&mut self) -> Result<Statement, Skip> {

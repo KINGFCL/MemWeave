@@ -8,6 +8,7 @@ use std::path::Path;
 use super::Mode;
 use super::ast::{AddNode, Citation, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
+use crate::board::{self, BoardOp, Goal};
 use crate::export::target_problem;
 use crate::knowledge::{Evidence, Locator};
 use crate::memory::{Memory, check_sources, is_valid_id};
@@ -42,6 +43,14 @@ pub fn check(
             .collect(),
         new_nodes: Vec::new(),
         export_targets: HashSet::new(),
+        goals: memory.catalog().goals.clone(),
+        declared: statements
+            .iter()
+            .filter_map(|located| match &located.statement {
+                Statement::Add(add) | Statement::Source(add) => Some(add.id.text.clone()),
+                _ => None,
+            })
+            .collect(),
         errors: Vec::new(),
     };
     for located in statements {
@@ -52,6 +61,10 @@ pub fn check(
                         "只读会话只能用 catalog show、show、links、evidence、based_by、related_by、full_source、check",
                     ),
             );
+            continue;
+        }
+        if let Statement::Board(op) = &located.statement {
+            checker.board(op, located.span);
             continue;
         }
         checker.statement(&located.statement);
@@ -89,13 +102,19 @@ struct Checker<'a> {
     new_nodes: Vec<Name>,
     /// 本脚本已经导出过的路径。
     export_targets: HashSet<String>,
+    /// 模拟到当前语句时的工作板。
+    goals: Vec<Goal>,
+    /// 这段脚本要新建的所有节点，报错时用来判断是不是写反了顺序。
+    declared: HashSet<String>,
     errors: Vec<Diagnostic>,
 }
 
 impl Checker<'_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::CatalogShow | Statement::Check => {}
+            Statement::CatalogShow | Statement::Check | Statement::Timeline { .. } => {}
+            Statement::Board(_) => unreachable!("工作板语句在 check 里单独处理"),
+            Statement::Log(text) => self.nonblank(text, "要记下的内容"),
             Statement::Export(path) => self.export(path),
             Statement::Cite { id, citation } => self.cite(id, citation),
             Statement::Uncite { id, source } => self.uncite(id, source),
@@ -416,6 +435,17 @@ impl Checker<'_> {
         list.retain(|other| *other != on.text);
     }
 
+    /// 和执行时调用同一个函数，所以结果一定一致。
+    fn board(&mut self, op: &BoardOp, span: Span) {
+        if let Err(error) = board::apply(&mut self.goals, op) {
+            let mut diagnostic = Diagnostic::new(error.code, span, error.message);
+            if let Some(hint) = error.hint {
+                diagnostic = diagnostic.with_hint(hint);
+            }
+            self.errors.push(diagnostic);
+        }
+    }
+
     fn cite(&mut self, id: &Name, citation: &Citation) {
         let known = self.require(id);
         let (cited, span) = match citation {
@@ -683,6 +713,11 @@ impl Checker<'_> {
         let mut error = Diagnostic::new("E201", name.span, format!("节点 {} 不存在", name.text));
         if self.removed.contains(&name.text) {
             error = error.with_hint("这个节点已被本脚本前面的 remove 删除");
+        } else if self.declared.contains(&name.text) {
+            error = error.with_hint(format!(
+                "{0} 在这段脚本后面才新建。把它写在前面；要互相指向，就都建好之后再 link",
+                name.text
+            ));
         } else if let Some(hint) = self.suggestion(&name.text) {
             error = error.with_hint(hint);
         }

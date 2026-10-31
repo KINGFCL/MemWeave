@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::board::Goal;
+
 /// 节点地址，在整个知识库内唯一。
 pub type NodeId = String;
 
@@ -42,6 +44,9 @@ pub enum Locator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Catalog {
     pub sections: Vec<Section>,
+    /// 工作板上进行中的目标。结束的目标离开这里，留在时间线上。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goals: Vec<Goal>,
 }
 
 /// 总表中的一个板块。

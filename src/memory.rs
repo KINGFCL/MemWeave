@@ -10,11 +10,13 @@ use std::str;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::board::{self, BoardError, BoardOp};
 use crate::error::Error;
 use crate::ffi::{self, RawBytes, RawEvidence, RawNode, RawNodeList};
 use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, NodeId, Section, SourceId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
+use crate::timeline::{Action, Event, NodeTimes};
 
 /// 节点地址的长度上限。地址可能被用作文件名，大多数文件系统限制为 255 字节。
 const MAX_ID_BYTES: usize = 200;
@@ -33,6 +35,8 @@ const MAX_ID_BYTES: usize = 200;
 pub struct Memory {
     catalog: Catalog,
     index: NonNull<ffi::RawIndex>,
+    timeline: Vec<Event>,
+    node_times: HashMap<NodeId, NodeTimes>,
 }
 
 // 整张图可以移动到另一个线程，但不实现 Sync：一张图只属于一个线程，别的线程要用就自己加载一份。
@@ -247,6 +251,9 @@ pub enum Problem {
         end: usize,
     },
 
+    #[error("工作板上的目标 {id} 重复")]
+    DuplicateGoal { id: String },
+
     #[error("板块“{name}”重复")]
     DuplicateSection { name: String },
 
@@ -300,7 +307,12 @@ impl Memory {
 
         // 先放进结构体：中途失败时由 Drop 释放已创建的节点。
         let index = NonNull::new(unsafe { ffi::mw_index_new() }).ok_or(Error::OutOfMemory)?;
-        let memory = Self { catalog, index };
+        let memory = Self {
+            catalog,
+            index,
+            timeline: Vec::new(),
+            node_times: HashMap::new(),
+        };
         // 先创建所有节点，再连接它们，这样节点之间可以直接存地址。
         for node in &nodes {
             let raw = new_node(
@@ -376,6 +388,15 @@ impl Memory {
                         id: entry.id.clone(),
                     });
                 }
+            }
+        }
+
+        let mut goal_ids = HashSet::new();
+        for goal in &parsed.catalog.goals {
+            if !goal_ids.insert(goal.id.as_str()) {
+                problems.push(Problem::DuplicateGoal {
+                    id: goal.id.clone(),
+                });
             }
         }
 
@@ -668,6 +689,43 @@ impl Memory {
 
     pub fn node_count(&self) -> usize {
         unsafe { ffi::mw_index_size(self.index.as_ptr()) }
+    }
+
+    /// 对工作板执行一个操作，返回给模型看的结果。
+    pub fn apply_board(&mut self, op: &BoardOp) -> Result<String, BoardError> {
+        board::apply(&mut self.catalog.goals, op)
+    }
+
+    /// 发生过的事，从旧到新。
+    pub fn timeline(&self) -> &[Event] {
+        &self.timeline
+    }
+
+    /// 节点的创建和更新时间，由时间线得出。没有记录时都是 `None`。
+    pub fn node_times(&self, id: &str) -> NodeTimes {
+        self.node_times.get(id).copied().unwrap_or_default()
+    }
+
+    /// 记下一件发生过的事，并更新相关节点的时间。
+    pub fn record(&mut self, event: Event) {
+        for (index, id) in event.nodes.iter().enumerate() {
+            match (index, event.action) {
+                (0, Action::Remove) => {
+                    self.node_times.remove(id);
+                }
+                (0, Action::Create) => {
+                    self.node_times.insert(
+                        id.clone(),
+                        NodeTimes {
+                            created: event.at,
+                            updated: event.at,
+                        },
+                    );
+                }
+                _ => self.node_times.entry(id.clone()).or_default().updated = event.at,
+            }
+        }
+        self.timeline.push(event);
     }
 
     /// 新建一个空板块。
@@ -1244,6 +1302,7 @@ mod tests {
             })
             .collect();
         Catalog {
+            goals: Vec::new(),
             sections: vec![Section {
                 name: "板块".into(),
                 description: String::new(),
@@ -2021,6 +2080,61 @@ mod tests {
                 name: "板块".into()
             }
         );
+    }
+
+    #[test]
+    fn node_times_follow_the_timeline() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        let event = |at, text: &str, nodes: &[&str], action| Event {
+            at: Some(at),
+            text: text.to_owned(),
+            nodes: nodes.iter().map(|id| id.to_string()).collect(),
+            action,
+        };
+        assert_eq!(memory.node_times("a"), NodeTimes::default());
+
+        memory.record(event(10, "add b", &["b", "a"], Action::Create));
+        memory.record(event(20, "set b", &["b"], Action::Change));
+
+        // 快照里的节点不知道什么时候创建，但知道什么时候更新。
+        assert_eq!(
+            memory.node_times("a"),
+            NodeTimes {
+                created: None,
+                updated: Some(10)
+            }
+        );
+        assert_eq!(
+            memory.node_times("b"),
+            NodeTimes {
+                created: Some(10),
+                updated: Some(20)
+            }
+        );
+
+        memory.record(event(30, "remove b", &["b"], Action::Remove));
+        assert_eq!(memory.node_times("b"), NodeTimes::default());
+        assert_eq!(memory.timeline().len(), 3);
+    }
+
+    #[test]
+    fn duplicate_goals_fail_validation() {
+        let goal = crate::board::Goal {
+            id: "g".into(),
+            title: "t".into(),
+            description: "d".into(),
+            steps: Vec::new(),
+        };
+        let mut duplicate = catalog(&["a"]);
+        duplicate.goals = vec![goal.clone(), goal];
+        let parsed = ParsedKnowledge {
+            catalog: duplicate,
+            nodes: vec![node("a", &[])],
+        };
+
+        let problems = Memory::validate(&parsed, &sources());
+
+        assert_eq!(problems, [Problem::DuplicateGoal { id: "g".into() }]);
     }
 
     #[test]

@@ -311,7 +311,10 @@ fn build_catalog(
             }
         })
         .collect();
-    Catalog { sections }
+    Catalog {
+        goals: Vec::new(),
+        sections,
+    }
 }
 
 #[cfg(test)]

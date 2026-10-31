@@ -23,6 +23,7 @@ use crate::error::Error;
 use crate::export::json::JsonExporter;
 use crate::export::{Exporter, target_problem};
 use crate::knowledge::Catalog;
+use crate::lang::exec::render_overview;
 use crate::lang::journal::{Journal, WriteLock, load_current};
 use crate::lang::{Mode, Output, Session};
 use crate::memory::Memory;
@@ -37,6 +38,7 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 40 * 1024;
 const READ_TOOL: &str = "memory_read";
 const WRITE_TOOL: &str = "memory_write";
 const MANUAL_TOOL: &str = "memory_manual";
+const ATTACHED_HEADER: &str = "--- 当前工作板和总表（每次调用自动附带）---";
 
 /// 在标准输入输出上提供服务，标准输入关闭时返回。
 ///
@@ -83,6 +85,7 @@ fn create_if_empty(knowledge_base: &Path) -> Result<(), Error> {
     }
     let parsed = ParsedKnowledge {
         catalog: Catalog {
+            goals: Vec::new(),
             sections: Vec::new(),
         },
         nodes: Vec::new(),
@@ -94,10 +97,16 @@ fn create_if_empty(knowledge_base: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// 脚本的结果和执行后的工作板、总表。
+struct Reply {
+    output: Option<Output>,
+    overview: String,
+}
+
 struct Job {
-    script: String,
-    mode: Mode,
-    reply: oneshot::Sender<Output>,
+    /// 没有脚本时只取工作板和总表。
+    script: Option<(String, Mode)>,
+    reply: oneshot::Sender<Reply>,
 }
 
 fn run_scripts(
@@ -108,13 +117,31 @@ fn run_scripts(
     queue: &mpsc::Receiver<Job>,
 ) {
     for job in queue {
-        let output = Session::new(&mut memory, sources, job.mode)
-            .with_journal(journal)
-            .with_output_limit(max_output_bytes)
-            .run(&job.script);
+        let output = job.script.map(|(script, mode)| {
+            Session::new(&mut memory, sources, mode)
+                .with_journal(journal)
+                .with_output_limit(max_output_bytes)
+                .run(&script)
+        });
+        let overview = attached_overview(&memory, max_output_bytes);
         // 客户端已经取消时没有人接收结果，脚本的效果不受影响。
-        let _ = job.reply.send(output);
+        let _ = job.reply.send(Reply { output, overview });
     }
+}
+
+/// 每次调用都附带的内容。最多占输出上限的一半，总能留出位置给脚本的结果。
+fn attached_overview(memory: &Memory, max_output_bytes: usize) -> String {
+    let mut text = render_overview(memory);
+    let limit = max_output_bytes / 2;
+    if text.len() > limit {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n（工作板和总表太长，被截断了，用 catalog show 看全）\n");
+    }
+    format!("{ATTACHED_HEADER}\n{text}")
 }
 
 struct Server {
@@ -129,16 +156,13 @@ impl Server {
     ) -> Result<CallToolResult, ErrorData> {
         let script = string_argument(request, "script")?
             .ok_or_else(|| ErrorData::invalid_params("缺少参数 script", None))?;
-        let (reply, result) = oneshot::channel();
-        let job = Job {
-            script: script.to_owned(),
-            mode,
-            reply,
-        };
-        let lost = || ErrorData::internal_error("执行脚本的线程已经退出", None);
-        self.jobs.send(job).map_err(|_| lost())?;
-        let output = result.await.map_err(|_| lost())?;
-        let content = vec![ContentBlock::text(output.text)];
+        let reply = self.ask(Some((script.to_owned(), mode))).await?;
+        let output = reply.output.ok_or_else(lost_worker)?;
+        let mut content = vec![ContentBlock::text(output.text)];
+        // 只查总表时，结果里已经有了。
+        if script.trim() != "catalog show" {
+            content.push(ContentBlock::text(reply.overview));
+        }
         // 脚本写错是模型能自己改正的错误，不是协议错误。
         Ok(if output.ok {
             CallToolResult::success(content)
@@ -146,6 +170,20 @@ impl Server {
             CallToolResult::error(content)
         })
     }
+}
+
+impl Server {
+    async fn ask(&self, script: Option<(String, Mode)>) -> Result<Reply, ErrorData> {
+        let (reply, result) = oneshot::channel();
+        self.jobs
+            .send(Job { script, reply })
+            .map_err(|_| lost_worker())?;
+        result.await.map_err(|_| lost_worker())
+    }
+}
+
+fn lost_worker() -> ErrorData {
+    ErrorData::internal_error("执行脚本的线程已经退出", None)
 }
 
 fn string_argument<'a>(
@@ -243,7 +281,12 @@ impl ServerHandler for Server {
         let result = match request.name.as_ref() {
             READ_TOOL => self.run_script(&request, Mode::ReadOnly).await?,
             WRITE_TOOL => self.run_script(&request, Mode::ReadWrite).await?,
-            MANUAL_TOOL => read_manual(&request)?,
+            MANUAL_TOOL => {
+                let mut result = read_manual(&request)?;
+                let reply = self.ask(None).await?;
+                result.content.push(ContentBlock::text(reply.overview));
+                result
+            }
             other => {
                 return Err(ErrorData::invalid_params(format!("没有工具 {other}"), None));
             }

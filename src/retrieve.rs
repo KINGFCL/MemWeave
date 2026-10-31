@@ -268,6 +268,7 @@ mod tests {
             })
             .collect();
         let catalog = Catalog {
+            goals: Vec::new(),
             sections: vec![Section {
                 name: "板块".into(),
                 description: String::new(),

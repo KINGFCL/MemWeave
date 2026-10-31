@@ -56,6 +56,9 @@ pub enum Error {
     #[error("内存不足，或单个节点的文本超过 4 GiB")]
     OutOfMemory,
 
+    #[error("工作板操作失败：{0}")]
+    Board(String),
+
     #[error("模型调用失败：{0}")]
     Model(String),
 

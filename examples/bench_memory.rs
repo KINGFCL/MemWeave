@@ -119,6 +119,7 @@ fn bench_graph(count: usize, links: usize, shape: Shape) {
     let nodes = build_nodes(count, links, shape, &source);
     let by_id: HashMap<String, Node> = nodes.iter().map(|n| (n.id.clone(), n.clone())).collect();
     let catalog = Catalog {
+        goals: Vec::new(),
         sections: vec![Section {
             name: "板块".into(),
             description: String::new(),

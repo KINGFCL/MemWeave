@@ -284,7 +284,7 @@ fn the_manual_is_available_through_the_tool() {
     let (ok, text) = split(&client.call("memory_manual", json!({})));
     assert!(ok && text.contains("这是你的长期记忆"), "{text}");
     for (topic, expected) in [
-        ("recall", "第一步：看总表"),
+        ("recall", "都由你决定"),
         ("write", "什么该记"),
         ("repair", "两条记忆互相矛盾"),
         ("language", "catalog create"),
@@ -421,5 +421,103 @@ fn large_output_is_cut_at_the_limit_with_a_note() {
     );
     assert!(text.contains("后面还有 2 条语句"), "{text}");
     assert!(!text.contains("show drop\n"), "{text}");
+    client.stop();
+}
+
+fn all_text(result: &Value) -> Vec<String> {
+    result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn every_call_comes_with_the_board_and_catalog() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+    let header = "当前工作板和总表（每次调用自动附带）";
+
+    // 读、写、报错和说明书都带。
+    let blocks = all_text(&client.call("memory_read", json!({ "script": "show drop" })));
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert!(blocks[0].starts_with("node drop"), "{blocks:?}");
+    assert!(blocks[1].contains(header), "{blocks:?}");
+    assert!(
+        blocks[1].contains("section \"Rust 内存管理\""),
+        "{blocks:?}"
+    );
+
+    let blocks = all_text(&client.call(
+        "memory_write",
+        json!({ "script": "goal create g \"目标\"\n desc \"d\"\n step \"一\"\nend" }),
+    ));
+    assert!(blocks[1].contains("[>] 1 \"一\""), "{blocks:?}");
+    assert!(blocks[1].contains("goal create g"), "{blocks:?}");
+
+    let result = client.call("memory_write", json!({ "script": "show 没有" }));
+    assert_eq!(result["isError"], true);
+    let blocks = all_text(&result);
+    assert!(blocks[0].contains("error[E201]"), "{blocks:?}");
+    assert!(blocks[1].contains(header), "{blocks:?}");
+
+    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "work" })));
+    assert!(blocks[0].contains("工作板"), "{blocks:?}");
+    assert!(blocks[1].contains(header), "{blocks:?}");
+
+    // 只查总表时，结果里已经有了。
+    let blocks = all_text(&client.call("memory_read", json!({ "script": " catalog show\n" })));
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert!(blocks[0].contains("工作板"), "{blocks:?}");
+    client.stop();
+}
+
+#[test]
+fn the_board_is_still_there_in_the_next_session() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+    let (ok, text) = client.write(
+        "goal create g \"目标\"\n desc \"d\"\n step \"一\"\n step \"二\"\nend\nstep done g 1",
+    );
+    assert!(ok, "{text}");
+    client.stop();
+
+    let mut next = Client::start(&kb, false);
+    let blocks = all_text(&next.call("memory_read", json!({ "script": "check" })));
+    assert!(blocks[1].contains("[x] 1 \"一\""), "{blocks:?}");
+    assert!(blocks[1].contains("[>] 2 \"二\""), "{blocks:?}");
+    next.stop();
+}
+
+#[test]
+fn an_oversized_catalog_cannot_crowd_out_the_result() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_memweave"))
+        .arg("mcp")
+        .arg(&kb)
+        .args(["--max-output-bytes", "400"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut client = Client {
+        child,
+        stdin,
+        stdout,
+        next_id: 0,
+        modern: true,
+    };
+
+    let blocks = all_text(&client.call("memory_read", json!({ "script": "check" })));
+
+    assert!(blocks[0].contains("check: 没有问题"), "{blocks:?}");
+    assert!(blocks[1].contains("用 catalog show 看全"), "{blocks:?}");
     client.stop();
 }

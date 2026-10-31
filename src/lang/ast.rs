@@ -1,6 +1,7 @@
 //! 语法树。
 
 use super::diagnostic::Span;
+use crate::board::BoardOp;
 
 /// 脚本里写的一个节点地址，记着位置，报错时用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,13 @@ pub enum Statement {
     },
     Check,
     Export(Label),
+    Board(BoardOp),
+    Log(Label),
+    Timeline {
+        limit: usize,
+        offset: usize,
+        node: Option<Name>,
+    },
     Cite {
         id: Name,
         citation: Citation,
@@ -139,6 +147,7 @@ impl Statement {
                 | Statement::RelatedBy(_)
                 | Statement::FullSource { .. }
                 | Statement::Export(_)
+                | Statement::Timeline { .. }
         )
     }
 

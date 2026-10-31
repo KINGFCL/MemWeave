@@ -7,12 +7,14 @@ use std::fmt::Write;
 use std::path::Path;
 
 use super::ast::{AddNode, Citation, Field, Located, Statement};
+use crate::board::{Goal, StepStatus};
 use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
 use crate::knowledge::{Evidence, Locator, Node};
 use crate::memory::{Memory, NodeRef, RemovedNode};
 use crate::source::{SourceStore, source_id};
+use crate::timeline::{Action, Event, NodeTimes, format_time};
 
 /// 板块的代表超过这个数量时提醒模型：总表不是索引。
 const MANY_REPRESENTATIVES: usize = 5;
@@ -31,6 +33,7 @@ pub fn execute(
     statements: &[Located],
     memory: &mut Memory,
     sources: &dyn SourceStore,
+    at: Option<u64>,
 ) -> Result<Report, (usize, String, Error)> {
     let mut report = Report {
         text: String::new(),
@@ -40,6 +43,9 @@ pub fn execute(
     for (done, located) in statements.iter().enumerate() {
         if let Err(error) = statement(&located.statement, memory, sources, &mut report) {
             return Err((done, report.text, error));
+        }
+        if let Some(event) = event_for(&located.statement, at) {
+            memory.record(event);
         }
         report.ends.push(report.text.len());
     }
@@ -54,7 +60,27 @@ fn statement(
 ) -> Result<(), Error> {
     let output = &mut report.text;
     match statement {
-        Statement::CatalogShow => render_catalog(memory, output),
+        Statement::CatalogShow => output.push_str(&render_overview(memory)),
+        Statement::Board(op) => {
+            let text = memory
+                .apply_board(op)
+                .map_err(|error| Error::Board(error.message))?;
+            let _ = writeln!(output, "{text}");
+        }
+        Statement::Log(text) => {
+            let _ = writeln!(output, "logged {}", quote(&text.text));
+        }
+        Statement::Timeline {
+            limit,
+            offset,
+            node,
+        } => render_timeline(
+            memory,
+            *limit,
+            *offset,
+            node.as_ref().map(|n| n.text.as_str()),
+            output,
+        ),
         Statement::Export(path) => {
             match JsonExporter.export(memory, sources, Path::new(&path.text)) {
                 Ok(exported) => {
@@ -138,7 +164,8 @@ fn statement(
         Statement::Check => render_check(memory, output),
         Statement::Show(id) => {
             let node = existing(memory, &id.text)?;
-            render_node(node, sources, output, &mut report.failures);
+            let times = memory.node_times(&id.text);
+            render_node(node, times, sources, output, &mut report.failures);
         }
         Statement::Links {
             id,
@@ -296,6 +323,220 @@ fn quote(text: &str) -> String {
     serde_json::to_string(text).expect("字符串总是可以序列化")
 }
 
+/// 工作板上最近行为显示几条。更多的用 `timeline` 看。
+const RECENT_EVENTS: usize = 5;
+/// 最近行为里每条最多显示多少字，完整内容用 `timeline` 看。
+const RECENT_EVENT_CHARS: usize = 80;
+
+/// 工作板、最近行为和总表：模型一眼就知道在做什么、做过什么、记忆里有什么。
+pub fn render_overview(memory: &Memory) -> String {
+    let mut output = String::new();
+    let goals = &memory.catalog().goals;
+    let recent = memory.timeline().iter().rev().take(RECENT_EVENTS);
+    if !goals.is_empty() {
+        output.push_str("工作板\n");
+        for goal in goals {
+            render_goal(goal, &mut output);
+        }
+    }
+    if recent.len() > 0 {
+        output.push_str("最近行为\n");
+        for event in recent {
+            let text: String = event.text.chars().take(RECENT_EVENT_CHARS).collect();
+            let more = if event.text.chars().count() > RECENT_EVENT_CHARS {
+                "…"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                output,
+                "  {} {}{more}",
+                format_time(event.at),
+                text.replace('\n', " ")
+            );
+        }
+    }
+    if !output.is_empty() {
+        output.push_str("总表\n");
+    }
+    render_catalog(memory, &mut output);
+    output
+}
+
+fn render_goal(goal: &Goal, output: &mut String) {
+    let _ = writeln!(output, "goal {} {}", goal.id, quote(&goal.title));
+    let _ = writeln!(output, "  desc: {}", quote(&goal.description));
+    if goal.steps.is_empty() {
+        output.push_str("  还没有步骤\n");
+    }
+    for step in &goal.steps {
+        let mark = match step.status {
+            StepStatus::Pending => "[ ]",
+            StepStatus::Doing => "[>]",
+            StepStatus::Done => "[x]",
+            StepStatus::Blocked => "[!]",
+        };
+        let _ = write!(output, "  {mark} {} {}", step.number, quote(&step.text));
+        if let Some(note) = &step.note {
+            let _ = write!(output, " 卡住：{}", quote(note));
+        }
+        output.push('\n');
+    }
+}
+
+/// 从新到旧。`node` 给定时只看和这个节点有关的事。
+fn render_timeline(
+    memory: &Memory,
+    limit: usize,
+    offset: usize,
+    node: Option<&str>,
+    output: &mut String,
+) {
+    let matching: Vec<&Event> = memory
+        .timeline()
+        .iter()
+        .rev()
+        .filter(|event| node.is_none_or(|id| event.nodes.iter().any(|other| other == id)))
+        .collect();
+    let total = matching.len();
+    if total == 0 {
+        output.push_str("时间线上没有记录\n");
+        return;
+    }
+    let shown: Vec<&&Event> = matching.iter().skip(offset).take(limit).collect();
+    for event in &shown {
+        let _ = writeln!(output, "{} {}", format_time(event.at), event.text);
+    }
+    if offset >= total {
+        let _ = writeln!(output, "（共 {total} 条，offset {offset} 已经超过末尾）");
+    } else if shown.len() < total {
+        let (first, last) = (offset + 1, offset + shown.len());
+        if last < total {
+            let _ = writeln!(
+                output,
+                "（共 {total} 条，这里是第 {first}–{last} 条，下一段用 offset {last}）"
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "（共 {total} 条，这里是第 {first}–{last} 条，后面没有了）"
+            );
+        }
+    }
+}
+
+/// 写语句对应的时间线事件。读语句不记。
+fn event_for(statement: &Statement, at: Option<u64>) -> Option<Event> {
+    let change = |text: String, nodes: Vec<String>| (text, nodes, Action::Change);
+    let (text, nodes, action) = match statement {
+        Statement::Add(add) | Statement::Source(add) => {
+            let keyword = if matches!(statement, Statement::Add(_)) {
+                "add"
+            } else {
+                "source"
+            };
+            let title = add.title.as_deref().unwrap_or_default();
+            let mut nodes = vec![add.id.text.clone()];
+            nodes.extend(add.related_by.iter().map(|name| name.text.clone()));
+            (
+                format!("{keyword} {} {}", add.id.text, quote(title)),
+                nodes,
+                Action::Create,
+            )
+        }
+        Statement::Remove(id) => (
+            format!("remove {}", id.text),
+            vec![id.text.clone()],
+            Action::Remove,
+        ),
+        Statement::Link { from, to } => change(
+            format!("link {} -> {}", from.text, to.text),
+            vec![from.text.clone()],
+        ),
+        Statement::Unlink { from, to } => change(
+            format!("unlink {} -> {}", from.text, to.text),
+            vec![from.text.clone()],
+        ),
+        Statement::Set { id, field, .. } => {
+            let field = match field {
+                Field::Title => "title",
+                Field::Description => "desc",
+            };
+            change(format!("set {} {field}", id.text), vec![id.text.clone()])
+        }
+        Statement::Base { id, on } => change(
+            format!("base {} on {}", id.text, on.text),
+            vec![id.text.clone()],
+        ),
+        Statement::Unbase { id, on } => change(
+            format!("unbase {} on {}", id.text, on.text),
+            vec![id.text.clone()],
+        ),
+        Statement::Cite { id, citation } => {
+            let what = match citation {
+                Citation::Text(text) => {
+                    format!("{} 0..{}", source_id(text.text.as_bytes()), text.text.len())
+                }
+                Citation::Source(source) => {
+                    format!("{} {}..{}", source.source.text, source.start, source.end)
+                }
+            };
+            change(format!("cite {} {what}", id.text), vec![id.text.clone()])
+        }
+        Statement::Uncite { id, source } => change(
+            format!(
+                "uncite {} {} {}..{}",
+                id.text, source.source.text, source.start, source.end
+            ),
+            vec![id.text.clone()],
+        ),
+        Statement::CatalogCreate { name, .. } => {
+            change(format!("catalog create {}", quote(&name.text)), Vec::new())
+        }
+        Statement::CatalogDescribe { name, .. } => change(
+            format!("catalog describe {}", quote(&name.text)),
+            Vec::new(),
+        ),
+        Statement::CatalogRename { name, new_name } => change(
+            format!(
+                "catalog rename {} to {}",
+                quote(&name.text),
+                quote(&new_name.text)
+            ),
+            Vec::new(),
+        ),
+        Statement::CatalogDelete(name) => {
+            change(format!("catalog delete {}", quote(&name.text)), Vec::new())
+        }
+        Statement::CatalogAdd { id, section } => change(
+            format!("catalog add {} to {}", id.text, quote(&section.text)),
+            Vec::new(),
+        ),
+        Statement::CatalogRemove { id, section } => change(
+            format!("catalog remove {} from {}", id.text, quote(&section.text)),
+            Vec::new(),
+        ),
+        Statement::Board(op) => change(op.summary(), Vec::new()),
+        Statement::Log(text) => change(format!("log {}", text.text), Vec::new()),
+        Statement::CatalogShow
+        | Statement::Check
+        | Statement::Export(_)
+        | Statement::Timeline { .. }
+        | Statement::Show(_)
+        | Statement::Links { .. }
+        | Statement::Evidence(_)
+        | Statement::BasedBy(_)
+        | Statement::RelatedBy(_)
+        | Statement::FullSource { .. } => return None,
+    };
+    Some(Event {
+        at,
+        text,
+        nodes,
+        action,
+    })
+}
+
 fn render_catalog(memory: &Memory, output: &mut String) {
     let sections = &memory.catalog().sections;
     if sections.is_empty() {
@@ -321,6 +562,7 @@ fn render_catalog(memory: &Memory, output: &mut String) {
 /// 输出节点的全部内容。原文这时才从固态硬盘读取，读不到时其他内容照常输出。
 fn render_node(
     node: NodeRef<'_>,
+    times: NodeTimes,
     sources: &dyn SourceStore,
     output: &mut String,
     failures: &mut usize,
@@ -332,6 +574,8 @@ fn render_node(
     render_list("related_by", node.related_by(), output);
     render_list("based_on", node.based_on(), output);
     render_list("based_by", node.based_by(), output);
+    let _ = writeln!(output, "  created: {}", format_time(times.created));
+    let _ = writeln!(output, "  updated: {}", format_time(times.updated));
 
     for evidence in node.evidence() {
         if let Evidence::Source { source, locator } = evidence {

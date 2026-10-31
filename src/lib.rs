@@ -2,6 +2,7 @@
 //!
 //! **这是不稳定的实验版本，接口和数据格式随时可能发生不兼容的变化。**
 
+pub mod board;
 pub mod error;
 pub mod export;
 mod ffi;
@@ -15,4 +16,5 @@ pub mod parse;
 mod prompt;
 pub mod retrieve;
 pub mod source;
+pub mod timeline;
 pub mod weave;

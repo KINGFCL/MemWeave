@@ -13,6 +13,7 @@ use crate::parse::Parser;
 use crate::parse::json::JsonParser;
 use crate::source::SourceStore;
 use crate::source::file::FileSources;
+use crate::timeline;
 
 /// 写成 [`JsonParser`] 读取的 JSON 目录格式。
 ///
@@ -83,6 +84,7 @@ fn write_knowledge_base(
         exported_sources.put(&sources.read_all(id)?)?;
     }
     write_json(&dir.join("catalog.json"), memory.catalog())?;
+    timeline::write(memory.timeline(), dir)?;
 
     let parsed = JsonParser.parse(dir)?;
     let problems = Memory::validate(&parsed, &exported_sources);
@@ -177,6 +179,7 @@ mod tests {
     fn empty_memory_can_be_exported() {
         let parsed = ParsedKnowledge {
             catalog: Catalog {
+                goals: Vec::new(),
                 sections: Vec::new(),
             },
             nodes: Vec::new(),
