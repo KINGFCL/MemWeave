@@ -1,12 +1,13 @@
 // 记忆图的节点：节点之间直接用地址相连，内存用 new 分配。
 //
+// 一张图只属于一个线程，这个线程又读又写，所以这里没有任何同步。别的线程要用就自己加载一份。
+//
 // 查询时只读不分配，所以分配方式不影响遍历的操作数，只影响节点在内存里的位置。
 // 每个节点两块内存：
 // - 热块：节点和关联列表。节点占一条缓存行，遍历要读的字段都在里面，关联列表紧跟在后面。
 // - 冷块：证据列表、被依赖列表和所有文本。遍历用不到，不占用遍历区域的缓存。
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -65,7 +66,7 @@ struct EvidenceList {
 struct alignas(64) Node {
   // 关联列表的地址，列表紧跟在节点后面，存的是相关节点的内存地址。
   // 从一个节点走到下一个节点只读这个字段。检索时沿它往下爬。
-  std::atomic<const NodeList*> related;
+  const NodeList* related;
   // 节点地址文本，如 "ownership"。它是节点的文本名字，也是 JSON 文件名，模型回答时用的就是它。
   const char* id;
   // 标题，如 "所有权"。总表和“已保留节点”列表里会用到。
@@ -150,7 +151,7 @@ inline Node* new_node(Bytes id, Bytes title, Bytes description, const Evidence* 
   const char* title_text = append(title.data, title.len);
   const char* description_text = append(description.data, description.len);
 
-  return new (hot) Node{{nullptr},
+  return new (hot) Node{nullptr,
                         id_text,
                         title_text,
                         description_text,
@@ -161,15 +162,13 @@ inline Node* new_node(Bytes id, Bytes title, Bytes description, const Evidence* 
                         static_cast<std::uint32_t>(description.len)};
 }
 
-// 下面三个函数只在建图时调用，这时还没有其他线程在读节点。
-
 // 写入节点的关联。count 不能超过创建时预留的数量，每个节点只能设置一次。
 inline void set_related(Node* node, Node* const* related, std::size_t count) noexcept {
   auto* list = new (node + 1) NodeList{count};
   if (count != 0) {
     std::memcpy(list->nodes(), related, count * sizeof(Node*));
   }
-  node->related.store(list, std::memory_order_release);
+  node->related = list;
 }
 
 // 填写第 index 条节点证据指向的节点。
@@ -186,7 +185,7 @@ inline void set_dependents(Node* node, Node* const* dependents, std::size_t coun
   }
 }
 
-// 释放节点。调用时不能有其他线程在读这个节点。
+// 释放节点。
 inline void delete_node(Node* node) noexcept {
   delete[] reinterpret_cast<const char*>(node->evidence);
   node->~Node();

@@ -6,7 +6,6 @@ use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::str;
-use std::sync::atomic::Ordering;
 
 use thiserror::Error;
 
@@ -23,14 +22,20 @@ const MAX_ID_BYTES: usize = 200;
 ///
 /// 节点由 C++ 分配，节点之间直接用地址相连。文本地址的索引只用在边界上：
 /// 把模型的回答和命令行参数对应回节点，遍历时不经过它。
+///
+/// 一张图只属于一个线程。编译器会拒绝跨线程共享：
+///
+/// ```compile_fail
+/// fn shared<T: Sync>() {}
+/// shared::<memweave::memory::Memory>();
+/// ```
 pub struct Memory {
     catalog: Catalog,
     index: HashMap<NodeId, NonNull<RawNode>>,
 }
 
-// 创建完成后图是只读的，节点的内容和关联都不会再变化，可以跨线程共享。
+// 整张图可以移动到另一个线程，但不实现 Sync：一张图只属于一个线程，别的线程要用就自己加载一份。
 unsafe impl Send for Memory {}
-unsafe impl Sync for Memory {}
 
 impl fmt::Debug for Memory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,7 +87,7 @@ impl<'m> NodeRef<'m> {
 
     /// 相关节点。遍历时只解引用地址，不做任何查找。
     pub fn related(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
-        node_list(self.raw().related.load(Ordering::Acquire))
+        node_list(self.raw().related)
     }
 
     /// 证据里引用了这个节点的节点。修改这个节点时，它们需要复查。
@@ -1067,10 +1072,7 @@ mod tests {
         let address = hub.raw.as_ptr() as usize;
 
         assert_eq!(address % 128, 0);
-        assert_eq!(
-            hub.raw().related.load(Ordering::Acquire) as usize,
-            address + 64
-        );
+        assert_eq!(hub.raw().related as usize, address + 64);
         let related: Vec<&str> = hub.related().map(NodeRef::id).collect();
         assert_eq!(related, ids);
     }
@@ -1081,27 +1083,21 @@ mod tests {
 
         let a = memory.node("a").unwrap();
         let address = a.raw.as_ptr() as usize;
-        let list = a.raw().related.load(Ordering::Acquire) as usize;
+        let list = a.raw().related as usize;
 
         assert_eq!(address % 128, 0);
         assert_eq!(list, address + 64);
     }
 
     #[test]
-    fn reads_are_shared_across_threads() {
-        let memory = build(&["a"], vec![node("a", &["b"]), node("b", &["a"])]).unwrap();
+    fn memory_can_move_to_another_thread() {
+        let memory = build(&["a"], vec![node("a", &[])]).unwrap();
 
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
-                    let mut current = memory.node("a").unwrap();
-                    for _ in 0..1000 {
-                        current = current.related().next().unwrap();
-                    }
-                    assert_eq!(current.id(), "a");
-                });
-            }
-        });
+        let count = std::thread::spawn(move || memory.node_count())
+            .join()
+            .unwrap();
+
+        assert_eq!(count, 1);
     }
 
     #[test]

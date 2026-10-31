@@ -1,7 +1,5 @@
 //! C++ 记忆层的接口。内存布局和 `cpp/include/memweave/graph.hpp` 共享。
 
-use std::sync::atomic::AtomicPtr;
-
 /// 和 C++ 的 `Bytes` 布局相同。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,7 +47,7 @@ pub(crate) struct RawEvidenceList {
 /// 和 C++ 的 `Node` 布局相同，正好占一条缓存行。
 #[repr(C, align(64))]
 pub(crate) struct RawNode {
-    pub(crate) related: AtomicPtr<RawNodeList>,
+    pub(crate) related: *const RawNodeList,
     pub(crate) id: *const u8,
     pub(crate) title: *const u8,
     pub(crate) description: *const u8,
