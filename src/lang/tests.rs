@@ -106,7 +106,7 @@ fn snapshot(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
 
 fn add_script(id: &str) -> String {
     format!(
-        "add {id}\n  title \"新标题\"\n  desc \"\"\"新描述\"\"\"\n  source {} 0..3\n  related_by entry\nend\n",
+        "source {id}\n  title \"新标题\"\n  desc \"\"\"新描述\"\"\"\n  source {} 0..3\n  related_by entry\nend\n",
         source()
     )
 }
@@ -973,7 +973,7 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
                     1 => format!("evidence {a}"),
                     2 => "check".to_owned(),
                     3 => format!(
-                        "add {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n section \"s\"\nend"
+                        "source {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n section \"s\"\nend"
                     ),
                     4 => format!(
                         "add {a}\n title \"t\"\n desc \"d\"\n based_on {b}, {b}\n related_by {c}\nend"
@@ -1106,7 +1106,7 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
     let count = files();
     let body = "title \"t\"\n desc \"d\"";
     let cases = [
-        ("E206", format!("source n\n {body}\n section \"s\"\nend")),
+        ("E207", format!("source n\n {body}\n section \"s\"\nend")),
         (
             "E206",
             format!("source n\n {body}\n text \"  \"\n section \"s\"\nend"),
@@ -1129,19 +1129,12 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
             format!("source n\n {body}\n text \"新原文\"\n related ghost\n section \"s\"\nend"),
         ),
         (
+            "E209",
+            format!("source n\n {body}\n text \"新原文\"\n source abc 0..3\n section \"s\"\nend"),
+        ),
+        (
             "E104",
             format!("source n\n {body}\n text \"新原文\"\n based_on entry\n section \"s\"\nend"),
-        ),
-        (
-            "E104",
-            format!(
-                "source n\n {body}\n text \"新原文\"\n source {} 0..3\n section \"s\"\nend",
-                source()
-            ),
-        ),
-        (
-            "E104",
-            format!("add n\n {body}\n text \"新原文\"\n section \"s\"\nend"),
         ),
         (
             "E105",
@@ -1150,6 +1143,23 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
         (
             "E103",
             format!("source n\n {body}\n text \"新原文\"\n section \"s\"\n"),
+        ),
+        // add 必须有 based_on，不能只有原文。
+        ("E207", format!("add n\n {body}\n section \"s\"\nend")),
+        (
+            "E207",
+            format!("add n\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+        ),
+        (
+            "E207",
+            format!(
+                "add n\n {body}\n source {} 0..3\n section \"s\"\nend",
+                source()
+            ),
+        ),
+        (
+            "E206",
+            format!("add n\n {body}\n text \"  \"\n based_on entry\n section \"s\"\nend"),
         ),
     ];
 
@@ -1165,6 +1175,63 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
 
     assert_eq!(snapshot(&memory), before);
     assert_eq!(files(), count, "报错时不能写入原文");
+}
+
+#[test]
+fn add_can_append_source_text_to_a_derived_node() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let script = format!(
+        "add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n source {} 0..3\n section \"s\"\nend\nshow 结论",
+        source()
+    );
+
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.ok, "{}", output.text);
+    assert!(
+        output.text.contains("based_on: ownership"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("\"新原文\""), "{}", output.text);
+    assert!(output.text.contains("\"一\""), "{}", output.text);
+    let id = source_id("新原文".as_bytes());
+    assert_eq!(store.size(&id).unwrap(), Some(9));
+    let evidence = memory.node("结论").unwrap().evidence();
+    assert_eq!(evidence.len(), 3);
+}
+
+#[test]
+fn source_can_reference_existing_text_or_store_both() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let script = format!(
+        "source 甲\n title \"t\"\n desc \"d\"\n source {0} 0..3\n section \"s\"\nend\nsource 乙\n title \"t\"\n desc \"d\"\n source {0} 0..3\n text \"新原文\"\n section \"s\"\nend",
+        source()
+    );
+
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(memory.node("甲").unwrap().evidence().len(), 1);
+    assert_eq!(memory.node("乙").unwrap().evidence().len(), 2);
+}
+
+#[test]
+fn appended_text_is_replayed() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run("add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n section \"s\"\nend");
+    assert!(output.ok, "{}", output.text);
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+
+    assert_eq!(snapshot(&restarted), snapshot(&live));
 }
 
 #[test]
@@ -1242,7 +1309,7 @@ fn full_source_can_page_through_a_large_file() {
 fn full_source_lists_each_file_once_and_handles_nodes_without_sources() {
     let mut memory = memory();
     let two_ranges = format!(
-        "add 两段\n title \"t\"\n desc \"d\"\n source {0} 0..3\n source {0} 3..6\n section \"s\"\nend",
+        "source 两段\n title \"t\"\n desc \"d\"\n source {0} 0..3\n source {0} 3..6\n section \"s\"\nend",
         source()
     );
     ok(&mut memory, &two_ranges);

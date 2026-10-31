@@ -27,7 +27,7 @@ pub struct AddNode {
     pub related: Vec<Name>,
     pub related_by: Vec<Name>,
     pub section: Option<String>,
-    /// `source` 语句写入的原文。`add` 里没有这一项。
+    /// 要存入的新原文。
     pub text: Option<String>,
 }
 

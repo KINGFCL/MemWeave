@@ -122,11 +122,7 @@ impl Checker<'_> {
                     .with_hint("换一个地址，或用 set 修改已有节点"),
             );
         }
-        let mut required = vec![(&add.title, "title"), (&add.description, "desc")];
-        if is_source {
-            required.push((&add.text, "text"));
-        }
-        for (value, clause) in required {
+        for (value, clause) in [(&add.title, "title"), (&add.description, "desc")] {
             match value {
                 None => self.errors.push(
                     Diagnostic::new(
@@ -134,11 +130,7 @@ impl Checker<'_> {
                         id.span,
                         format!("{keyword} {} 缺少 {clause}", id.text),
                     )
-                    .with_hint(if is_source {
-                        "source 必须写 title、desc 和 text"
-                    } else {
-                        "add 必须写 title 和 desc"
-                    }),
+                    .with_hint(format!("{keyword} 必须写 title 和 desc")),
                 ),
                 Some(text) if text.trim().is_empty() => self.errors.push(Diagnostic::new(
                     "E206",
@@ -148,10 +140,25 @@ impl Checker<'_> {
                 Some(_) => {}
             }
         }
-        if !is_source && add.sources.is_empty() && add.based_on.is_empty() {
+        if add.text.as_ref().is_some_and(|text| text.trim().is_empty()) {
+            self.errors.push(Diagnostic::new(
+                "E206",
+                id.span,
+                format!("{keyword} {} 的 text 不能为空", id.text),
+            ));
+        }
+        if is_source && add.text.is_none() && add.sources.is_empty() {
             self.errors.push(
-                Diagnostic::new("E207", id.span, format!("add {} 没有任何证据", id.text))
-                    .with_hint("至少写一条 source 或 based_on；要存入新的原文，请用 source 语句"),
+                Diagnostic::new("E207", id.span, format!("source {} 没有原文", id.text))
+                    .with_hint("用 text 写入新的原文，或用 source 子句引用已有的原文"),
+            );
+        }
+        if !is_source && add.based_on.is_empty() {
+            self.errors.push(
+                Diagnostic::new("E207", id.span, format!("add {} 没有 based_on", id.text))
+                    .with_hint(
+                        "add 用于由别的节点推出的知识，必须写 based_on；只来自原文的知识请用 source 语句",
+                    ),
             );
         }
         if add.related_by.is_empty() && add.section.is_none() {
@@ -197,8 +204,10 @@ impl Checker<'_> {
             id.text.clone(),
             unique(add.based_on.iter().map(|n| n.text.clone())),
         );
-        self.source_counts
-            .insert(id.text.clone(), add.sources.len() + usize::from(is_source));
+        self.source_counts.insert(
+            id.text.clone(),
+            add.sources.len() + usize::from(add.text.is_some()),
+        );
         for from in &add.related_by {
             if self.exists(&from.text) {
                 self.related_of(&from.text).push(id.text.clone());

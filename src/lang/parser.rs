@@ -22,20 +22,22 @@ const KEYWORDS: [&str; 16] = [
     "base",
     "unbase",
 ];
-const ADD_CLAUSES: [&str; 8] = [
+const ADD_CLAUSES: [&str; 9] = [
     "title",
     "desc",
-    "source",
     "based_on",
+    "text",
+    "source",
     "related",
     "related_by",
     "section",
     "end",
 ];
-const SOURCE_CLAUSES: [&str; 7] = [
+const SOURCE_CLAUSES: [&str; 8] = [
     "title",
     "desc",
     "text",
+    "source",
     "related",
     "related_by",
     "section",
@@ -257,7 +259,7 @@ impl Parser {
         Ok(Statement::FullSource { id, offset, limit })
     }
 
-    /// `add` 和 `source` 写法相同：`source` 多一个必填的 `text`，不能写别的证据。
+    /// `add` 和 `source` 写法相同：`add` 必须有 `based_on`，`source` 必须有原文且不能有 `based_on`。
     fn add(&mut self, keyword: &str) -> Result<Statement, Skip> {
         let id = self.name("新节点的地址")?;
         self.end_of_line()?;
@@ -325,18 +327,16 @@ impl Parser {
                 token.span,
                 format!("{keyword} 里不能写 {}", describe(token)),
             );
-            error = match (keyword, clause) {
-                ("source", "source" | "based_on") => error.with_hint(
-                    "source 节点只靠 text 里的原文。要引用已有的原文或别的节点，请用 add",
-                ),
-                ("add", "text") => error.with_hint("要存入新的原文，请用 source 语句，而不是 add"),
-                _ => match closest(clause, allowed.iter().copied()) {
+            error = if clause == "based_on" {
+                error.with_hint("source 只用于直接来自原文的知识；由别的节点推出的知识请用 add")
+            } else {
+                match closest(clause, allowed.iter().copied()) {
                     Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
                     None => error.with_hint(format!(
                         "{keyword} 里可以写：{}。是不是忘了写 end？",
                         allowed.join("、")
                     )),
-                },
+                }
             };
             return self.fail(error);
         }

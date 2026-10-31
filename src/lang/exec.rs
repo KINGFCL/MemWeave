@@ -85,25 +85,14 @@ fn statement(
                 &mut report.read_failures,
             );
         }
-        Statement::Add(add) => {
+        Statement::Add(add) | Statement::Source(add) => {
             let (node, placement) = build_node(add);
             memory.add_node(node, placement, sources)?;
             let _ = writeln!(output, "added {}", add.id.text);
-        }
-        Statement::Source(add) => {
-            let (mut node, placement) = build_node(add);
-            let text = add.text.as_deref().unwrap_or_default();
-            let source = source_id(text.as_bytes());
-            node.evidence = vec![Evidence::Source {
-                source: source.clone(),
-                locator: Locator::TextRange {
-                    start: 0,
-                    end: text.len(),
-                },
-            }];
-            memory.add_node(node, placement, sources)?;
-            let _ = writeln!(output, "added {}", add.id.text);
-            let _ = writeln!(output, "  source: {source} 0..{}", text.len());
+            if let Some(text) = &add.text {
+                let source = source_id(text.as_bytes());
+                let _ = writeln!(output, "  source: {source} 0..{}", text.len());
+            }
         }
         Statement::Remove(id) => {
             let removed = memory.remove_node(&id.text)?;
@@ -164,6 +153,15 @@ fn build_node(add: &AddNode) -> (Node, Placement) {
             },
         })
         .collect();
+    if let Some(text) = &add.text {
+        evidence.push(Evidence::Source {
+            source: source_id(text.as_bytes()),
+            locator: Locator::TextRange {
+                start: 0,
+                end: text.len(),
+            },
+        });
+    }
     evidence.extend(add.based_on.iter().map(|name| Evidence::Node {
         id: name.text.clone(),
     }));

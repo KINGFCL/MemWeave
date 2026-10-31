@@ -36,19 +36,21 @@ full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文
 check                                    列出从总表走不到的节点
 
 修改：
-add 节点
+add 节点                                  新增由别的节点推出的知识
   title "标题"
   desc """描述，可以多行，可以含引号"""
-  source sha256:... 起始..结束             来自原始数据的证据，可以写多条
-  based_on 节点, 节点                      由其他节点推出的证据
+  based_on 节点, 节点                      必填：它依据哪些节点
+  text """原文"""                          可选：同时存入一段新原文
+  source sha256:... 起始..结束             可选：同时引用已有的原文，可以写多条
   related 节点, 节点                       它关联哪些节点
   related_by 节点, 节点                    哪些节点关联它
   section "板块"                           成为这个板块的代表节点
 end
-source 节点
+source 节点                               新增直接来自原文的知识，不能写 based_on
   title "标题"
   desc """描述"""
-  text """原文"""                          把这段文字存成不可变的原文，节点指向它
+  text """原文"""                          把这段文字存成不可变的原文
+  source sha256:... 起始..结束             或者引用已有的原文。这两项至少写一个
   related 节点, 节点
   related_by 节点, 节点
   section "板块"
@@ -62,8 +64,8 @@ base 结论 on 依据
 unbase 结论 on 依据
 
 规则：
-- add 必须有 title、desc，至少一条 source 或 based_on，至少一条 related_by 或 section。
-- source 必须有 title、desc、text，至少一条 related_by 或 section。要记下对话或工具结果里的新内容，就用它。
+- add 必须有 title、desc、based_on，至少一条 related_by 或 section。
+- source 必须有 title、desc，至少一段原文，至少一条 related_by 或 section。要记下对话或工具结果里的新内容，就用它。
 - 节点地址只能包含字母、数字、- 和 _，不能修改。
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
@@ -222,7 +224,7 @@ impl Session<'_> {
 impl Session<'_> {
     fn store_new_sources(&self, statements: &[ast::Located]) -> Result<(), crate::error::Error> {
         for located in statements {
-            if let ast::Statement::Source(add) = &located.statement
+            if let ast::Statement::Add(add) | ast::Statement::Source(add) = &located.statement
                 && let Some(text) = &add.text
             {
                 self.sources.put(text.as_bytes())?;
