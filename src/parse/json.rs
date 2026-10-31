@@ -101,7 +101,6 @@ mod tests {
         format!(r#"{{"id":"{id}","title":"T","description":"D","evidence":[]}}"#)
     }
 
-    /// 创建知识库目录。`nodes` 的每一项是（文件名，内容）。
     fn demo_path() -> &'static Path {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"))
     }
@@ -110,6 +109,7 @@ mod tests {
         Memory::load(&JsonParser, &FileSources::new(demo_path()), demo_path()).unwrap()
     }
 
+    /// 创建知识库目录。`nodes` 的每一项是（文件名，内容）。
     fn knowledge_base(catalog: &str, nodes: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("catalog.json"), catalog).unwrap();
@@ -165,6 +165,32 @@ mod tests {
         let ids: Vec<&str> = parsed.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(parsed.catalog.sections[0].name, "板块");
+    }
+
+    #[test]
+    fn an_empty_knowledge_base_loads() {
+        let dir = knowledge_base(r#"{"sections":[]}"#, &[]);
+
+        let memory = Memory::load(&JsonParser, &FileSources::new(dir.path()), dir.path()).unwrap();
+
+        assert_eq!(memory.node_count(), 0);
+        assert!(memory.catalog().sections.is_empty());
+    }
+
+    #[test]
+    fn section_descriptions_are_read_and_old_catalogs_still_parse() {
+        let a = node_json("a");
+        let old = knowledge_base(CATALOG, &[("a.json", &a)]);
+        let new = knowledge_base(
+            r#"{"sections":[{"name":"板块","description":"描述","nodes":[]}]}"#,
+            &[],
+        );
+
+        let old = JsonParser.parse(old.path()).unwrap();
+        let new = JsonParser.parse(new.path()).unwrap();
+
+        assert_eq!(old.catalog.sections[0].description, "");
+        assert_eq!(new.catalog.sections[0].description, "描述");
     }
 
     #[test]
