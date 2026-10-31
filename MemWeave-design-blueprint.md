@@ -137,6 +137,8 @@ pub trait Model {
 
 ### 厂商差异
 
+目前处于实验阶段，默认使用成本较低的 DeepSeek，也只用它做真实验证。Claude 接入只用模拟服务器测试过。
+
 | | Anthropic | DeepSeek |
 | --- | --- | --- |
 | 默认模型 | `claude-opus-5-5` | `deepseek-flash` |
@@ -154,14 +156,14 @@ pub trait Model {
 ## 8. 命令行
 
 ```bash
-# Claude（默认）
-export ANTHROPIC_API_KEY=...
-cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
-
-# DeepSeek
-export MEMWEAVE_PROVIDER=deepseek
+# DeepSeek（默认）
 export DEEPSEEK_API_KEY=...
 export MEMWEAVE_CONTEXT_LIMIT=100000
+cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
+
+# Claude
+export MEMWEAVE_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=...
 cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
 ```
 
@@ -171,7 +173,7 @@ cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据�
 
 | 环境变量 | 说明 |
 | --- | --- |
-| `MEMWEAVE_PROVIDER` | 模型厂商：`anthropic`（默认）或 `deepseek` |
+| `MEMWEAVE_PROVIDER` | 模型厂商：`deepseek`（默认）或 `anthropic` |
 | `MEMWEAVE_MODEL` | 模型名，默认使用所选厂商的默认模型 |
 | `MEMWEAVE_CONTEXT_LIMIT` | 模型的输入 token 上限 |
 | `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` | Claude 的密钥和地址 |

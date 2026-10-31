@@ -1,7 +1,14 @@
 [package]
 name = "memweave"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
+description = "Experimental and unstable: model-driven knowledge graph retrieval that returns a tree of knowledge nodes"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["knowledge-graph", "retrieval", "llm", "rag"]
+categories = ["command-line-utilities"]
+# 白名单：只打包列出的文件，避免把本地的密钥或笔记带进发布包。
+include = ["/src/**/*.rs", "/examples/demo-kb/**/*.json", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

@@ -11,13 +11,13 @@ const USAGE: &str = "\
 用法：memweave query <知识库目录> <问题>
 
 环境变量：
-  MEMWEAVE_PROVIDER       可选，模型厂商：anthropic（默认）或 deepseek
+  MEMWEAVE_PROVIDER       可选，模型厂商：deepseek（默认）或 anthropic
   MEMWEAVE_MODEL          可选，默认使用所选厂商的默认模型
   MEMWEAVE_CONTEXT_LIMIT  模型的输入 token 上限：
                           anthropic 可选，默认从 Models API 查询；deepseek 必填
 
-  anthropic：ANTHROPIC_API_KEY 必填，ANTHROPIC_BASE_URL 可选
-  deepseek： DEEPSEEK_API_KEY 必填，DEEPSEEK_BASE_URL 可选";
+  deepseek： DEEPSEEK_API_KEY 必填，DEEPSEEK_BASE_URL 可选
+  anthropic：ANTHROPIC_API_KEY 必填，ANTHROPIC_BASE_URL 可选";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -50,7 +50,7 @@ fn run(kb: &str, query: &str) -> Result<String, String> {
 
 /// 根据环境变量创建模型。接入新厂商时，在这里加一个分支。
 fn connect_model() -> Result<Box<dyn Model>, String> {
-    let provider = env_or("MEMWEAVE_PROVIDER", "anthropic");
+    let provider = env_or("MEMWEAVE_PROVIDER", "deepseek");
     let context_limit = context_limit()?;
 
     match provider.as_str() {
