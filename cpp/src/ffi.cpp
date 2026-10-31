@@ -120,6 +120,16 @@ bool mw_node_remove_evidence(Node* node, Bytes id) noexcept {
   return memweave::remove_node_evidence(node, id);
 }
 
+bool mw_node_add_source_evidence(Node* node, Bytes source, std::uint64_t start,
+                                 std::uint64_t end) noexcept {
+  return memweave::add_source_evidence(node, source, start, end);
+}
+
+bool mw_node_remove_source_evidence(Node* node, Bytes source, std::uint64_t start,
+                                    std::uint64_t end) noexcept {
+  return memweave::remove_source_evidence(node, source, start, end);
+}
+
 NodeIndex* mw_index_new() noexcept { return new (std::nothrow) NodeIndex(); }
 
 void mw_index_free(NodeIndex* index) noexcept { delete index; }

@@ -49,7 +49,7 @@ class Graph {
     if (live_.empty()) return;
     Node* node = live_[random() % live_.size()];
     Node* other = live_[random() % live_.size()];
-    switch (random() % 6) {
+    switch (random() % 8) {
       case 0: {
         const std::string text(random() % 200, 'x');
         if (!set_text(node, TextField::kDescription, bytes(text))) fail("分配失败");
@@ -71,6 +71,35 @@ class Graph {
           if (!add_node_evidence(node, other)) fail("分配失败");
         }
         break;
+      case 5: {
+        const std::string source = "sha256:" + std::to_string(random() % 5);
+        const std::uint64_t start = random() % 100;
+        if (!add_source_evidence(node, bytes(source), start, start + 1)) fail("分配失败");
+        break;
+      }
+      case 6: {
+        const EvidenceList* evidence = node->evidence;
+        if (evidence->count < 2) break;
+        for (std::size_t i = 0; i < evidence->count; ++i) {
+          const Evidence& entry = evidence->entries()[i];
+          if (entry.kind == EvidenceKind::kTextRange) {
+            // 重写后旧的列表就释放了，所以先把要用的内容复制出来。
+            const std::string source(entry.id, entry.id_len);
+            const std::uint64_t start = entry.start;
+            const std::uint64_t end = entry.end;
+            if (!remove_source_evidence(node, bytes(source), start, end)) fail("分配失败");
+            for (std::size_t j = 0; j < node->evidence->count; ++j) {
+              const Evidence& left = node->evidence->entries()[j];
+              if (left.kind == EvidenceKind::kTextRange && left.start == start && left.end == end &&
+                  source == std::string(left.id, left.id_len)) {
+                fail("来源证据没有去掉");
+              }
+            }
+            break;
+          }
+        }
+        break;
+      }
       default: {
         const EvidenceList* evidence = node->evidence;
         for (std::size_t i = 0; i < evidence->count; ++i) {

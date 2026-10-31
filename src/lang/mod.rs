@@ -66,6 +66,9 @@ set 节点 title "新标题"
 set 节点 desc """新描述"""
 base 结论 on 依据
 unbase 结论 on 依据
+cite 节点 text """原文"""                  存一段新原文，并让节点引用它
+cite 节点 source sha256:... 起始..结束     让节点引用已有原文的一段
+uncite 节点 source sha256:... 起始..结束   去掉节点对这段原文的引用，地址和范围抄 show 的输出
 export "路径"                             把当前记忆导出成新的知识库目录，只带节点引用到的原文
 
 规则：
@@ -77,7 +80,8 @@ export "路径"                             把当前记忆导出成新的知识
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
 - 还有结论依据某个节点时不能删除它。先用 base 和 unbase 给这些结论换依据，或者先删除它们，可以写在同一段脚本里。
-- 修改描述后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
+- 修改描述或原文引用后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
+- 原文说错或过时了：写一段脚本，用 cite 引用新原文，uncite 去掉旧的，需要时用 set 改描述。原文本身不可变，节点至少要留一条证据。
 - 删除节点或减少关联后，可能有节点走不到了，用 check 确认。
 - export 的目标必须不存在或是空目录，不会覆盖。有节点走不到时会拒绝导出并列出它们，接入或删除后再导出。
 "####;
@@ -232,9 +236,15 @@ impl Session<'_> {
 impl Session<'_> {
     fn store_new_sources(&self, statements: &[ast::Located]) -> Result<(), crate::error::Error> {
         for located in statements {
-            if let ast::Statement::Add(add) | ast::Statement::Source(add) = &located.statement
-                && let Some(text) = &add.text
-            {
+            let text = match &located.statement {
+                ast::Statement::Add(add) | ast::Statement::Source(add) => add.text.as_deref(),
+                ast::Statement::Cite {
+                    citation: ast::Citation::Text(text),
+                    ..
+                } => Some(text.text.as_str()),
+                _ => None,
+            };
+            if let Some(text) = text {
                 self.sources.put(text.as_bytes())?;
             }
         }

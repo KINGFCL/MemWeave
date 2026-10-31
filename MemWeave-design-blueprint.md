@@ -369,7 +369,7 @@ memweave run --write my-kb -                   # 从标准输入读脚本
 | 类型 | 语句 |
 | --- | --- |
 | 读 | `catalog show`、`show`、`links`、`evidence`、`based_by`、`related_by`、`full_source`、`check` |
-| 写 | `add`、`source`、`remove`、`set`、`link`、`unlink`、`base`、`unbase`、`catalog create`、`catalog describe`、`catalog rename`、`catalog delete`、`catalog add`、`catalog remove` |
+| 写 | `add`、`source`、`remove`、`set`、`link`、`unlink`、`base`、`unbase`、`cite`、`uncite`、`catalog create`、`catalog describe`、`catalog rename`、`catalog delete`、`catalog add`、`catalog remove` |
 | 导出 | `export`：不改图，不写日志，但会写磁盘，所以只读会话不能用 |
 
 agent 不一定要从总表开始，知道地址就可以直接 `show`，再用 `links` 沿关系走。
@@ -426,7 +426,14 @@ agent 不一定要从总表开始，知道地址就可以直接 `show`，再用 
 
 写 `text` 时会把它存成不可变的原文。流程是检查 → 写入原文 → 写日志 → 改图：报错时什么都不写；中途崩溃最多留下一个没人引用的原文文件。日志里也有这段文字，文件丢了能在重放时恢复。
 
-这些规则只管创建。之后用 `base` 和 `unbase` 调整依据时，只要求节点至少还有一条证据。
+这些规则只管创建。之后用 `base`、`unbase`、`cite`、`uncite` 调整证据时，只要求节点至少还有一条证据。
+
+原文说错或过时了，就在一段脚本里用 `cite` 引用新原文、`uncite` 去掉旧的，需要时用 `set` 改描述。
+
+- `cite 节点 text """原文"""` 新存一段原文并引用它，范围是整段；`cite 节点 source sha256:... 3..9` 引用已有原文的一段。证据加在列表末尾。写 `text` 时的流程和 `add` 相同：检查 → 写入原文 → 写日志 → 改图。
+- `uncite 节点 source sha256:... 3..9` 只去掉这一条，同一来源的其他范围保留。必须写具体范围，模型不会误删别的段落。
+- 这两条指令不改描述，不碰反向列表和总表，也不删除原文文件。没有节点引用的旧原文留在 `sources/` 里，`export` 不会带上它。
+- 它们和 `set desc` 一样，用 warning 列出 `based_by` 里的节点。这只是当次提醒，不会保存。
 
 模型随时可以看到完整的原始数据：`show` 和 `evidence` 显示节点引用的那一段，`full_source` 显示整个文件。输出有上限，所以文件很大时要分段读，每段都会告诉模型下一段的位置。
 
@@ -463,7 +470,6 @@ agent 不一定要从总表开始，知道地址就可以直接 `show`，再用 
 - **更细的证据粒度**：目前证据的最小单位是一行，一整段写在一行的文本无法再拆开。
 - **运行时确认**：模型逐层判断时可以要求查看某个节点的原文。目前要由调用方用 `evidence` 读取。
 - **日志整理**：把 `journal.jsonl` 合并回 JSON。目前日志只增不减，加载时要全部重放。
-- **修改已有节点的来源证据**：`source` 只能新建节点，还不能让已有节点改为引用新原文。
 - **纠错**：模型发现记忆和现实对不上时修改记忆。记忆和原文不符时改记忆；原文和现实不符时原文保留，把新观察存成新来源。修改要保留历史，并把依赖它的节点标记为待复查。需要让 `Memory` 变成可写的。
 - **常驻进程**：目前命令行每次查询都是一个新进程，都要重新解析整个知识库。`Memory` 要配合常驻进程才能发挥价值。
 - **节点删除和内存回收**：纠错和增量写入都需要，要先解决读取线程还拿着旧地址的问题。

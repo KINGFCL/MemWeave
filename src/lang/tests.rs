@@ -745,7 +745,19 @@ fn random_statement(random: &mut Random, source: &str) -> String {
     let a = IDS[random.next() % IDS.len()];
     let b = IDS[random.next() % IDS.len()];
     let c = IDS[random.next() % IDS.len()];
-    match random.next() % 20 {
+    match random.next() % 25 {
+        20 => format!("cite {a} text \"\"\"原文{b}\"\"\""),
+        21 => format!("cite {a} source {source} 0..3"),
+        22 => format!("cite {a} source {source} 3..6"),
+        23 => format!("uncite {a} source {source} 0..3"),
+        24 => {
+            let text = format!("原文{b}");
+            format!(
+                "uncite {a} source {} 0..{}",
+                source_id(text.as_bytes()),
+                text.len()
+            )
+        }
         14 => "catalog show".to_owned(),
         15 => format!("catalog create \"{a}\" desc \"d\""),
         16 => format!("catalog delete \"{a}\""),
@@ -1842,9 +1854,9 @@ fn random_scripts_export_exactly_what_execution_produces() {
     let (dir, store) = file_store();
     let source = source();
     let mut random = Random(0x0fed_cba9_8765_4321);
-    let (mut exported, mut refused) = (0, 0);
+    let (mut exported, mut refused, mut recited) = (0, 0, 0);
 
-    for round in 0..80 {
+    for round in 0..120 {
         let mut live = memory();
         // 随机语句很少让节点走不到，一半的轮次从走不到的状态开始。
         if round % 2 == 1 {
@@ -1882,11 +1894,19 @@ fn random_scripts_export_exactly_what_execution_produces() {
                 let output = run_with(&mut live, &store, &with_export);
                 assert!(output.ok, "{script}\n{}", output.text);
                 assert_eq!(same_content(&load_exported(&target)), same_content(&live));
+                let original = (source.clone(), 0, 3);
+                if live
+                    .nodes()
+                    .any(|node| source_entries(&live, node.id()) != [original.clone()])
+                {
+                    recited += 1;
+                }
             }
         }
     }
 
     assert!(exported > 100 && refused > 100, "{exported} {refused}");
+    assert!(recited > 50, "随机脚本很少改到原文引用：{recited}");
 }
 
 #[test]
@@ -2047,4 +2067,307 @@ fn pages_reach_edges_beyond_the_largest_limit() {
 
     let expected: Vec<String> = targets.iter().map(|id| format!("hub -> {id}")).collect();
     assert_eq!(seen, expected);
+}
+
+fn source_entries(memory: &Memory, id: &str) -> Vec<(String, usize, usize)> {
+    memory
+        .node(id)
+        .unwrap()
+        .evidence()
+        .into_iter()
+        .filter_map(|evidence| match evidence {
+            Evidence::Source {
+                source,
+                locator: Locator::TextRange { start, end },
+            } => Some((source, start, end)),
+            Evidence::Node { .. } => None,
+        })
+        .collect()
+}
+
+#[test]
+fn cite_text_stores_it_and_warns_about_dependents() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let new = "用户纠正后的原文。";
+    let id = source_id(new.as_bytes());
+
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("cite ownership text \"\"\"{new}\"\"\"\nshow ownership"),
+    );
+
+    assert!(output.ok, "{}", output.text);
+    assert!(output.text.contains("cited ownership"), "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains(&format!("source: {id} 0..{}", new.len())),
+        "{}",
+        output.text
+    );
+    assert!(
+        output
+            .text
+            .contains("warning: conclusion 依据 ownership，证据变了，它可能需要复查"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains(new), "{}", output.text);
+    assert_eq!(
+        source_entries(&memory, "ownership"),
+        [(source(), 0, 3), (id.clone(), 0, new.len())]
+    );
+    assert!(
+        dir.path()
+            .join("sources")
+            .join(&id["sha256:".len()..])
+            .exists()
+    );
+}
+
+#[test]
+fn uncite_removes_only_that_range() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let source = source();
+
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("cite entry source {source} 3..6\nuncite entry source {source} 0..3"),
+    );
+
+    assert!(output.ok, "{}", output.text);
+    assert!(output.text.contains("uncited entry"), "{}", output.text);
+    assert_eq!(source_entries(&memory, "entry"), [(source, 3, 6)]);
+}
+
+#[test]
+fn a_script_can_replace_a_source_and_the_description() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let old = source();
+    let new = "新的原文";
+    let script = format!(
+        "cite ownership text \"\"\"{new}\"\"\"\nuncite ownership source {old} 0..3\nset ownership desc \"\"\"新的描述\"\"\"",
+    );
+
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.ok, "{}", output.text);
+    let node = memory.node("ownership").unwrap();
+    assert_eq!(node.description(), "新的描述");
+    assert_eq!(
+        source_entries(&memory, "ownership"),
+        [(source_id(new.as_bytes()), 0, new.len())]
+    );
+}
+
+#[test]
+fn cite_and_uncite_are_checked_like_a_compiler() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let source = source();
+    let run = |memory: &mut Memory, script: &str, code: &str| {
+        let before = snapshot(memory);
+        let output = run_with(memory, &store, script);
+        assert!(!output.ok, "应该失败：{script}");
+        assert!(
+            output.text.contains(&format!("error[{code}]")),
+            "缺少 {code}：{}",
+            output.text
+        );
+        assert_eq!(snapshot(memory), before, "{script}");
+    };
+
+    run(&mut memory, "cite ghost text \"x\"", "E201");
+    run(
+        &mut memory,
+        &format!("uncite ghost source {source} 0..3"),
+        "E201",
+    );
+    run(&mut memory, "cite entry text \"  \"", "E206");
+    run(&mut memory, "cite entry source bad-id 0..3", "E209");
+    run(
+        &mut memory,
+        &format!("cite entry source {source} 3..3"),
+        "E209",
+    );
+    run(
+        &mut memory,
+        &format!("cite entry source {source} 0..99999"),
+        "E209",
+    );
+    let missing = source_id(b"not stored");
+    run(
+        &mut memory,
+        &format!("cite entry source {missing} 0..1"),
+        "E209",
+    );
+    run(
+        &mut memory,
+        &format!("cite entry source {source} 0..3"),
+        "E210",
+    );
+    // 同一段脚本里重复。
+    run(
+        &mut memory,
+        &format!("cite entry source {source} 3..6\ncite entry source {source} 3..6"),
+        "E210",
+    );
+    run(
+        &mut memory,
+        "cite entry text \"x\"\ncite entry text \"x\"",
+        "E210",
+    );
+    run(
+        &mut memory,
+        &format!("uncite entry source {source} 3..6"),
+        "E211",
+    );
+    // 最后一条证据不能去掉，先去再加也不行。
+    let text = {
+        let output = run_with(
+            &mut memory,
+            &store,
+            &format!("uncite entry source {source} 0..3"),
+        );
+        assert!(output.text.contains("error[E207]"), "{}", output.text);
+        output.text
+    };
+    assert!(text.contains("先用 cite 或 base"), "{text}");
+    run(
+        &mut memory,
+        &format!("uncite entry source {source} 0..3\ncite entry source {source} 3..6"),
+        "E207",
+    );
+
+    let output = run_with(&mut memory, &store, "ciet entry text \"x\"");
+    assert!(
+        output.text.contains("你是不是想写 cite？"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn evidence_only_has_to_stay_non_empty() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let source = source();
+
+    // add 建的结论可以换成只靠原文。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("cite conclusion source {source} 3..6\nunbase conclusion on ownership"),
+    );
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(memory.node("conclusion").unwrap().based_on().count(), 0);
+
+    // source 建的节点可以换成只靠依据。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("base entry on borrowing\nuncite entry source {source} 0..3"),
+    );
+    assert!(output.ok, "{}", output.text);
+    assert!(source_entries(&memory, "entry").is_empty());
+
+    // 这时再去掉依据就没有证据了。
+    let output = run_with(&mut memory, &store, "unbase entry on borrowing");
+    assert!(output.text.contains("error[E207]"), "{}", output.text);
+
+    // 同一段脚本里新建的节点，检查也看得到它的原文。
+    let text = "新节点的原文";
+    let new = format!(
+        "source 新\n title \"t\"\n desc \"d\"\n text \"\"\"{text}\"\"\"\n related_by entry\nend\nuncite 新 source {} 0..{}",
+        source_id(text.as_bytes()),
+        text.len()
+    );
+    let output = run_with(&mut memory, &store, &new);
+    assert!(output.text.contains("error[E207]"), "{}", output.text);
+}
+
+#[test]
+fn failed_or_read_only_cites_store_nothing() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let count = || fs::read_dir(dir.path().join("sources")).unwrap().count();
+    let before = count();
+
+    let output = run_with(
+        &mut memory,
+        &store,
+        "cite entry text \"存不下来\"\nshow ghost",
+    );
+    assert!(output.text.contains("error[E201]"), "{}", output.text);
+    assert_eq!(count(), before);
+
+    let output =
+        Session::new(&mut memory, &store, Mode::ReadOnly).run("cite entry text \"存不下来\"");
+    assert!(output.text.contains("error[E301]"), "{}", output.text);
+    let output = Session::new(&mut memory, &store, Mode::ReadOnly)
+        .run(&format!("uncite entry source {} 0..3", source()));
+    assert!(output.text.contains("error[E301]"), "{}", output.text);
+    assert_eq!(count(), before);
+}
+
+#[test]
+fn cite_and_uncite_are_replayed_and_lost_text_is_restored() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let text = "只存在日志里也能恢复的原文";
+    let id = source_id(text.as_bytes());
+    let script = format!(
+        "cite ownership text \"\"\"{text}\"\"\"\nuncite ownership source {} 0..3",
+        source()
+    );
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&script);
+    assert!(output.ok, "{}", output.text);
+
+    let path = dir.path().join("sources").join(&id["sha256:".len()..]);
+    fs::remove_file(&path).unwrap();
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn export_follows_the_current_citations() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+    let (old, text) = (source(), "替换后的原文");
+    // 所有节点都换掉旧原文，它就不会被导出。
+    let script: String = ["entry", "ownership", "borrowing", "conclusion"]
+        .iter()
+        .map(|id| {
+            let uncite = if *id == "conclusion" {
+                String::new()
+            } else {
+                format!("uncite {id} source {old} 0..3\n")
+            };
+            format!("cite {id} text \"\"\"{text}\"\"\"\n{uncite}")
+        })
+        .collect();
+    let script = format!("{script}{}", export_to(&target));
+
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.ok, "{}", output.text);
+    assert!(output.text.contains("1 sources"), "{}", output.text);
+    let names: Vec<_> = fs::read_dir(target.join("sources"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, [&source_id(text.as_bytes())["sha256:".len()..]]);
+    assert_eq!(same_content(&load_exported(&target)), same_content(&memory));
 }

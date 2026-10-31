@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::Mode;
-use super::ast::{AddNode, Label, Located, Name, Statement};
+use super::ast::{AddNode, Citation, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use crate::export::target_problem;
 use crate::knowledge::{Evidence, Locator};
 use crate::memory::{Memory, check_sources, is_valid_id};
-use crate::source::SourceStore;
+use crate::source::{SourceStore, source_id};
 
 /// 提示“你是不是想写”时要逐个比较，节点太多就不提示了。
 const MAX_SUGGESTION_SCAN: usize = 200_000;
@@ -29,7 +29,7 @@ pub fn check(
         removed: HashSet::new(),
         related: HashMap::new(),
         based_on: HashMap::new(),
-        source_counts: HashMap::new(),
+        cited: HashMap::new(),
         removed_ever: HashSet::new(),
         sections: memory
             .catalog()
@@ -60,6 +60,17 @@ pub fn check(
     checker.errors
 }
 
+/// 一段被引用的原文：来源地址、起始和结束。
+type Cited = (String, usize, usize);
+
+fn cited_range(source: &SourceRef) -> Cited {
+    (source.source.text.clone(), source.start, source.end)
+}
+
+fn cited_text(text: &str) -> Cited {
+    (source_id(text.as_bytes()), 0, text.len())
+}
+
 struct Checker<'a> {
     memory: &'a Memory,
     sources: &'a dyn SourceStore,
@@ -68,7 +79,8 @@ struct Checker<'a> {
     removed: HashSet<String>,
     related: HashMap<String, Vec<String>>,
     based_on: HashMap<String, Vec<String>>,
-    source_counts: HashMap<String, usize>,
+    /// 每个节点引用的原文：来源地址和范围。
+    cited: HashMap<String, Vec<Cited>>,
     /// 本脚本删除过的节点，内存里指向它们的关联在执行时已经不在了。
     removed_ever: HashSet<String>,
     /// 模拟到当前语句时的总表：板块的名字和代表节点。
@@ -85,6 +97,8 @@ impl Checker<'_> {
         match statement {
             Statement::CatalogShow | Statement::Check => {}
             Statement::Export(path) => self.export(path),
+            Statement::Cite { id, citation } => self.cite(id, citation),
+            Statement::Uncite { id, source } => self.uncite(id, source),
             Statement::CatalogCreate { name, description } => {
                 self.nonblank(name, "板块的名字");
                 self.nonblank(description, "板块的描述");
@@ -180,7 +194,7 @@ impl Checker<'_> {
                     self.new_nodes.retain(|name| name.text != id.text);
                     self.related.remove(&id.text);
                     self.based_on.remove(&id.text);
-                    self.source_counts.remove(&id.text);
+                    self.cited.remove(&id.text);
                 }
             }
             Statement::Link { from, to } => self.link(from, to),
@@ -297,10 +311,10 @@ impl Checker<'_> {
             id.text.clone(),
             unique(add.based_on.iter().map(|n| n.text.clone())),
         );
-        self.source_counts.insert(
-            id.text.clone(),
-            add.sources.len() + usize::from(add.text.is_some()),
-        );
+        let mut cited: Vec<Cited> = add.sources.iter().map(cited_range).collect();
+        cited.extend(add.text.as_deref().map(cited_text));
+        cited.dedup();
+        self.cited.insert(id.text.clone(), cited);
         for from in &add.related_by {
             if self.exists(&from.text) {
                 self.related_of(&from.text).push(id.text.clone());
@@ -379,7 +393,7 @@ impl Checker<'_> {
         if !known {
             return;
         }
-        let sources = self.source_count_of(&id.text);
+        let sources = self.cited_of(&id.text).len();
         let list = self.based_on_of(&id.text);
         if !list.contains(&on.text) {
             self.errors.push(
@@ -395,11 +409,92 @@ impl Checker<'_> {
                     on.span,
                     format!("去掉后 {} 就没有任何证据了", id.text),
                 )
-                .with_hint("先用 base 加上新的依据，或者用 remove 删除这个结论"),
+                .with_hint("先用 base 或 cite 加上新的证据，或者用 remove 删除这个结论"),
             );
             return;
         }
         list.retain(|other| *other != on.text);
+    }
+
+    fn cite(&mut self, id: &Name, citation: &Citation) {
+        let known = self.require(id);
+        let (cited, span) = match citation {
+            Citation::Text(text) => {
+                self.nonblank(text, "原文");
+                if text.text.trim().is_empty() {
+                    return;
+                }
+                (cited_text(&text.text), text.span)
+            }
+            Citation::Source(source) => {
+                let evidence = [Evidence::Source {
+                    source: source.source.text.clone(),
+                    locator: Locator::TextRange {
+                        start: source.start,
+                        end: source.end,
+                    },
+                }];
+                let problems = check_sources(&id.text, &evidence, self.sources);
+                if !problems.is_empty() {
+                    for problem in problems {
+                        self.errors.push(Diagnostic::new(
+                            "E209",
+                            source.source.span,
+                            problem.to_string(),
+                        ));
+                    }
+                    return;
+                }
+                (cited_range(source), source.source.span)
+            }
+        };
+        if !known {
+            return;
+        }
+        if self.cited_of(&id.text).contains(&cited) {
+            self.errors.push(Diagnostic::new(
+                "E210",
+                span,
+                format!(
+                    "{} 已经引用了 {} 的 {}..{}",
+                    id.text, cited.0, cited.1, cited.2
+                ),
+            ));
+            return;
+        }
+        self.cited_of(&id.text).push(cited);
+    }
+
+    fn uncite(&mut self, id: &Name, source: &SourceRef) {
+        if !self.require(id) {
+            return;
+        }
+        let cited = cited_range(source);
+        let span = source.source.span;
+        let no_nodes = self.based_on_of(&id.text).is_empty();
+        let list = self.cited_of(&id.text);
+        if !list.contains(&cited) {
+            self.errors.push(
+                Diagnostic::new(
+                    "E211",
+                    span,
+                    format!(
+                        "{} 没有引用 {} 的 {}..{}",
+                        id.text, cited.0, cited.1, cited.2
+                    ),
+                )
+                .with_hint(format!("用 show {} 查看它现有的原文", id.text)),
+            );
+            return;
+        }
+        if no_nodes && list.len() == 1 {
+            self.errors.push(
+                Diagnostic::new("E207", span, format!("去掉后 {} 就没有任何证据了", id.text))
+                    .with_hint("先用 cite 或 base 加上新的证据，或者用 remove 删除这个节点"),
+            );
+            return;
+        }
+        list.retain(|other| *other != cited);
     }
 
     /// 脚本结束时，新节点必须有路可达：它是板块的代表，或者有已接入的节点关联它。
@@ -638,14 +733,24 @@ impl Checker<'_> {
         })
     }
 
-    fn source_count_of(&mut self, id: &str) -> usize {
+    fn cited_of(&mut self, id: &str) -> &mut Vec<Cited> {
         let memory = self.memory;
-        *self.source_counts.entry(id.to_owned()).or_insert_with(|| {
-            memory.node(id).map_or(0, |node| {
-                node.evidence()
-                    .iter()
-                    .filter(|evidence| matches!(evidence, Evidence::Source { .. }))
-                    .count()
+        self.cited.entry(id.to_owned()).or_insert_with(|| {
+            memory.node(id).map_or_else(Vec::new, |node| {
+                let mut cited = Vec::new();
+                for evidence in node.evidence() {
+                    if let Evidence::Source {
+                        source,
+                        locator: Locator::TextRange { start, end },
+                    } = evidence
+                    {
+                        let entry = (source, start, end);
+                        if !cited.contains(&entry) {
+                            cited.push(entry);
+                        }
+                    }
+                }
+                cited
             })
         })
     }

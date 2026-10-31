@@ -43,6 +43,13 @@ pub struct Label {
     pub span: Span,
 }
 
+/// `cite` 引用的原文：新存一段，或者已有原文的一段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Citation {
+    Text(Label),
+    Source(SourceRef),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     CatalogShow,
@@ -69,6 +76,14 @@ pub enum Statement {
     },
     Check,
     Export(Label),
+    Cite {
+        id: Name,
+        citation: Citation,
+    },
+    Uncite {
+        id: Name,
+        source: SourceRef,
+    },
     Show(Name),
     Links {
         id: Name,

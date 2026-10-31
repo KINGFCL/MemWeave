@@ -1,10 +1,10 @@
 //! 语法分析：把词组成语句。出错后跳到下一行继续，这样一次能报告所有语法错误。
 
-use super::ast::{AddNode, Field, Label, Located, Name, SourceRef, Statement};
+use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-const KEYWORDS: [&str; 17] = [
+const KEYWORDS: [&str; 19] = [
     "catalog",
     "check",
     "export",
@@ -22,6 +22,8 @@ const KEYWORDS: [&str; 17] = [
     "set",
     "base",
     "unbase",
+    "cite",
+    "uncite",
 ];
 const ADD_CLAUSES: [&str; 8] = [
     "title",
@@ -127,6 +129,15 @@ impl Parser {
                 Statement::Unbase { id, on }
             }
             "full_source" => self.full_source()?,
+            "cite" => self.cite()?,
+            "uncite" => {
+                let id = self.name("节点地址")?;
+                self.expect_word("source", "写法：uncite 节点 source sha256:... 起始..结束")?;
+                Statement::Uncite {
+                    id,
+                    source: self.source_ref()?,
+                }
+            }
             "add" => return self.add("add"),
             "source" => return self.add("source"),
             other => {
@@ -141,6 +152,49 @@ impl Parser {
         };
         self.end_of_line()?;
         Ok(statement)
+    }
+
+    fn cite(&mut self) -> Result<Statement, Skip> {
+        let id = self.name("节点地址")?;
+        let kind = self.peek_word().map(|token| word_of(&token));
+        let citation = match kind.as_deref() {
+            Some("text") => {
+                self.position += 1;
+                Citation::Text(self.label("原文")?)
+            }
+            Some("source") => {
+                self.position += 1;
+                Citation::Source(self.source_ref()?)
+            }
+            _ => {
+                return self.fail(
+                    Diagnostic::new("E102", self.current_span(), "这里应该写 text 或 source")
+                        .with_hint(
+                            "写法：cite 节点 text \"\"\"原文\"\"\"，或 cite 节点 source sha256:... 起始..结束",
+                        ),
+                );
+            }
+        };
+        Ok(Statement::Cite { id, citation })
+    }
+
+    fn source_ref(&mut self) -> Result<SourceRef, Skip> {
+        let source = self.name("来源地址")?;
+        let start = self.number("起始位置")?;
+        match self.peek() {
+            Some(Token {
+                kind: TokenKind::DotDot,
+                ..
+            }) => self.position += 1,
+            _ => {
+                return self.fail(
+                    Diagnostic::new("E102", self.current_span(), "这里应该写 ..")
+                        .with_hint("写法：source sha256:... 起始..结束"),
+                );
+            }
+        }
+        let end = self.number("结束位置")?;
+        Ok(SourceRef { source, start, end })
     }
 
     fn catalog(&mut self, keyword: &Token) -> Result<Statement, Skip> {
@@ -469,22 +523,8 @@ impl Parser {
                 self.once(&mut add.text, value, token.span, "text")?;
             }
             "source" => {
-                let source = self.name("来源地址")?;
-                let start = self.number("起始位置")?;
-                match self.peek() {
-                    Some(Token {
-                        kind: TokenKind::DotDot,
-                        ..
-                    }) => self.position += 1,
-                    _ => {
-                        return self.fail(
-                            Diagnostic::new("E102", self.current_span(), "这里应该写 ..")
-                                .with_hint("写法：source sha256:... 起始..结束"),
-                        );
-                    }
-                }
-                let end = self.number("结束位置")?;
-                add.sources.push(SourceRef { source, start, end });
+                let source = self.source_ref()?;
+                add.sources.push(source);
             }
             "based_on" => add.based_on.extend(self.names()?),
             "related" => add.related.extend(self.names()?),
@@ -712,6 +752,43 @@ mod tests {
         );
         assert!(
             matches!(&parsed[3], Statement::Base { id, on } if id.text == "a" && on.text == "b")
+        );
+    }
+
+    #[test]
+    fn parses_cite_and_uncite() {
+        let parsed = statements(
+            "cite a text \"\"\"原文\"\"\"\ncite a source sha256:ab 1..9\nuncite a source sha256:ab 1..9",
+        );
+
+        assert!(matches!(
+            &parsed[0],
+            Statement::Cite { id, citation: Citation::Text(text) }
+                if id.text == "a" && text.text == "原文"
+        ));
+        let Statement::Cite {
+            citation: Citation::Source(source),
+            ..
+        } = &parsed[1]
+        else {
+            panic!("应为引用已有原文");
+        };
+        assert_eq!(source.source.text, "sha256:ab");
+        assert_eq!((source.start, source.end), (1, 9));
+        assert!(matches!(
+            &parsed[2],
+            Statement::Uncite { source, .. } if (source.start, source.end) == (1, 9)
+        ));
+
+        let found = errors(
+            "cite a\ncite a \"原文\"\ncite a text\ncite a source sha256:ab 1\nuncite a\nuncite a text \"x\"\nuncite a source sha256:ab\ncite a text \"x\" y",
+        );
+        let codes: Vec<&str> = found.iter().map(|error| error.code).collect();
+        assert_eq!(
+            codes,
+            [
+                "E102", "E102", "E102", "E102", "E102", "E102", "E102", "E106"
+            ]
         );
     }
 

@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::Path;
 
-use super::ast::{AddNode, Field, Located, Statement};
+use super::ast::{AddNode, Citation, Field, Located, Statement};
 use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
@@ -204,8 +204,30 @@ fn statement(
             let _ = writeln!(output, "updated {}", id.text);
             let node = existing(memory, &id.text)?;
             if *field == Field::Description {
-                render_review(node, output);
+                render_review(node, "内容", output);
             }
+        }
+        Statement::Cite { id, citation } => {
+            let (source, start, end) = match citation {
+                Citation::Text(text) => (source_id(text.text.as_bytes()), 0, text.text.len()),
+                Citation::Source(source) => (source.source.text.clone(), source.start, source.end),
+            };
+            let locator = Locator::TextRange { start, end };
+            memory.cite(&id.text, &source, &locator, sources)?;
+            let _ = writeln!(output, "cited {}", id.text);
+            if matches!(citation, Citation::Text(_)) {
+                let _ = writeln!(output, "  source: {source} {start}..{end}");
+            }
+            render_review(existing(memory, &id.text)?, "证据", output);
+        }
+        Statement::Uncite { id, source } => {
+            let locator = Locator::TextRange {
+                start: source.start,
+                end: source.end,
+            };
+            memory.uncite(&id.text, &source.source.text, &locator)?;
+            let _ = writeln!(output, "uncited {}", id.text);
+            render_review(existing(memory, &id.text)?, "证据", output);
         }
         Statement::Base { id, on } => {
             memory.base(&id.text, &on.text)?;
@@ -495,11 +517,11 @@ fn render_removed(removed: &RemovedNode, output: &mut String) {
 }
 
 /// 描述变了，依据它的结论可能要跟着变。
-fn render_review(node: NodeRef<'_>, output: &mut String) {
+fn render_review(node: NodeRef<'_>, changed: &str, output: &mut String) {
     for dependent in node.based_by() {
         let _ = writeln!(
             output,
-            "warning: {} 依据 {}，内容变了，它可能需要复查",
+            "warning: {} 依据 {}，{changed}变了，它可能需要复查",
             dependent.id(),
             node.id()
         );

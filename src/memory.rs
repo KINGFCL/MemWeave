@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::error::Error;
 use crate::ffi::{self, RawBytes, RawEvidence, RawNode, RawNodeList};
-use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, NodeId, Section};
+use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, NodeId, Section, SourceId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
 
@@ -238,6 +238,14 @@ pub enum Problem {
 
     #[error("要关联到节点 {target} 的节点 {id} 不存在")]
     MissingIncoming { id: NodeId, target: NodeId },
+
+    #[error("节点 {id} 没有引用来源 {cited} 的 {start}..{end}")]
+    NotCited {
+        id: NodeId,
+        cited: SourceId,
+        start: usize,
+        end: usize,
+    },
 
     #[error("板块“{name}”重复")]
     DuplicateSection { name: String },
@@ -810,6 +818,69 @@ impl Memory {
         }
         let bytes = RawBytes::from_slice(on.as_bytes());
         if unsafe { ffi::mw_node_remove_evidence(raw.as_ptr(), bytes) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// 让 `id` 引用来源里的一段，加在证据列表末尾。已经引用了同一段时什么也不做。
+    pub fn cite(
+        &mut self,
+        id: &str,
+        source: &str,
+        locator: &Locator,
+        sources: &dyn SourceStore,
+    ) -> Result<(), Error> {
+        let raw = self.find(id)?;
+        let citation = Evidence::Source {
+            source: source.to_owned(),
+            locator: locator.clone(),
+        };
+        let problems = check_sources(id, slice::from_ref(&citation), sources);
+        if !problems.is_empty() {
+            return Err(Error::InvalidMemory(problems));
+        }
+        if NodeRef::new(raw).evidence().contains(&citation) {
+            return Ok(());
+        }
+        let Locator::TextRange { start, end } = *locator;
+        let bytes = RawBytes::from_slice(source.as_bytes());
+        if unsafe {
+            ffi::mw_node_add_source_evidence(raw.as_ptr(), bytes, start as u64, end as u64)
+        } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// 去掉 `id` 对来源里这一段的引用，同一来源的其他范围保留。节点不能因此失去所有证据。
+    pub fn uncite(&mut self, id: &str, source: &str, locator: &Locator) -> Result<(), Error> {
+        let raw = self.find(id)?;
+        let citation = Evidence::Source {
+            source: source.to_owned(),
+            locator: locator.clone(),
+        };
+        let evidence = NodeRef::new(raw).evidence();
+        let Locator::TextRange { start, end } = *locator;
+        if !evidence.contains(&citation) {
+            return Err(Error::InvalidMemory(vec![Problem::NotCited {
+                id: id.to_owned(),
+                cited: source.to_owned(),
+                start,
+                end,
+            }]));
+        }
+        if evidence.iter().all(|entry| *entry == citation) {
+            return Err(Error::InvalidMemory(vec![Problem::MissingEvidence {
+                id: id.to_owned(),
+            }]));
+        }
+        let bytes = RawBytes::from_slice(source.as_bytes());
+        if unsafe {
+            ffi::mw_node_remove_source_evidence(raw.as_ptr(), bytes, start as u64, end as u64)
+        } {
             Ok(())
         } else {
             Err(Error::OutOfMemory)
@@ -1817,6 +1888,64 @@ mod tests {
         assert_eq!(ids(memory.node("a").unwrap().related_by()), ["新"]);
         assert!(memory.unreachable().is_empty());
         assert_eq!(memory.node_count(), 3);
+    }
+
+    #[test]
+    fn citing_and_unciting_change_only_that_range() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        let original = memory.node("a").unwrap().evidence();
+        let Evidence::Source { source, locator } = original[0].clone() else {
+            panic!("测试节点应该引用来源");
+        };
+        let Locator::TextRange { start, end } = locator;
+        let other = Locator::TextRange {
+            start,
+            end: end - 1,
+        };
+        let cited = Evidence::Source {
+            source: source.clone(),
+            locator: other.clone(),
+        };
+
+        memory.cite("a", &source, &other, &sources()).unwrap();
+        // 重复引用不会多出一条。
+        memory.cite("a", &source, &other, &sources()).unwrap();
+        assert_eq!(
+            memory.node("a").unwrap().evidence(),
+            [original[0].clone(), cited.clone()]
+        );
+
+        memory.uncite("a", &source, &locator).unwrap();
+        assert_eq!(memory.node("a").unwrap().evidence(), [cited]);
+
+        // 没有引用的范围、最后一条证据、不存在的节点和来源，都不能改动。
+        let problem = |error: Error| match error {
+            Error::InvalidMemory(problems) => problems[0].clone(),
+            other => panic!("{other}"),
+        };
+        assert_eq!(
+            problem(memory.uncite("a", &source, &locator).unwrap_err()),
+            Problem::NotCited {
+                id: "a".into(),
+                cited: source.clone(),
+                start,
+                end,
+            }
+        );
+        assert_eq!(
+            problem(memory.uncite("a", &source, &other).unwrap_err()),
+            Problem::MissingEvidence { id: "a".into() }
+        );
+        assert!(matches!(
+            memory.uncite("幽灵", &source, &other),
+            Err(Error::UnknownNode(_))
+        ));
+        let missing = source_id(b"not stored");
+        assert!(matches!(
+            memory.cite("a", &missing, &other, &sources()),
+            Err(Error::InvalidMemory(_))
+        ));
+        assert_eq!(memory.node("a").unwrap().evidence().len(), 1);
     }
 
     #[test]

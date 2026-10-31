@@ -150,6 +150,18 @@ unsafe extern "C" {
     pub(crate) fn mw_node_unlink(from: *mut RawNode, to: *mut RawNode);
     pub(crate) fn mw_node_add_evidence(node: *mut RawNode, target: *mut RawNode) -> bool;
     pub(crate) fn mw_node_remove_evidence(node: *mut RawNode, id: RawBytes) -> bool;
+    pub(crate) fn mw_node_add_source_evidence(
+        node: *mut RawNode,
+        source: RawBytes,
+        start: u64,
+        end: u64,
+    ) -> bool;
+    pub(crate) fn mw_node_remove_source_evidence(
+        node: *mut RawNode,
+        source: RawBytes,
+        start: u64,
+        end: u64,
+    ) -> bool;
 
     pub(crate) fn mw_index_new() -> *mut RawIndex;
     pub(crate) fn mw_index_free(index: *mut RawIndex);

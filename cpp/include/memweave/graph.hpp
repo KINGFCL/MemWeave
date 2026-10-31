@@ -373,20 +373,17 @@ inline void unlink_nodes(Node* from, Node* to) noexcept {
   remove_link(to, LinkKind::kRelatedBy, from);
 }
 
-// 重写证据列表：去掉 drop 指向的节点证据，再追加 extra。
+// 重写证据列表：去掉 dropped 选中的证据，再追加 extra。
 //
 // 新列表和它用到的所有 id 文本放在同一块内存里，旧的那块可以直接释放。内存不足时返回 false，列表不变。
-inline bool rewrite_evidence(Node* node, Bytes drop, const Evidence* extra) noexcept {
+template <typename Dropped>
+inline bool rewrite_evidence(Node* node, Dropped dropped, const Evidence* extra) noexcept {
   const EvidenceList* old = node->evidence;
-  const auto dropped = [&drop](const Evidence& entry) {
-    return entry.kind == EvidenceKind::kNode && entry.id_len == drop.len &&
-           std::memcmp(entry.id, drop.data, drop.len) == 0;
-  };
 
   std::size_t count = extra == nullptr ? 0 : 1;
   std::size_t text_size = extra == nullptr ? 0 : extra->id_len;
   for (std::size_t i = 0; i < old->count; ++i) {
-    if (drop.data == nullptr || !dropped(old->entries()[i])) {
+    if (!dropped(old->entries()[i])) {
       ++count;
       text_size += old->entries()[i].id_len;
     }
@@ -411,7 +408,7 @@ inline bool rewrite_evidence(Node* node, Bytes drop, const Evidence* extra) noex
     ++written;
   };
   for (std::size_t i = 0; i < old->count; ++i) {
-    if (drop.data == nullptr || !dropped(old->entries()[i])) {
+    if (!dropped(old->entries()[i])) {
       copy_entry(old->entries()[i]);
     }
   }
@@ -434,7 +431,7 @@ inline bool add_node_evidence(Node* node, Node* target) noexcept {
     return false;
   }
   const Evidence extra{EvidenceKind::kNode, target->id_len, target->id, target, 0, 0};
-  if (!rewrite_evidence(node, Bytes{nullptr, 0}, &extra)) {
+  if (!rewrite_evidence(node, [](const Evidence&) { return false; }, &extra)) {
     return false;
   }
   if (!has_reverse) {
@@ -455,13 +452,36 @@ inline bool remove_node_evidence(Node* node, Bytes id) noexcept {
       target = entry.node;
     }
   }
-  if (!rewrite_evidence(node, id, nullptr)) {
+  const auto dropped = [&id](const Evidence& entry) {
+    return entry.kind == EvidenceKind::kNode && entry.id_len == id.len &&
+           std::memcmp(entry.id, id.data, id.len) == 0;
+  };
+  if (!rewrite_evidence(node, dropped, nullptr)) {
     return false;
   }
   if (target != nullptr) {
     remove_link(target, LinkKind::kBasedBy, node);
   }
   return true;
+}
+
+// 新增一条来源证据：node 引用 source 的 start..end。内存不足时返回 false，图不变。
+inline bool add_source_evidence(Node* node, Bytes source, std::uint64_t start,
+                                std::uint64_t end) noexcept {
+  const Evidence extra{EvidenceKind::kTextRange, static_cast<std::uint32_t>(source.len), source.data,
+                       nullptr, start, end};
+  return rewrite_evidence(node, [](const Evidence&) { return false; }, &extra);
+}
+
+// 去掉 source 的 start..end 这条来源证据，同一来源的其他范围保留。内存不足时返回 false，图不变。
+inline bool remove_source_evidence(Node* node, Bytes source, std::uint64_t start,
+                                   std::uint64_t end) noexcept {
+  const auto dropped = [&](const Evidence& entry) {
+    return entry.kind == EvidenceKind::kTextRange && entry.id_len == source.len &&
+           std::memcmp(entry.id, source.data, source.len) == 0 && entry.start == start &&
+           entry.end == end;
+  };
+  return rewrite_evidence(node, dropped, nullptr);
 }
 
 // 释放节点。释放前必须先调用 detach_node，除非整张图都在销毁。
