@@ -8,13 +8,15 @@ readme = "README.md"
 keywords = ["knowledge-graph", "retrieval", "llm", "memory"]
 categories = ["command-line-utilities"]
 # 白名单：只打包列出的文件，避免把本地的密钥或笔记带进发布包。
-include = ["/src/**/*.rs", "/build.rs", "/cpp/**", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
+include = ["/src/**/*.rs", "/src/mcp/manual/*.md", "/build.rs", "/cpp/**", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
 [dependencies]
+rmcp = { version = "3.8.0", default-features = false, features = ["server", "transport-io"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "sync"], optional = true }
 ureq = "3.5.0"
 
 [dev-dependencies]
@@ -22,3 +24,8 @@ tempfile = "3.27.0"
 
 [build-dependencies]
 cc = "1.10.0"
+
+[features]
+default = ["mcp"]
+# MCP 服务。只用库的人可以关掉它，不必引入 tokio。
+mcp = ["dep:rmcp", "dep:tokio"]

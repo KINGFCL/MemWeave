@@ -58,6 +58,9 @@ pub enum Error {
 
     #[error("模型调用失败：{0}")]
     Model(String),
+
+    #[error("MCP 服务失败：{0}")]
+    Mcp(String),
 }
 
 fn bullet_list(items: &[impl Display]) -> String {

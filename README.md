@@ -66,6 +66,33 @@ Weaver 目前只支持文本文件，每次生成一个全新的知识库。输�
 
 目前只用真实的 DeepSeek 模型验证过，Claude 接入只用模拟服务器测试过。
 
+## 作为模型的记忆：MCP 服务
+
+```bash
+memweave mcp <知识库目录>
+```
+
+通过标准输入输出提供 [MCP](https://modelcontextprotocol.io) 服务，由客户端启动。不需要模型密钥：调用方就是模型，它自己走图、判断和写记忆。目录不存在或为空时新建空知识库。
+
+```json
+{
+  "mcpServers": {
+    "memweave": {
+      "command": "memweave",
+      "args": ["mcp", "/path/to/my-memory"]
+    }
+  }
+}
+```
+
+| 工具 | 作用 |
+| --- | --- |
+| `memory_read` | 执行只读脚本 |
+| `memory_write` | 执行修改记忆或导出的脚本 |
+| `memory_manual` | 读给模型的说明书：原理、用法、示例和各种情况的处理规则 |
+
+用 DeepSeek 跑过真实的 MCP 试验，也用 Claude Code 实际连接过。一个知识库同一时间只属于一个服务进程。别的 agent 要用，就用 `export` 导出一份。
+
 ## 知识库格式
 
 ```text

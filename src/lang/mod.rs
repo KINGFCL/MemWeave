@@ -106,6 +106,7 @@ pub struct Session<'a> {
     sources: &'a dyn SourceStore,
     mode: Mode,
     journal: Option<&'a Journal>,
+    output_limit: usize,
 }
 
 impl<'a> Session<'a> {
@@ -115,6 +116,7 @@ impl<'a> Session<'a> {
             sources,
             mode,
             journal: None,
+            output_limit: MAX_OUTPUT_BYTES,
         }
     }
 
@@ -124,10 +126,20 @@ impl<'a> Session<'a> {
         self
     }
 
+    /// 设置输出的上限，默认是 256 KiB。工具调用的结果比命令行的输出更容易超过客户端的限制。
+    pub fn with_output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = bytes;
+        self
+    }
+
     /// 执行一段脚本。对任何输入都只会返回文本，不会崩溃。
     pub fn run(&mut self, script: &str) -> Output {
         if script.len() > MAX_SCRIPT_BYTES {
-            return failure(&[check::too_large("大小", MAX_SCRIPT_BYTES)], "");
+            return failure(
+                &[check::too_large("大小", MAX_SCRIPT_BYTES)],
+                "",
+                self.output_limit,
+            );
         }
 
         let (tokens, mut errors) = lexer::tokenize(script);
@@ -138,12 +150,12 @@ impl<'a> Session<'a> {
         }
         if !errors.is_empty() {
             errors.sort_by_key(|error| (error.span.line, error.span.column));
-            return failure(&errors, script);
+            return failure(&errors, script, self.output_limit);
         }
 
         let errors = check::check(&statements, self.memory, self.sources, self.mode);
         if !errors.is_empty() {
-            return failure(&errors, script);
+            return failure(&errors, script, self.output_limit);
         }
         if statements.is_empty() {
             return Output {
@@ -174,22 +186,28 @@ impl<'a> Session<'a> {
         match exec::execute(&statements, self.memory, self.sources) {
             Ok(report) if report.failures == 0 => Output {
                 ok: true,
-                text: limit_output(report.text),
+                text: limit_output(report.text, self.output_limit),
             },
             Ok(report) => Output {
                 ok: false,
-                text: limit_output(format!(
-                    "{}有 {} 条语句失败，其余语句都已执行。",
-                    report.text, report.failures
-                )),
+                text: limit_output(
+                    format!(
+                        "{}有 {} 条语句失败，其余语句都已执行。",
+                        report.text, report.failures
+                    ),
+                    self.output_limit,
+                ),
             },
             // 检查已经通过，只有内存不足才会走到这里。
             Err((done, text, error)) => Output {
                 ok: false,
-                text: limit_output(format!(
-                    "{text}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
-                    done + 1
-                )),
+                text: limit_output(
+                    format!(
+                        "{text}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
+                        done + 1
+                    ),
+                    self.output_limit,
+                ),
             },
         }
     }
@@ -211,7 +229,7 @@ impl Session<'_> {
             Mode::ReadWrite,
         ));
         if !errors.is_empty() {
-            return failure(&errors, script);
+            return failure(&errors, script, MAX_OUTPUT_BYTES);
         }
         // 日志里有原文，文件丢了也能恢复。
         if let Err(error) = self.store_new_sources(&statements) {
@@ -252,28 +270,30 @@ impl Session<'_> {
     }
 }
 
-fn failure(errors: &[Diagnostic], script: &str) -> Output {
+fn failure(errors: &[Diagnostic], script: &str, limit: usize) -> Output {
     Output {
         ok: false,
         text: truncate(
             render(errors, script),
+            limit,
             "\n（输出超过上限，后面的内容被截断了。脚本没有执行。）",
         ),
     }
 }
 
-fn limit_output(text: String) -> String {
+fn limit_output(text: String, limit: usize) -> String {
     truncate(
         text,
+        limit,
         "\n（输出超过上限，后面的内容被截断了。语句都已执行，可以用 limit 或分多次查看。）",
     )
 }
 
-fn truncate(mut text: String, note: &str) -> String {
-    if text.len() <= MAX_OUTPUT_BYTES {
+fn truncate(mut text: String, limit: usize, note: &str) -> String {
+    if text.len() <= limit {
         return text;
     }
-    let mut end = MAX_OUTPUT_BYTES;
+    let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }

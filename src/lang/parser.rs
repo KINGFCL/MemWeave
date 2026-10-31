@@ -4,7 +4,7 @@ use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Stat
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-const KEYWORDS: [&str; 19] = [
+pub(crate) const KEYWORDS: [&str; 19] = [
     "catalog",
     "check",
     "export",

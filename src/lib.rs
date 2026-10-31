@@ -7,6 +7,8 @@ pub mod export;
 mod ffi;
 pub mod knowledge;
 pub mod lang;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod parse;

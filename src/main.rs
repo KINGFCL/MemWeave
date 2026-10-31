@@ -1,12 +1,11 @@
 use std::env;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
 use memweave::export::json::JsonExporter;
 use memweave::export::{self, Exporter};
-use memweave::lang::journal::{self, Journal};
+use memweave::lang::journal::{self, Journal, WriteLock};
 use memweave::lang::{self, Mode, Session};
 use memweave::memory::Memory;
 use memweave::model::Model;
@@ -26,6 +25,9 @@ const USAGE: &str = "\
   memweave run [--write] <知识库目录> <脚本|->
                                           执行记忆指令，- 表示从标准输入读。默认只读，不调用模型
   memweave spec                           输出记忆指令的说明，用来放进模型的提示词
+  memweave mcp <知识库目录> [--max-output-bytes N]
+                                          启动 MCP 服务，通过标准输入输出通信。目录不存在或为空时
+                                          新建空知识库。不调用模型，调用方就是模型
 
 环境变量：
   MEMWEAVE_PROVIDER       可选，模型厂商：deepseek（默认）或 anthropic
@@ -42,6 +44,12 @@ fn main() -> ExitCode {
         && command == "run"
     {
         return run_command(rest);
+    }
+    #[cfg(feature = "mcp")]
+    if let [command, rest @ ..] = args.as_slice()
+        && command == "mcp"
+    {
+        return run_mcp(rest);
     }
     let result = match args.as_slice() {
         [command, input, kb] if command == "weave" => run_weave(input, kb),
@@ -140,8 +148,9 @@ fn run_script(mode: Mode, kb: &str, script: &str) -> Result<lang::Output, String
     let path = Path::new(kb);
     // 写脚本是基于加载时的状态检查的，加载到写完日志之间不能有别的进程写入，否则日志重放会失败。
     let _lock = (mode == Mode::ReadWrite)
-        .then(|| lock_for_writing(path))
-        .transpose()?;
+        .then(|| WriteLock::acquire(path))
+        .transpose()
+        .map_err(|e| e.to_string())?;
     let mut memory = load_memory(kb)?;
     let sources = FileSources::new(path);
     let journal = Journal::new(path);
@@ -151,12 +160,30 @@ fn run_script(mode: Mode, kb: &str, script: &str) -> Result<lang::Output, String
     Ok(output)
 }
 
-/// 独占知识库的写入权，返回的文件关闭时自动释放。
-fn lock_for_writing(path: &Path) -> Result<File, String> {
-    let file =
-        File::create(path.join("journal.lock")).map_err(|e| format!("无法创建写入锁：{e}"))?;
-    file.lock().map_err(|e| format!("无法获取写入锁：{e}"))?;
-    Ok(file)
+/// 标准输出只能写协议消息，所以结果和错误都写到标准错误。
+#[cfg(feature = "mcp")]
+fn run_mcp(args: &[String]) -> ExitCode {
+    let (kb, max_output_bytes) = match args {
+        [kb] => (kb, memweave::mcp::DEFAULT_MAX_OUTPUT_BYTES),
+        [kb, flag, bytes] if flag == "--max-output-bytes" => match bytes.parse() {
+            Ok(bytes) if bytes > 0 => (kb, bytes),
+            _ => {
+                eprintln!("错误：--max-output-bytes 必须是正整数");
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match memweave::mcp::serve(Path::new(kb), max_output_bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("错误：{error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// 加载知识库，并重放写入日志，恢复上次的修改。
