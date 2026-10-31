@@ -1,11 +1,13 @@
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 
+use memweave::memory::Memory;
 use memweave::model::Model;
 use memweave::model::anthropic::{self, AnthropicModel};
 use memweave::model::deepseek::{self, DeepSeekModel};
+use memweave::parse::json::JsonParser;
 use memweave::retrieve::retrieve;
-use memweave::store::FsStore;
 
 const USAGE: &str = "\
 用法：memweave query <知识库目录> <问题>
@@ -43,8 +45,10 @@ fn main() -> ExitCode {
 }
 
 fn run(kb: &str, query: &str) -> Result<String, String> {
+    // 先解析知识库：有问题就不必连接模型。
+    let memory = Memory::load(&JsonParser, Path::new(kb)).map_err(|e| e.to_string())?;
     let model = connect_model()?;
-    let tree = retrieve(&FsStore::new(kb), model.as_ref(), query).map_err(|e| e.to_string())?;
+    let tree = retrieve(&memory, model.as_ref(), query).map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())
 }
 

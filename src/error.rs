@@ -1,8 +1,9 @@
-use std::fmt;
+use std::fmt::{self, Display};
 
 use thiserror::Error;
 
 use crate::knowledge::NodeId;
+use crate::memory::Problem;
 
 /// 查询进行到的阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,17 @@ pub enum Error {
     #[error("知识库读取失败：{0}")]
     Store(String),
 
+    #[error("知识库解析失败，共 {} 个问题：\n{}", .0.len(), bullet_list(.0))]
+    Parse(Vec<String>),
+
+    #[error("知识库校验失败，共 {} 个问题：\n{}", .0.len(), bullet_list(.0))]
+    InvalidMemory(Vec<Problem>),
+
     #[error("模型调用失败：{0}")]
     Model(String),
+}
+
+fn bullet_list(items: &[impl Display]) -> String {
+    let lines: Vec<String> = items.iter().map(|item| format!("- {item}")).collect();
+    lines.join("\n")
 }

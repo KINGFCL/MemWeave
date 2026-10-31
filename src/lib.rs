@@ -4,7 +4,9 @@
 
 pub mod error;
 pub mod knowledge;
+pub mod memory;
 pub mod model;
+pub mod parse;
 mod prompt;
 pub mod retrieve;
 pub mod store;
