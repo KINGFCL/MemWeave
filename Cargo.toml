@@ -1,11 +1,11 @@
 [package]
 name = "memweave"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
-description = "Experimental and unstable: model-driven knowledge graph retrieval that returns a tree of knowledge nodes"
+description = "Experimental and unstable: long-term memory for AI agents, a knowledge graph the model traverses itself, with an MCP server"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["knowledge-graph", "retrieval", "llm", "memory"]
+keywords = ["knowledge-graph", "mcp", "llm", "memory", "agent"]
 categories = ["command-line-utilities"]
 # 白名单：只打包列出的文件，避免把本地的密钥或笔记带进发布包。
 include = ["/src/**/*.rs", "/src/mcp/manual/*.md", "/build.rs", "/cpp/**", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
