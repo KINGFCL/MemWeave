@@ -11,9 +11,6 @@ use crate::knowledge::{Evidence, Locator, Node};
 use crate::memory::{Memory, NodeRef, Placement, RemovedNode};
 use crate::source::{LoadedEvidence, SourceStore};
 
-/// `show` 里每个列表最多显示多少条。
-const SHOW_LIST_LIMIT: usize = 50;
-
 /// 执行结果。
 pub struct Report {
     pub text: String,
@@ -49,7 +46,10 @@ fn statement(
     match statement {
         Statement::Catalog => render_catalog(memory, output),
         Statement::Check => render_check(memory, output),
-        Statement::Show(id) => render_node(existing(memory, &id.text)?, output),
+        Statement::Show(id) => {
+            let node = existing(memory, &id.text)?;
+            render_node(node, sources, output, &mut report.read_failures);
+        }
         Statement::Links { id, depth, limit } => {
             render_links(existing(memory, &id.text)?, *depth, *limit, output);
         }
@@ -163,43 +163,45 @@ fn render_catalog(memory: &Memory, output: &mut String) {
     }
 }
 
-fn render_node(node: NodeRef<'_>, output: &mut String) {
+/// 输出节点的全部内容。原文这时才从固态硬盘读取，读不到时其他内容照常输出。
+fn render_node(
+    node: NodeRef<'_>,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    read_failures: &mut usize,
+) {
     let _ = writeln!(output, "node {}", node.id());
     let _ = writeln!(output, "  title: {}", quote(node.title()));
     let _ = writeln!(output, "  desc: {}", quote(node.description()));
     render_list("related", node.related(), output);
     render_list("related_by", node.related_by(), output);
-
-    let based_on: Vec<String> = node.based_on().map(|n| n.id().to_owned()).collect();
-    let _ = writeln!(output, "  based_on: {}", join_ids(&based_on));
+    render_list("based_on", node.based_on(), output);
     render_list("based_by", node.based_by(), output);
 
     for evidence in node.evidence() {
-        if let Evidence::Source {
-            source,
-            locator: Locator::TextRange { start, end },
-        } = evidence
-        {
-            let _ = writeln!(output, "  source: {source} {start}..{end}");
+        if let Evidence::Source { source, locator } = evidence {
+            let Locator::TextRange { start, end } = locator;
+            match sources.read(&source, &locator) {
+                Ok(text) => {
+                    let _ = writeln!(
+                        output,
+                        "  source: {source} {start}..{end}: {}",
+                        quote(&text)
+                    );
+                }
+                Err(error) => {
+                    *read_failures += 1;
+                    let _ = writeln!(output, "  source: {source} {start}..{end}");
+                    let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
+                }
+            }
         }
     }
 }
 
-fn render_list<'m>(
-    name: &str,
-    nodes: impl ExactSizeIterator<Item = NodeRef<'m>>,
-    output: &mut String,
-) {
-    let total = nodes.len();
-    let ids: Vec<String> = nodes
-        .take(SHOW_LIST_LIMIT)
-        .map(|node| node.id().to_owned())
-        .collect();
-    let _ = write!(output, "  {name}: {}", join_ids(&ids));
-    if total > SHOW_LIST_LIMIT {
-        let _ = write!(output, "（共 {total} 条，只显示前 {SHOW_LIST_LIMIT} 条）");
-    }
-    output.push('\n');
+fn render_list<'m>(name: &str, nodes: impl Iterator<Item = NodeRef<'m>>, output: &mut String) {
+    let ids: Vec<String> = nodes.map(|node| node.id().to_owned()).collect();
+    let _ = writeln!(output, "  {name}: {}", join_ids(&ids));
 }
 
 fn join_ids(ids: &[String]) -> String {

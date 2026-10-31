@@ -135,6 +135,63 @@ fn reads_catalog_and_nodes() {
 }
 
 #[test]
+fn show_includes_the_source_text() {
+    let mut memory = memory();
+
+    let text = read(&mut memory, "show ownership").text;
+
+    assert!(
+        text.contains(&format!("source: {} 0..3: \"一\"", source())),
+        "{text}"
+    );
+}
+
+#[test]
+fn show_lists_every_relationship() {
+    let mut memory = memory();
+    let mut script = String::new();
+    for index in 0..120 {
+        script.push_str(&format!(
+            "add n{index}\n title \"t\"\n desc \"d\"\n based_on ownership\n related ownership\n related_by ownership\nend\n"
+        ));
+    }
+    ok(&mut memory, &script);
+
+    let text = read(&mut memory, "show ownership").text;
+
+    for field in ["related", "related_by", "based_by"] {
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{field}:")))
+            .unwrap();
+        assert!(line.contains("n119"), "{line}");
+    }
+}
+
+#[test]
+fn show_still_lists_everything_else_when_the_source_is_damaged() {
+    let mut memory = memory();
+    let empty = InMemorySources::new();
+
+    let output = Session::new(&mut memory, &empty, Mode::ReadOnly).run("show ownership\ncatalog");
+
+    assert!(!output.ok);
+    assert!(
+        output.text.contains("desc: \"描述ownership\""),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("related: borrowing"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("error[E901]"), "{}", output.text);
+    // 后面的语句照常执行。
+    assert!(output.text.contains("section \"Rust\""), "{}", output.text);
+}
+
+#[test]
 fn agents_can_go_straight_to_a_node() {
     let mut memory = memory();
 
