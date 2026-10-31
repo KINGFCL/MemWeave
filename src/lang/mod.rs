@@ -31,6 +31,7 @@ show 节点                                 查看节点的全部内容：标题
 links 节点 [depth N] [limit N]            沿关联往外看，默认 depth 1，limit 50
 evidence 节点                             读取证据指向的原文
 based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
+related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
 check                                    列出从总表走不到的节点
 
 修改：

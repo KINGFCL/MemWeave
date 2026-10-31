@@ -240,6 +240,63 @@ fn based_by_has_compiler_errors() {
 }
 
 #[test]
+fn related_by_lists_the_nodes_pointing_at_this_one() {
+    let mut memory = memory();
+
+    let output = read(&mut memory, "related_by borrowing\nrelated_by entry");
+
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(
+        output.text,
+        "related_by borrowing: ownership\nrelated_by entry: 无\n"
+    );
+}
+
+#[test]
+fn related_by_does_not_need_the_sources() {
+    let mut memory = memory();
+    let empty = InMemorySources::new();
+
+    let output = Session::new(&mut memory, &empty, Mode::ReadOnly).run("related_by borrowing");
+
+    assert!(output.ok, "{}", output.text);
+}
+
+#[test]
+fn related_by_sees_earlier_changes_in_the_script() {
+    let mut memory = memory();
+
+    let text = ok(&mut memory, "link entry -> borrowing\nrelated_by borrowing");
+
+    assert!(
+        text.contains("related_by borrowing: ownership, entry"),
+        "{text}"
+    );
+}
+
+#[test]
+fn related_by_has_compiler_errors() {
+    let mut memory = memory();
+
+    fails(&mut memory, "related_by borrowng", "E201");
+    fails(&mut memory, "related_by", "E102");
+    let text = fails(&mut memory, "relatedby borrowing", "E101");
+    assert!(text.contains("你是不是想写 related_by？"), "{text}");
+}
+
+#[test]
+fn related_by_is_still_a_clause_inside_add() {
+    let mut memory = memory();
+
+    let text = ok(
+        &mut memory,
+        "add new\n title \"t\"\n desc \"d\"\n based_on ownership\n related_by entry\nend\nrelated_by new",
+    );
+
+    assert!(text.contains("related_by new: entry"), "{text}");
+}
+
+#[test]
 fn agents_can_go_straight_to_a_node() {
     let mut memory = memory();
 

@@ -67,6 +67,13 @@ fn statement(
                 .collect();
             let _ = writeln!(output, "based_by {}: {}", id.text, join_ids(&ids));
         }
+        Statement::RelatedBy(id) => {
+            let ids: Vec<String> = existing(memory, &id.text)?
+                .related_by()
+                .map(|node| node.id().to_owned())
+                .collect();
+            let _ = writeln!(output, "related_by {}: {}", id.text, join_ids(&ids));
+        }
         Statement::Add(add) => {
             let (node, placement) = build_node(add);
             memory.add_node(node, placement, sources)?;

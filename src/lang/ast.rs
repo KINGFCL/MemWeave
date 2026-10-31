@@ -47,6 +47,7 @@ pub enum Statement {
     },
     Evidence(Name),
     BasedBy(Name),
+    RelatedBy(Name),
     Add(Box<AddNode>),
     Remove(Name),
     Link {
@@ -83,6 +84,7 @@ impl Statement {
                 | Statement::Links { .. }
                 | Statement::Evidence(_)
                 | Statement::BasedBy(_)
+                | Statement::RelatedBy(_)
         )
     }
 }
