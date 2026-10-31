@@ -96,8 +96,8 @@ fn snapshot(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
         .nodes()
         .map(|n| {
             let related_by: Vec<&str> = n.related_by().map(|o| o.id()).collect();
-            let dependents: Vec<&str> = n.dependents().map(|o| o.id()).collect();
-            format!("{}:{related_by:?}:{dependents:?}", n.id())
+            let based_by: Vec<&str> = n.based_by().map(|o| o.id()).collect();
+            format!("{}:{related_by:?}:{based_by:?}", n.id())
         })
         .collect();
     backlinks.sort();
@@ -129,7 +129,7 @@ fn reads_catalog_and_nodes() {
     assert!(text.contains("desc: \"描述ownership\""), "{text}");
     assert!(text.contains("related: borrowing"), "{text}");
     assert!(text.contains("related_by: entry"), "{text}");
-    assert!(text.contains("dependents: conclusion"), "{text}");
+    assert!(text.contains("based_by: conclusion"), "{text}");
     assert!(text.contains("entry -> ownership"), "{text}");
     assert!(text.contains("ownership -> borrowing"), "{text}");
 }
@@ -190,7 +190,7 @@ fn add_to_a_section_is_listed_in_the_catalog() {
 }
 
 #[test]
-fn set_changes_text_and_warns_about_dependents() {
+fn set_changes_text_and_warns_about_based_by() {
     let mut memory = memory();
 
     let text = ok(
@@ -229,12 +229,12 @@ fn base_and_unbase_update_both_directions() {
         memory
             .node("conclusion")
             .unwrap()
-            .dependents()
+            .based_by()
             .any(|n| n.id() == "borrowing")
     );
 
     ok(&mut memory, "unbase borrowing on conclusion");
-    assert_eq!(memory.node("conclusion").unwrap().dependents().len(), 0);
+    assert_eq!(memory.node("conclusion").unwrap().based_by().len(), 0);
 }
 
 #[test]
@@ -607,9 +607,9 @@ fn assert_consistent(memory: &Memory) {
             assert!(from.related().any(|other| other == node));
         }
         for target in node.based_on() {
-            assert!(target.dependents().any(|other| other == node));
+            assert!(target.based_by().any(|other| other == node));
         }
-        for dependent in node.dependents() {
+        for dependent in node.based_by() {
             assert!(dependent.based_on().any(|other| other == node));
         }
     }

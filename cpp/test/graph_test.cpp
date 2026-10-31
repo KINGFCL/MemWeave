@@ -115,8 +115,8 @@ class Graph {
     set_links(node, LinkKind::kRelatedBy, incoming.data(), incoming.size());
     for (std::size_t i = 0; i < based_on.size(); ++i) {
       set_evidence_target(node, i + 1, based_on[i]);
-      if (!reserve_links(based_on[i], LinkKind::kDependents, 1)) fail("分配失败");
-      append_link(based_on[i], LinkKind::kDependents, node);
+      if (!reserve_links(based_on[i], LinkKind::kBasedBy, 1)) fail("分配失败");
+      append_link(based_on[i], LinkKind::kBasedBy, node);
     }
     for (Node* target : unique(related)) {
       if (!reserve_links(target, LinkKind::kRelatedBy, 1)) fail("分配失败");
@@ -178,18 +178,18 @@ class Graph {
       for (std::size_t i = 0; i < evidence->count; ++i) {
         const Evidence& entry = evidence->entries()[i];
         if (std::memchr(entry.id, 0, entry.id_len) != nullptr) fail("证据的 id 被破坏");
-        if (entry.node != nullptr && !contains(link_list(entry.node, LinkKind::kDependents), node)) {
-          fail("证据没有对应的 dependents");
+        if (entry.node != nullptr && !contains(link_list(entry.node, LinkKind::kBasedBy), node)) {
+          fail("证据没有对应的 based_by");
         }
       }
-      const NodeList* dependents = link_list(node, LinkKind::kDependents);
-      for (std::uint32_t i = 0; i < dependents->count; ++i) {
-        const EvidenceList* entries = dependents->nodes()[i]->evidence;
+      const NodeList* based_by = link_list(node, LinkKind::kBasedBy);
+      for (std::uint32_t i = 0; i < based_by->count; ++i) {
+        const EvidenceList* entries = based_by->nodes()[i]->evidence;
         bool found = false;
         for (std::size_t e = 0; e < entries->count; ++e) {
           found = found || entries->entries()[e].node == node;
         }
-        if (!found) fail("dependents 没有对应的证据");
+        if (!found) fail("based_by 没有对应的证据");
       }
     }
   }

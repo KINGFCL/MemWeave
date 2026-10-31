@@ -63,7 +63,7 @@ struct EvidenceList {
 // 反向关系：谁指向我。修改和删除节点时靠它找到需要处理的节点，遍历时用不到。
 // 它们都可以从 evidence 和 related 反推，所以不存到磁盘，加载时计算。这个布局也是和 Rust 共享的。
 struct Backlinks {
-  const NodeList* dependents;  // 谁依赖我：证据里引用了这个节点的节点。这个节点变了，它们要复查。
+  const NodeList* based_by;  // 谁依赖我：证据里引用了这个节点的节点。这个节点变了，它们要复查。
   const NodeList* related_by;  // 谁关联我：related 里有这个节点的节点。删除这个节点时要清理它们。
   char* cold;                  // 冷块的开头，释放节点时用。
 };
@@ -101,7 +101,7 @@ inline constexpr std::align_val_t kNodeAlignment{128};
 // 节点的三个列表。
 enum class LinkKind : std::uint32_t {
   kRelated = 0,
-  kDependents = 1,
+  kBasedBy = 1,
   kRelatedBy = 2,
 };
 
@@ -109,8 +109,8 @@ inline const NodeList* link_list(const Node* node, LinkKind kind) noexcept {
   switch (kind) {
     case LinkKind::kRelated:
       return node->related;
-    case LinkKind::kDependents:
-      return node->backlinks->dependents;
+    case LinkKind::kBasedBy:
+      return node->backlinks->based_by;
     case LinkKind::kRelatedBy:
       return node->backlinks->related_by;
   }
@@ -123,8 +123,8 @@ inline void replace_link_list(Node* node, LinkKind kind, const NodeList* list) n
     case LinkKind::kRelated:
       node->related = list;
       break;
-    case LinkKind::kDependents:
-      backlinks->dependents = list;
+    case LinkKind::kBasedBy:
+      backlinks->based_by = list;
       break;
     case LinkKind::kRelatedBy:
       backlinks->related_by = list;
@@ -146,20 +146,20 @@ inline constexpr std::uint32_t kEvidenceOnHeap = std::uint32_t{1} << 5;
 // 内存不足或文本超过 4 GiB 时返回 nullptr。
 inline Node* new_node(Bytes id, Bytes title, Bytes description, const Evidence* evidence,
                       std::size_t evidence_count, std::size_t related_capacity,
-                      std::size_t dependents_capacity, std::size_t related_by_capacity) noexcept {
+                      std::size_t based_by_capacity, std::size_t related_by_capacity) noexcept {
   constexpr std::size_t kMax = std::numeric_limits<std::size_t>::max();
   constexpr std::size_t kMaxText = std::numeric_limits<std::uint32_t>::max();
   constexpr std::size_t kMaxCount = std::numeric_limits<std::uint32_t>::max();
   if (id.len > kMaxText || title.len > kMaxText || description.len > kMaxText ||
       evidence_count > kMaxCount || related_capacity > kMaxCount ||
-      dependents_capacity > kMaxCount || related_by_capacity > kMaxCount) {
+      based_by_capacity > kMaxCount || related_by_capacity > kMaxCount) {
     return nullptr;
   }
 
   // 冷块依次放证据列表、反向列表和文本。证据列表在最前面，释放时只需要释放它。
   const std::size_t lists_size = sizeof(EvidenceList) + evidence_count * sizeof(Evidence) +
                                  sizeof(Backlinks) + sizeof(NodeList) +
-                                 dependents_capacity * sizeof(Node*) + sizeof(NodeList) +
+                                 based_by_capacity * sizeof(Node*) + sizeof(NodeList) +
                                  related_by_capacity * sizeof(Node*);
   std::size_t text_size = id.len + title.len + description.len;
   for (std::size_t i = 0; i < evidence_count; ++i) {
@@ -182,11 +182,11 @@ inline Node* new_node(Bytes id, Bytes title, Bytes description, const Evidence* 
 
   auto* evidence_list = new (cold) EvidenceList{evidence_count};
   auto* backlinks = reinterpret_cast<Backlinks*>(evidence_list->entries() + evidence_count);
-  auto* dependents =
-      new (backlinks + 1) NodeList{0, static_cast<std::uint32_t>(dependents_capacity)};
-  auto* related_by = new (dependents->nodes() + dependents_capacity)
+  auto* based_by =
+      new (backlinks + 1) NodeList{0, static_cast<std::uint32_t>(based_by_capacity)};
+  auto* related_by = new (based_by->nodes() + based_by_capacity)
       NodeList{0, static_cast<std::uint32_t>(related_by_capacity)};
-  new (backlinks) Backlinks{dependents, related_by, cold};
+  new (backlinks) Backlinks{based_by, related_by, cold};
 
   char* cursor = cold + lists_size;
   auto append = [&cursor](const char* data, std::size_t len) {
@@ -309,12 +309,12 @@ inline void detach_node(Node* node) noexcept {
   const EvidenceList* evidence = node->evidence;
   for (std::size_t i = 0; i < evidence->count; ++i) {
     if (Node* target = evidence->entries()[i].node) {
-      remove_link(target, LinkKind::kDependents, node);
+      remove_link(target, LinkKind::kBasedBy, node);
     }
   }
-  const NodeList* dependents = link_list(node, LinkKind::kDependents);
-  for (std::uint32_t i = 0; i < dependents->count; ++i) {
-    auto* entries = const_cast<EvidenceList*>(dependents->nodes()[i]->evidence);
+  const NodeList* based_by = link_list(node, LinkKind::kBasedBy);
+  for (std::uint32_t i = 0; i < based_by->count; ++i) {
+    auto* entries = const_cast<EvidenceList*>(based_by->nodes()[i]->evidence);
     for (std::size_t e = 0; e < entries->count; ++e) {
       if (entries->entries()[e].node == node) {
         entries->entries()[e].node = nullptr;
@@ -439,8 +439,8 @@ inline bool rewrite_evidence(Node* node, Bytes drop, const Evidence* extra) noex
 
 // 新增一条节点证据：node 依据 target，同时维护 target 的被依赖列表。内存不足时返回 false，图不变。
 inline bool add_node_evidence(Node* node, Node* target) noexcept {
-  const bool has_reverse = list_contains(link_list(target, LinkKind::kDependents), node);
-  if (!has_reverse && !reserve_links(target, LinkKind::kDependents, 1)) {
+  const bool has_reverse = list_contains(link_list(target, LinkKind::kBasedBy), node);
+  if (!has_reverse && !reserve_links(target, LinkKind::kBasedBy, 1)) {
     return false;
   }
   const Evidence extra{EvidenceKind::kNode, target->id_len, target->id, target, 0, 0};
@@ -448,7 +448,7 @@ inline bool add_node_evidence(Node* node, Node* target) noexcept {
     return false;
   }
   if (!has_reverse) {
-    append_link(target, LinkKind::kDependents, node);
+    append_link(target, LinkKind::kBasedBy, node);
   }
   return true;
 }
@@ -469,14 +469,14 @@ inline bool remove_node_evidence(Node* node, Bytes id) noexcept {
     return false;
   }
   if (target != nullptr) {
-    remove_link(target, LinkKind::kDependents, node);
+    remove_link(target, LinkKind::kBasedBy, node);
   }
   return true;
 }
 
 // 释放节点。释放前必须先调用 detach_node，除非整张图都在销毁。
 inline void delete_node(Node* node) noexcept {
-  for (LinkKind kind : {LinkKind::kRelated, LinkKind::kDependents, LinkKind::kRelatedBy}) {
+  for (LinkKind kind : {LinkKind::kRelated, LinkKind::kBasedBy, LinkKind::kRelatedBy}) {
     if ((node->flags & heap_flag(kind)) != 0) {
       delete[] reinterpret_cast<const char*>(link_list(node, kind));
     }

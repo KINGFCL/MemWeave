@@ -26,7 +26,7 @@ pub(crate) struct RawNodeList {
 
 /// 和 C++ 的 `LinkKind` 取值相同。
 pub(crate) const LINK_RELATED: u32 = 0;
-pub(crate) const LINK_DEPENDENTS: u32 = 1;
+pub(crate) const LINK_BASED_BY: u32 = 1;
 pub(crate) const LINK_RELATED_BY: u32 = 2;
 
 /// 和 C++ 的 `EvidenceKind` 取值相同。
@@ -63,7 +63,7 @@ pub(crate) struct RawIndex {
 /// 和 C++ 的 `Backlinks` 布局相同。
 #[repr(C)]
 pub(crate) struct RawBacklinks {
-    pub(crate) dependents: *const RawNodeList,
+    pub(crate) based_by: *const RawNodeList,
     pub(crate) related_by: *const RawNodeList,
     pub(crate) cold: *mut u8,
 }
@@ -111,7 +111,7 @@ pub(crate) struct RawLayout {
     pub(crate) evidence_start: usize,
     pub(crate) evidence_end: usize,
     pub(crate) backlinks_size: usize,
-    pub(crate) backlinks_dependents: usize,
+    pub(crate) backlinks_based_by: usize,
     pub(crate) backlinks_related_by: usize,
     pub(crate) backlinks_cold: usize,
 }
@@ -127,7 +127,7 @@ unsafe extern "C" {
         evidence: *const RawEvidence,
         evidence_count: usize,
         related_capacity: usize,
-        dependents_capacity: usize,
+        based_by_capacity: usize,
         related_by_capacity: usize,
     ) -> *mut RawNode;
     pub(crate) fn mw_node_set_evidence_target(
@@ -194,7 +194,7 @@ mod tests {
             evidence_start: offset_of!(RawEvidence, start),
             evidence_end: offset_of!(RawEvidence, end),
             backlinks_size: size_of::<RawBacklinks>(),
-            backlinks_dependents: offset_of!(RawBacklinks, dependents),
+            backlinks_based_by: offset_of!(RawBacklinks, based_by),
             backlinks_related_by: offset_of!(RawBacklinks, related_by),
             backlinks_cold: offset_of!(RawBacklinks, cold),
         };

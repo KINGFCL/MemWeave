@@ -40,7 +40,7 @@ struct MwLayout {
   std::size_t evidence_start;
   std::size_t evidence_end;
   std::size_t backlinks_size;
-  std::size_t backlinks_dependents;
+  std::size_t backlinks_based_by;
   std::size_t backlinks_related_by;
   std::size_t backlinks_cold;
 };
@@ -71,7 +71,7 @@ MwLayout mw_layout() noexcept {
       offsetof(Evidence, start),
       offsetof(Evidence, end),
       sizeof(Backlinks),
-      offsetof(Backlinks, dependents),
+      offsetof(Backlinks, based_by),
       offsetof(Backlinks, related_by),
       offsetof(Backlinks, cold),
   };
@@ -79,9 +79,9 @@ MwLayout mw_layout() noexcept {
 
 Node* mw_node_new(Bytes id, Bytes title, Bytes description, const Evidence* evidence,
                   std::size_t evidence_count, std::size_t related_capacity,
-                  std::size_t dependents_capacity, std::size_t related_by_capacity) noexcept {
+                  std::size_t based_by_capacity, std::size_t related_by_capacity) noexcept {
   return memweave::new_node(id, title, description, evidence, evidence_count, related_capacity,
-                            dependents_capacity, related_by_capacity);
+                            based_by_capacity, related_by_capacity);
 }
 
 void mw_node_set_evidence_target(Node* node, std::size_t index, Node* target) noexcept {

@@ -160,7 +160,7 @@ fn render_node(node: NodeRef<'_>, output: &mut String) {
     let mut based_on: Vec<String> = node.based_on().map(|n| n.id().to_owned()).collect();
     based_on.extend(broken.iter().map(|id| format!("{id}（已删除）")));
     let _ = writeln!(output, "  based_on: {}", join_ids(&based_on));
-    render_list("dependents", node.dependents(), output);
+    render_list("based_by", node.based_by(), output);
 
     for evidence in node.evidence() {
         if let Evidence::Source {
@@ -249,7 +249,7 @@ fn render_evidence(id: &str, evidence: Vec<LoadedEvidence>, output: &mut String)
 fn render_removed(removed: &RemovedNode, output: &mut String) {
     let _ = writeln!(output, "removed {}", removed.node.id);
     let _ = writeln!(output, "  desc: {}", quote(&removed.node.description));
-    for id in &removed.dependents {
+    for id in &removed.based_by {
         let _ = writeln!(
             output,
             "warning: {id} 失去了依据 {}，用 show {id} 查看，再决定保留、改写还是删除",
@@ -271,7 +271,7 @@ fn render_removed(removed: &RemovedNode, output: &mut String) {
 
 /// 描述变了，依据它的结论可能要跟着变。
 fn render_review(node: NodeRef<'_>, output: &mut String) {
-    for dependent in node.dependents() {
+    for dependent in node.based_by() {
         let _ = writeln!(
             output,
             "warning: {} 依据 {}，内容变了，它可能需要复查",

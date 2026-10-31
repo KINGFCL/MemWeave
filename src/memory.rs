@@ -98,8 +98,8 @@ impl<'m> NodeRef<'m> {
     }
 
     /// 证据里引用了这个节点的节点。修改这个节点时，它们需要复查。
-    pub fn dependents(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
-        node_list(unsafe { (*self.raw().backlinks).dependents })
+    pub fn based_by(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
+        node_list(unsafe { (*self.raw().backlinks).based_by })
     }
 
     /// `related` 里有这个节点的节点。删除这个节点时要清理它们。
@@ -266,7 +266,7 @@ pub struct RemovedNode {
     /// 被删除节点的完整内容。
     pub node: Node,
     /// 依赖它的节点。它们的结论失去了这条依据，证据里保留 id，见 [`NodeRef::broken_evidence`]。
-    pub dependents: Vec<NodeId>,
+    pub based_by: Vec<NodeId>,
     /// 关联它的节点。它们少了一条路径，有些节点可能因此查不到了，见 [`Memory::unreachable`]。
     pub related_by: Vec<NodeId>,
     /// 它原来是哪些板块的代表节点。这些板块可能已经空了。
@@ -301,7 +301,7 @@ impl Memory {
         for node in &nodes {
             let raw = new_node(
                 node,
-                reverse_ids(&backlinks.dependents, &node.id).len(),
+                reverse_ids(&backlinks.based_by, &node.id).len(),
                 reverse_ids(&backlinks.related_by, &node.id).len(),
             )?;
             if let Err(error) = memory.index_insert(raw) {
@@ -326,9 +326,9 @@ impl Memory {
             }
 
             addresses.clear();
-            let dependents = reverse_ids(&backlinks.dependents, &node.id);
-            addresses.extend(dependents.iter().map(|id| memory.lookup(id).as_ptr()));
-            set_links(raw, ffi::LINK_DEPENDENTS, &addresses);
+            let based_by = reverse_ids(&backlinks.based_by, &node.id);
+            addresses.extend(based_by.iter().map(|id| memory.lookup(id).as_ptr()));
+            set_links(raw, ffi::LINK_BASED_BY, &addresses);
 
             addresses.clear();
             let related_by = reverse_ids(&backlinks.related_by, &node.id);
@@ -451,7 +451,7 @@ impl Memory {
             .all(|target| reserve_link(*target, ffi::LINK_RELATED_BY))
             && evidence_targets
                 .iter()
-                .all(|target| reserve_link(*target, ffi::LINK_DEPENDENTS))
+                .all(|target| reserve_link(*target, ffi::LINK_BASED_BY))
             && incoming
                 .iter()
                 .all(|from| reserve_link(*from, ffi::LINK_RELATED));
@@ -491,7 +491,7 @@ impl Memory {
             append_link(*target, ffi::LINK_RELATED_BY, raw);
         }
         for target in &evidence_targets {
-            append_link(*target, ffi::LINK_DEPENDENTS, raw);
+            append_link(*target, ffi::LINK_BASED_BY, raw);
         }
         for from in &incoming {
             append_link(*from, ffi::LINK_RELATED, raw);
@@ -577,7 +577,7 @@ impl Memory {
         };
         let removed = RemovedNode {
             node: node.to_node(),
-            dependents: other_ids(node.dependents().collect()),
+            based_by: other_ids(node.based_by().collect()),
             related_by: other_ids(node.related_by().collect()),
             sections: self
                 .catalog
@@ -777,14 +777,14 @@ impl Memory {
 
 /// 从证据和关联反推的反向关系：节点地址到指向它的节点。
 struct ReverseLinks<'a> {
-    dependents: HashMap<&'a str, Vec<&'a str>>,
+    based_by: HashMap<&'a str, Vec<&'a str>>,
     related_by: HashMap<&'a str, Vec<&'a str>>,
 }
 
 impl<'a> ReverseLinks<'a> {
     fn new(nodes: &'a [Node]) -> Self {
         let mut links = Self {
-            dependents: HashMap::new(),
+            based_by: HashMap::new(),
             related_by: HashMap::new(),
         };
         for node in nodes {
@@ -792,7 +792,7 @@ impl<'a> ReverseLinks<'a> {
                 Evidence::Node { id } => Some(id.as_str()),
                 Evidence::Source { .. } => None,
             });
-            add_reverse(&mut links.dependents, &node.id, based_on);
+            add_reverse(&mut links.based_by, &node.id, based_on);
             add_reverse(
                 &mut links.related_by,
                 &node.id,
@@ -823,7 +823,7 @@ fn reverse_ids<'r, 'a>(reverse: &'r HashMap<&'a str, Vec<&'a str>>, id: &str) ->
 
 fn new_node(
     node: &Node,
-    dependents_count: usize,
+    based_by_count: usize,
     related_by_count: usize,
 ) -> Result<NonNull<RawNode>, Error> {
     let mut evidence = Vec::with_capacity(node.evidence.len());
@@ -852,7 +852,7 @@ fn new_node(
             evidence.as_ptr(),
             evidence.len(),
             node.related.len(),
-            dependents_count,
+            based_by_count,
             related_by_count,
         )
     };
@@ -1015,7 +1015,7 @@ fn check_locator(
 /// 反复移除所有依据都已确认的节点，剩下的就是这些节点。
 fn nodes_in_evidence_cycles(parsed: &ParsedKnowledge, nodes: &HashMap<&str, &Node>) -> Vec<NodeId> {
     let mut waiting_on: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut based_by: HashMap<&str, Vec<&str>> = HashMap::new();
     for node in nodes.values() {
         let dependencies: HashSet<&str> = node
             .evidence
@@ -1026,7 +1026,7 @@ fn nodes_in_evidence_cycles(parsed: &ParsedKnowledge, nodes: &HashMap<&str, &Nod
             })
             .collect();
         for dependency in &dependencies {
-            dependents.entry(dependency).or_default().push(&node.id);
+            based_by.entry(dependency).or_default().push(&node.id);
         }
         waiting_on.insert(&node.id, dependencies);
     }
@@ -1038,7 +1038,7 @@ fn nodes_in_evidence_cycles(parsed: &ParsedKnowledge, nodes: &HashMap<&str, &Nod
         .collect();
     while let Some(id) = settled.pop() {
         waiting_on.remove(id);
-        for dependent in dependents.get(id).into_iter().flatten() {
+        for dependent in based_by.get(id).into_iter().flatten() {
             if let Some(dependencies) = waiting_on.get_mut(dependent) {
                 dependencies.remove(id);
                 if dependencies.is_empty() {
@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn dependents_are_the_reverse_of_evidence() {
+    fn based_by_are_the_reverse_of_evidence() {
         let memory = build(
             &["地基", "a", "b", "c"],
             vec![
@@ -1619,7 +1619,7 @@ mod tests {
             memory
                 .node(id)
                 .unwrap()
-                .dependents()
+                .based_by()
                 .map(|node| node.id().to_owned())
                 .collect()
         };
@@ -1671,9 +1671,9 @@ mod tests {
         let a = memory.node("a").unwrap();
 
         let related_by: Vec<&str> = a.related_by().map(NodeRef::id).collect();
-        let dependents: Vec<&str> = a.dependents().map(NodeRef::id).collect();
+        let based_by: Vec<&str> = a.based_by().map(NodeRef::id).collect();
         assert_eq!(related_by, ["b", "c"]);
-        assert_eq!(dependents, ["b", "d"]);
+        assert_eq!(based_by, ["b", "d"]);
     }
 
     #[test]
@@ -1726,7 +1726,7 @@ mod tests {
 
         let foundation = memory.node("基础").unwrap();
         assert_eq!(ids(foundation.related()), ["新"]);
-        assert_eq!(ids(foundation.dependents()), ["新"]);
+        assert_eq!(ids(foundation.based_by()), ["新"]);
         assert_eq!(ids(memory.node("a").unwrap().related_by()), ["新"]);
         assert!(memory.unreachable().is_empty());
         assert_eq!(memory.node_count(), 3);
@@ -1765,7 +1765,7 @@ mod tests {
         let hub = memory.node("hub").unwrap();
         assert_eq!(hub.related().len(), 100);
         assert_eq!(hub.related_by().len(), 100);
-        assert_eq!(hub.dependents().len(), 100);
+        assert_eq!(hub.based_by().len(), 100);
         assert_eq!(hub.related().last().unwrap().id(), "n99");
     }
 
@@ -1851,7 +1851,7 @@ mod tests {
         let removed = memory.remove_node("x").unwrap();
 
         assert_eq!(removed.node.id, "x");
-        assert_eq!(removed.dependents, ["结论"]);
+        assert_eq!(removed.based_by, ["结论"]);
         assert_eq!(removed.related_by, ["入口"]);
         assert_eq!(removed.sections, ["板块"]);
 
@@ -1862,7 +1862,7 @@ mod tests {
             ["依据", "后继", "结论"]
         );
         assert_eq!(memory.node("后继").unwrap().related_by().len(), 1);
-        assert_eq!(ids(memory.node("依据").unwrap().dependents()), ["结论"]);
+        assert_eq!(ids(memory.node("依据").unwrap().based_by()), ["结论"]);
         assert_eq!(memory.catalog(), &catalog(&["入口"]));
 
         // 知识关系不自动处理：结论还在，证据保留 id，地址已经清掉。
@@ -1980,9 +1980,9 @@ mod tests {
             }
             for target in node.based_on() {
                 assert!(live.contains(&target));
-                assert!(target.dependents().any(|other| other == node));
+                assert!(target.based_by().any(|other| other == node));
             }
-            for dependent in node.dependents() {
+            for dependent in node.based_by() {
                 assert!(live.contains(&dependent));
                 assert!(dependent.based_on().any(|other| other == node));
             }
