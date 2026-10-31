@@ -270,6 +270,7 @@ mod tests {
         let catalog = Catalog {
             sections: vec![Section {
                 name: "板块".into(),
+                description: String::new(),
                 nodes: entries,
             }],
         };

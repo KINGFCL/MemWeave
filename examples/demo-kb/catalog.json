@@ -2,15 +2,26 @@
   "sections": [
     {
       "name": "Rust 内存管理",
+      "description": "所有权、借用和资源释放：Rust 如何在没有垃圾回收的情况下管理内存。",
       "nodes": [
-        { "id": "ownership", "title": "所有权" },
-        { "id": "borrowing", "title": "借用" }
+        {
+          "id": "ownership",
+          "title": "所有权"
+        },
+        {
+          "id": "borrowing",
+          "title": "借用"
+        }
       ]
     },
     {
       "name": "Rust 并发",
+      "description": "线程之间如何安全地传递和共享数据。",
       "nodes": [
-        { "id": "send-sync", "title": "Send 与 Sync" }
+        {
+          "id": "send-sync",
+          "title": "Send 与 Sync"
+        }
       ]
     }
   ]

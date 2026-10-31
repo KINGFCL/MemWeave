@@ -26,14 +26,14 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const SPEC: &str = r####"用下面的语言操作记忆。每条语句占一行，# 开头是注释。节点用文本地址引用。
 
 读取：
-catalog                                  查看总表：按领域分类的代表节点
+catalog show                             查看总表：每个领域的名字、描述和代表节点
 show 节点                                 查看节点的全部内容：标题、描述、所有关系和证据原文
 links 节点 [depth N] [limit N]            沿关联往外看，默认 depth 1，limit 50
 evidence 节点                             读取证据指向的原文
 based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
 related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
 full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
-check                                    列出从总表走不到的节点
+check                                    列出从总表走不到的节点和没有代表的板块
 
 修改：
 add 节点                                  新增由别的节点推出的知识
@@ -44,7 +44,6 @@ add 节点                                  新增由别的节点推出的知识
   source sha256:... 起始..结束             可选：同时引用已有的原文，可以写多条
   related 节点, 节点                       它关联哪些节点
   related_by 节点, 节点                    哪些节点关联它
-  section "板块"                           成为这个板块的代表节点
 end
 source 节点                               新增直接来自原文的知识，不能写 based_on
   title "标题"
@@ -53,9 +52,14 @@ source 节点                               新增直接来自原文的知识，
   source sha256:... 起始..结束             或者引用已有的原文。这两项至少写一个
   related 节点, 节点
   related_by 节点, 节点
-  section "板块"
 end
 remove 节点
+catalog create "板块" desc """这个领域包含什么"""
+catalog describe "板块" """新的描述"""
+catalog rename "板块" to "新名字"
+catalog delete "板块"                      删除板块，节点本身保留
+catalog add 节点 to "板块"                 让节点成为这个领域的代表
+catalog remove 节点 from "板块"            撤下代表，节点本身保留
 link 甲 -> 乙
 unlink 甲 -> 乙
 set 节点 title "新标题"
@@ -64,8 +68,10 @@ base 结论 on 依据
 unbase 结论 on 依据
 
 规则：
-- add 必须有 title、desc、based_on，至少一条 related_by 或 section。
-- source 必须有 title、desc，至少一段原文，至少一条 related_by 或 section。要记下对话或工具结果里的新内容，就用它。
+- add 必须有 title、desc、based_on。
+- source 必须有 title、desc，至少一段原文。要记下对话或工具结果里的新内容，就用它。
+- 新节点必须能被找到：在同一段脚本里写 related_by、link 某节点 -> 它，或者 catalog add 它 to "板块"。
+- 总表由你维护。它是目录，不是索引：每个领域只放几个代表节点，其他节点靠 related 到达。
 - 节点地址只能包含字母、数字、- 和 _，不能修改。
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。

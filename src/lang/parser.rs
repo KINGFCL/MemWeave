@@ -1,6 +1,6 @@
 //! 语法分析：把词组成语句。出错后跳到下一行继续，这样一次能报告所有语法错误。
 
-use super::ast::{AddNode, Field, Located, Name, SourceRef, Statement};
+use super::ast::{AddNode, Field, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
@@ -22,7 +22,7 @@ const KEYWORDS: [&str; 16] = [
     "base",
     "unbase",
 ];
-const ADD_CLAUSES: [&str; 9] = [
+const ADD_CLAUSES: [&str; 8] = [
     "title",
     "desc",
     "based_on",
@@ -30,18 +30,19 @@ const ADD_CLAUSES: [&str; 9] = [
     "source",
     "related",
     "related_by",
-    "section",
     "end",
 ];
-const SOURCE_CLAUSES: [&str; 8] = [
+const SOURCE_CLAUSES: [&str; 7] = [
     "title",
     "desc",
     "text",
     "source",
     "related",
     "related_by",
-    "section",
     "end",
+];
+const CATALOG_COMMANDS: [&str; 7] = [
+    "show", "create", "describe", "rename", "delete", "add", "remove",
 ];
 /// `full_source` 每个文件默认和最多显示多少字节。最大值小于输出上限，所以总能看到下一段的位置。
 const DEFAULT_SOURCE_LIMIT: usize = 64 * 1024;
@@ -98,7 +99,7 @@ impl Parser {
         let keyword = keyword.clone();
         self.position += 1;
         let statement = match keyword.as_str() {
-            "catalog" => Statement::Catalog,
+            "catalog" => self.catalog(token)?,
             "check" => Statement::Check,
             "show" => Statement::Show(self.name("节点地址")?),
             "evidence" => Statement::Evidence(self.name("节点地址")?),
@@ -138,6 +139,103 @@ impl Parser {
         };
         self.end_of_line()?;
         Ok(statement)
+    }
+
+    fn catalog(&mut self, keyword: &Token) -> Result<Statement, Skip> {
+        let Some(token) = self.peek_word() else {
+            return self.fail(
+                Diagnostic::new("E102", keyword.span, "catalog 后面要写操作")
+                    .with_hint(format!("可用的操作：{}", CATALOG_COMMANDS.join("、"))),
+            );
+        };
+        let command = word_of(&token);
+        if !CATALOG_COMMANDS.contains(&command.as_str()) {
+            let hint = match closest(&command, CATALOG_COMMANDS.into_iter()) {
+                Some(suggestion) => format!("你是不是想写 catalog {suggestion}？"),
+                None => format!("可用的操作：{}", CATALOG_COMMANDS.join("、")),
+            };
+            return self.fail(
+                Diagnostic::new(
+                    "E101",
+                    token.span,
+                    format!("catalog 没有 {command} 这个操作"),
+                )
+                .with_hint(hint),
+            );
+        }
+        self.position += 1;
+        Ok(match command.as_str() {
+            "show" => Statement::CatalogShow,
+            "create" => {
+                let name = self.label("板块的名字")?;
+                self.expect_word(
+                    "desc",
+                    "写法：catalog create \"板块\" desc \"\"\"描述\"\"\"",
+                )?;
+                Statement::CatalogCreate {
+                    name,
+                    description: self.label("板块的描述")?,
+                }
+            }
+            "describe" => Statement::CatalogDescribe {
+                name: self.label("板块的名字")?,
+                description: self.label("板块的描述")?,
+            },
+            "rename" => {
+                let name = self.label("板块的名字")?;
+                self.expect_word("to", "写法：catalog rename \"旧名字\" to \"新名字\"")?;
+                Statement::CatalogRename {
+                    name,
+                    new_name: self.label("新名字")?,
+                }
+            }
+            "delete" => Statement::CatalogDelete(self.label("板块的名字")?),
+            "add" => {
+                let id = self.name("节点地址")?;
+                self.expect_word("to", "写法：catalog add 节点 to \"板块\"")?;
+                Statement::CatalogAdd {
+                    id,
+                    section: self.label("板块的名字")?,
+                }
+            }
+            _ => {
+                let id = self.name("节点地址")?;
+                self.expect_word("from", "写法：catalog remove 节点 from \"板块\"")?;
+                Statement::CatalogRemove {
+                    id,
+                    section: self.label("板块的名字")?,
+                }
+            }
+        })
+    }
+
+    fn expect_word(&mut self, word: &str, hint: &str) -> Result<(), Skip> {
+        match self.peek_word() {
+            Some(token) if word_of(&token) == word => {
+                self.position += 1;
+                Ok(())
+            }
+            _ => self.fail(
+                Diagnostic::new("E102", self.current_span(), format!("这里应该写 {word}"))
+                    .with_hint(hint),
+            ),
+        }
+    }
+
+    fn label(&mut self, what: &str) -> Result<Label, Skip> {
+        match self.peek().cloned() {
+            Some(Token {
+                kind: TokenKind::Text(text),
+                span,
+            }) => {
+                self.position += 1;
+                Ok(Label { text, span })
+            }
+            _ => self.fail(
+                Diagnostic::new("E102", self.current_span(), format!("这里应该写{what}"))
+                    .with_hint("要写在引号里，比如 \"咖啡\""),
+            ),
+        }
     }
 
     fn links(&mut self) -> Result<Statement, Skip> {
@@ -272,7 +370,6 @@ impl Parser {
             based_on: Vec::new(),
             related: Vec::new(),
             related_by: Vec::new(),
-            section: None,
             text: None,
         };
         let finish = |add: AddNode| {
@@ -329,6 +426,11 @@ impl Parser {
             );
             error = if clause == "based_on" {
                 error.with_hint("source 只用于直接来自原文的知识；由别的节点推出的知识请用 add")
+            } else if clause == "section" {
+                error.with_hint(format!(
+                    "板块用单独的指令管理：{keyword} 之后写 catalog add {} to \"板块\"",
+                    add.id.text
+                ))
             } else {
                 match closest(clause, allowed.iter().copied()) {
                     Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
@@ -353,10 +455,6 @@ impl Parser {
             "text" => {
                 let value = self.text()?;
                 self.once(&mut add.text, value, token.span, "text")?;
-            }
-            "section" => {
-                let value = self.text()?;
-                self.once(&mut add.section, value, token.span, "section")?;
             }
             "source" => {
                 let source = self.name("来源地址")?;
@@ -592,10 +690,10 @@ mod tests {
 
     #[test]
     fn parses_simple_statements() {
-        let parsed = statements("catalog\n\n# 注释\nshow a\nlink a -> b\nbase a on b\n");
+        let parsed = statements("catalog show\n\n# 注释\nshow a\nlink a -> b\nbase a on b\n");
 
         assert_eq!(parsed.len(), 4);
-        assert_eq!(parsed[0], Statement::Catalog);
+        assert_eq!(parsed[0], Statement::CatalogShow);
         assert!(matches!(&parsed[1], Statement::Show(name) if name.text == "a"));
         assert!(
             matches!(&parsed[2], Statement::Link { from, to } if from.text == "a" && to.text == "b")
@@ -630,7 +728,7 @@ mod tests {
     #[test]
     fn parses_add() {
         let parsed = statements(
-            "add n\n  title \"标题\"\n  desc \"\"\"描述\n两行\"\"\"\n  source sha256:ab 1..9\n  based_on x, y\n  related z\n  related_by w\n  section \"板块\"\nend\nshow n",
+            "add n\n  title \"标题\"\n  desc \"\"\"描述\n两行\"\"\"\n  source sha256:ab 1..9\n  based_on x, y\n  related z\n  related_by w\nend\nshow n",
         );
 
         let Statement::Add(add) = &parsed[0] else {
@@ -641,7 +739,6 @@ mod tests {
         assert_eq!(add.sources[0].source.text, "sha256:ab");
         assert_eq!((add.sources[0].start, add.sources[0].end), (1, 9));
         assert_eq!(add.based_on.len(), 2);
-        assert_eq!(add.section.as_deref(), Some("板块"));
         assert!(matches!(parsed[1], Statement::Show(_)));
     }
 

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::Mode;
-use super::ast::{AddNode, Located, Name, Statement};
+use super::ast::{AddNode, Label, Located, Name, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use crate::knowledge::{Evidence, Locator};
 use crate::memory::{Memory, check_sources, is_valid_id};
@@ -29,6 +29,16 @@ pub fn check(
         based_on: HashMap::new(),
         source_counts: HashMap::new(),
         removed_ever: HashSet::new(),
+        sections: memory
+            .catalog()
+            .sections
+            .iter()
+            .map(|section| {
+                let nodes = section.nodes.iter().map(|entry| entry.id.clone()).collect();
+                (section.name.clone(), nodes)
+            })
+            .collect(),
+        new_nodes: Vec::new(),
         errors: Vec::new(),
     };
     for located in statements {
@@ -41,6 +51,7 @@ pub fn check(
         }
         checker.statement(&located.statement);
     }
+    checker.finish();
     checker.errors
 }
 
@@ -55,13 +66,85 @@ struct Checker<'a> {
     source_counts: HashMap<String, usize>,
     /// 本脚本删除过的节点，内存里指向它们的关联在执行时已经不在了。
     removed_ever: HashSet<String>,
+    /// 模拟到当前语句时的总表：板块的名字和代表节点。
+    sections: Vec<(String, Vec<String>)>,
+    /// 本脚本新建的节点，脚本结束时要确认它们有路可达。
+    new_nodes: Vec<Name>,
     errors: Vec<Diagnostic>,
 }
 
 impl Checker<'_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::Catalog | Statement::Check => {}
+            Statement::CatalogShow | Statement::Check => {}
+            Statement::CatalogCreate { name, description } => {
+                self.nonblank(name, "板块的名字");
+                self.nonblank(description, "板块的描述");
+                if self.section(&name.text).is_some() {
+                    self.errors.push(
+                        Diagnostic::new("E215", name.span, format!("板块“{}”已经存在", name.text))
+                            .with_hint("换一个名字，或用 catalog describe 修改它的描述"),
+                    );
+                } else {
+                    self.sections.push((name.text.clone(), Vec::new()));
+                }
+            }
+            Statement::CatalogDescribe { name, description } => {
+                self.require_section(name);
+                self.nonblank(description, "板块的描述");
+            }
+            Statement::CatalogRename { name, new_name } => {
+                self.nonblank(new_name, "板块的名字");
+                let known = self.require_section(name);
+                if self.section(&new_name.text).is_some() {
+                    self.errors.push(Diagnostic::new(
+                        "E215",
+                        new_name.span,
+                        format!("板块“{}”已经存在", new_name.text),
+                    ));
+                } else if let Some(index) = known {
+                    self.sections[index].0.clone_from(&new_name.text);
+                }
+            }
+            Statement::CatalogDelete(name) => {
+                if let Some(index) = self.require_section(name) {
+                    self.sections.remove(index);
+                }
+            }
+            Statement::CatalogAdd { id, section } => {
+                let known_node = self.require(id);
+                if let Some(index) = self.require_section(section)
+                    && known_node
+                {
+                    if self.sections[index].1.contains(&id.text) {
+                        self.errors.push(Diagnostic::new(
+                            "E210",
+                            id.span,
+                            format!("{} 已经是板块“{}”的代表", id.text, section.text),
+                        ));
+                    } else {
+                        self.sections[index].1.push(id.text.clone());
+                    }
+                }
+            }
+            Statement::CatalogRemove { id, section } => {
+                if let Some(index) = self.require_section(section) {
+                    if let Some(position) =
+                        self.sections[index].1.iter().position(|n| *n == id.text)
+                    {
+                        self.sections[index].1.remove(position);
+                    } else {
+                        self.errors.push(
+                            Diagnostic::new(
+                                "E211",
+                                id.span,
+                                format!("{} 不是板块“{}”的代表", id.text, section.text),
+                            )
+                            .with_hint("用 catalog show 查看现有的代表"),
+                        );
+                    }
+                }
+            }
             Statement::Show(id)
             | Statement::Evidence(id)
             | Statement::BasedBy(id)
@@ -83,6 +166,10 @@ impl Checker<'_> {
                     for list in self.related.values_mut() {
                         list.retain(|other| *other != id.text);
                     }
+                    for (_, nodes) in &mut self.sections {
+                        nodes.retain(|other| *other != id.text);
+                    }
+                    self.new_nodes.retain(|name| name.text != id.text);
                     self.related.remove(&id.text);
                     self.based_on.remove(&id.text);
                     self.source_counts.remove(&id.text);
@@ -116,7 +203,8 @@ impl Checker<'_> {
                     .with_hint("只能包含字母、数字、- 和 _，且不超过 200 字节"),
             );
         }
-        if self.exists(&id.text) {
+        let duplicate = self.exists(&id.text);
+        if duplicate {
             self.errors.push(
                 Diagnostic::new("E205", id.span, format!("节点 {} 已经存在", id.text))
                     .with_hint("换一个地址，或用 set 修改已有节点"),
@@ -161,12 +249,6 @@ impl Checker<'_> {
                     ),
             );
         }
-        if add.related_by.is_empty() && add.section.is_none() {
-            self.errors.push(
-                Diagnostic::new("E208", id.span, format!("从总表到达不了节点 {}", id.text))
-                    .with_hint("写 related_by 指定谁关联它，或写 section 放进某个板块"),
-            );
-        }
 
         for source in &add.sources {
             let evidence = [Evidence::Source {
@@ -194,6 +276,9 @@ impl Checker<'_> {
         }
 
         // 记下这个节点，后面的语句才能引用它。
+        if !duplicate {
+            self.new_nodes.push(id.clone());
+        }
         self.removed.remove(&id.text);
         self.added.insert(id.text.clone());
         self.related.insert(
@@ -307,6 +392,70 @@ impl Checker<'_> {
             return;
         }
         list.retain(|other| *other != on.text);
+    }
+
+    /// 脚本结束时，新节点必须有路可达：它是板块的代表，或者有已接入的节点关联它。
+    /// 新节点只是互相关联不算接入。已有节点本身是否可达由 `check` 负责。
+    fn finish(&mut self) {
+        let mut waiting = std::mem::take(&mut self.new_nodes);
+        loop {
+            let before = waiting.len();
+            let unjoined: HashSet<String> = waiting.iter().map(|id| id.text.clone()).collect();
+            waiting.retain(|id| !self.joined(&id.text, &unjoined));
+            if waiting.len() == before {
+                break;
+            }
+        }
+        for id in waiting {
+            self.errors.push(
+                Diagnostic::new("E208", id.span, format!("从总表到达不了节点 {}", id.text))
+                    .with_hint(format!(
+                        "在这段脚本里接入它：写 related_by，或 link 某节点 -> {0}，或 catalog add {0} to \"板块\"",
+                        id.text
+                    )),
+            );
+        }
+    }
+
+    fn joined(&self, id: &String, unjoined: &HashSet<String>) -> bool {
+        self.sections.iter().any(|(_, nodes)| nodes.contains(id))
+            || self.related.iter().any(|(from, list)| {
+                !unjoined.contains(from) && self.exists(from) && list.contains(id)
+            })
+    }
+
+    fn section(&self, name: &str) -> Option<usize> {
+        self.sections
+            .iter()
+            .position(|(section, _)| section == name)
+    }
+
+    fn require_section(&mut self, name: &Label) -> Option<usize> {
+        let index = self.section(&name.text);
+        if index.is_none() {
+            let mut error =
+                Diagnostic::new("E214", name.span, format!("板块“{}”不存在", name.text));
+            let names: Vec<&str> = self.sections.iter().map(|(n, _)| n.as_str()).collect();
+            error = match closest(&name.text, names.into_iter()) {
+                Some(found) => error.with_hint(format!("你是不是想写“{found}”？")),
+                None => error.with_hint(format!(
+                    "先用 catalog create \"{}\" desc \"\"\"描述\"\"\" 新建",
+                    name.text
+                )),
+            };
+            self.errors.push(error);
+        }
+        index
+    }
+
+    fn nonblank(&mut self, value: &Label, what: &str) {
+        if value.text.trim().is_empty() {
+            self.errors.push(Diagnostic::new(
+                "E206",
+                value.span,
+                format!("{what}不能为空"),
+            ));
+        }
     }
 
     /// 还有结论依据这个节点时不能删除，推导关系必须永远指向真实存在的节点。

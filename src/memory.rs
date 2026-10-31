@@ -239,17 +239,20 @@ pub enum Problem {
     #[error("要关联到节点 {target} 的节点 {id} 不存在")]
     MissingIncoming { id: NodeId, target: NodeId },
 
+    #[error("板块“{name}”重复")]
+    DuplicateSection { name: String },
+
+    #[error("板块“{name}”不存在")]
+    UnknownSection { name: String },
+
+    #[error("节点 {id} 已经是板块“{section}”的代表")]
+    AlreadyRepresentative { id: NodeId, section: String },
+
+    #[error("节点 {id} 不是板块“{section}”的代表")]
+    NotRepresentative { id: NodeId, section: String },
+
     #[error("不能删除节点 {id}，{} 还依据它", .by.join("、"))]
     StillBasedOn { id: NodeId, by: Vec<NodeId> },
-}
-
-/// 新节点放在图的什么位置。至少要有一项，否则从总表到达不了它，它就永远查不到。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Placement {
-    /// 这些已有节点的 `related` 里会加上新节点。
-    pub related_by: Vec<NodeId>,
-    /// 新节点成为这个板块的代表节点，板块不存在时会创建。
-    pub section: Option<String>,
 }
 
 /// 删除一个节点的结果。
@@ -261,7 +264,7 @@ pub struct RemovedNode {
     pub node: Node,
     /// 关联它的节点。它们少了一条路径，有些节点可能因此查不到了，见 [`Memory::unreachable`]。
     pub related_by: Vec<NodeId>,
-    /// 它原来是哪些板块的代表节点。这些板块可能已经空了。
+    /// 它原来是哪些板块的代表节点。这些板块可能已经空了，要不要保留由模型决定。
     pub sections: Vec<String>,
 }
 
@@ -351,7 +354,13 @@ impl Memory {
             }
         }
 
+        let mut section_names = HashSet::new();
         for section in &parsed.catalog.sections {
+            if !section_names.insert(section.name.as_str()) {
+                problems.push(Problem::DuplicateSection {
+                    name: section.name.clone(),
+                });
+            }
             for entry in &section.nodes {
                 if !by_id.contains_key(entry.id.as_str()) {
                     problems.push(Problem::MissingEntry {
@@ -396,17 +405,18 @@ impl Memory {
         problems
     }
 
-    /// 添加一个节点，并接入图。
+    /// 添加一个节点，并接入图。`related_by` 里的节点会关联它。
     ///
     /// 证据只能依据已有的节点，所以不会形成循环。来源必须已经在 `sources` 里。
+    /// 这里不要求它能从总表到达，之后可以用 [`Memory::catalog_add`] 或 [`Memory::link`] 接入。
     /// 有问题时一次报告所有问题，图保持不变。
     pub fn add_node(
         &mut self,
         mut node: Node,
-        placement: Placement,
+        related_by: &[NodeId],
         sources: &dyn SourceStore,
     ) -> Result<NodeRef<'_>, Error> {
-        let problems = self.check_new_node(&node, &placement, sources);
+        let problems = self.check_new_node(&node, related_by, sources);
         if !problems.is_empty() {
             return Err(Error::InvalidMemory(problems));
         }
@@ -429,8 +439,7 @@ impl Memory {
             })
             .collect();
         let mut seen = HashSet::new();
-        let incoming: Vec<NonNull<RawNode>> = placement
-            .related_by
+        let incoming: Vec<NonNull<RawNode>> = related_by
             .iter()
             .filter(|id| seen.insert(id.as_str()))
             .map(|id| self.lookup(id))
@@ -491,26 +500,13 @@ impl Memory {
             append_link(*from, ffi::LINK_RELATED, raw);
         }
 
-        if let Some(name) = placement.section {
-            let entry = CatalogEntry {
-                id: node.id.clone(),
-                title: node.title.clone(),
-            };
-            match self.catalog.sections.iter_mut().find(|s| s.name == name) {
-                Some(section) => section.nodes.push(entry),
-                None => self.catalog.sections.push(Section {
-                    name,
-                    nodes: vec![entry],
-                }),
-            }
-        }
         Ok(NodeRef::new(raw))
     }
 
     fn check_new_node(
         &self,
         node: &Node,
-        placement: &Placement,
+        related_by: &[NodeId],
         sources: &dyn SourceStore,
     ) -> Vec<Problem> {
         let mut problems = Vec::new();
@@ -532,18 +528,13 @@ impl Memory {
                 });
             }
         }
-        for id in &placement.related_by {
+        for id in related_by {
             if !self.contains(id) {
                 problems.push(Problem::MissingIncoming {
                     id: id.clone(),
                     target: node.id.clone(),
                 });
             }
-        }
-        if placement.related_by.is_empty() && placement.section.is_none() {
-            problems.push(Problem::Unreachable {
-                id: node.id.clone(),
-            });
         }
         check_evidence(
             slice::from_ref(node),
@@ -669,6 +660,90 @@ impl Memory {
 
     pub fn node_count(&self) -> usize {
         unsafe { ffi::mw_index_size(self.index.as_ptr()) }
+    }
+
+    /// 新建一个空板块。
+    pub fn catalog_create(&mut self, name: &str, description: &str) -> Result<(), Error> {
+        if self.section_index(name).is_some() {
+            return Err(Error::InvalidMemory(vec![Problem::DuplicateSection {
+                name: name.to_owned(),
+            }]));
+        }
+        self.catalog.sections.push(Section {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            nodes: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// 修改板块的描述。
+    pub fn catalog_describe(&mut self, name: &str, description: &str) -> Result<(), Error> {
+        let index = self.find_section(name)?;
+        description.clone_into(&mut self.catalog.sections[index].description);
+        Ok(())
+    }
+
+    /// 修改板块的名字。
+    pub fn catalog_rename(&mut self, name: &str, new_name: &str) -> Result<(), Error> {
+        let index = self.find_section(name)?;
+        if self.section_index(new_name).is_some() {
+            return Err(Error::InvalidMemory(vec![Problem::DuplicateSection {
+                name: new_name.to_owned(),
+            }]));
+        }
+        new_name.clone_into(&mut self.catalog.sections[index].name);
+        Ok(())
+    }
+
+    /// 删除板块，返回它原来的代表节点。节点本身保留，但可能有节点因此查不到了。
+    pub fn catalog_delete(&mut self, name: &str) -> Result<Vec<CatalogEntry>, Error> {
+        let index = self.find_section(name)?;
+        Ok(self.catalog.sections.remove(index).nodes)
+    }
+
+    /// 让节点成为板块的代表。标题取自节点，之后修改标题时会同步。
+    pub fn catalog_add(&mut self, id: &str, section: &str) -> Result<(), Error> {
+        let title = NodeRef::new(self.find(id)?).title().to_owned();
+        let index = self.find_section(section)?;
+        let nodes = &mut self.catalog.sections[index].nodes;
+        if nodes.iter().any(|entry| entry.id == id) {
+            return Err(Error::InvalidMemory(vec![Problem::AlreadyRepresentative {
+                id: id.to_owned(),
+                section: section.to_owned(),
+            }]));
+        }
+        nodes.push(CatalogEntry {
+            id: id.to_owned(),
+            title,
+        });
+        Ok(())
+    }
+
+    /// 撤下板块的代表，节点本身保留。之后可能有节点查不到了，见 [`Memory::unreachable`]。
+    pub fn catalog_remove(&mut self, id: &str, section: &str) -> Result<(), Error> {
+        let index = self.find_section(section)?;
+        let nodes = &mut self.catalog.sections[index].nodes;
+        let Some(position) = nodes.iter().position(|entry| entry.id == id) else {
+            return Err(Error::InvalidMemory(vec![Problem::NotRepresentative {
+                id: id.to_owned(),
+                section: section.to_owned(),
+            }]));
+        };
+        nodes.remove(position);
+        Ok(())
+    }
+
+    fn section_index(&self, name: &str) -> Option<usize> {
+        self.catalog.sections.iter().position(|s| s.name == name)
+    }
+
+    fn find_section(&self, name: &str) -> Result<usize, Error> {
+        self.section_index(name).ok_or_else(|| {
+            Error::InvalidMemory(vec![Problem::UnknownSection {
+                name: name.to_owned(),
+            }])
+        })
     }
 
     /// 修改节点的标题，总表里的标题也跟着改。
@@ -1100,6 +1175,7 @@ mod tests {
         Catalog {
             sections: vec![Section {
                 name: "板块".into(),
+                description: String::new(),
                 nodes,
             }],
         }
@@ -1710,18 +1786,8 @@ mod tests {
         build(entries, nodes).unwrap()
     }
 
-    fn section(name: &str) -> Placement {
-        Placement {
-            section: Some(name.into()),
-            ..Placement::default()
-        }
-    }
-
-    fn linked_from(ids: &[&str]) -> Placement {
-        Placement {
-            related_by: ids.iter().map(|id| id.to_string()).collect(),
-            ..Placement::default()
-        }
+    fn linked_from(ids: &[&str]) -> Vec<NodeId> {
+        ids.iter().map(|id| id.to_string()).collect()
     }
 
     fn ids<'m>(nodes: impl Iterator<Item = NodeRef<'m>>) -> Vec<&'m str> {
@@ -1732,13 +1798,13 @@ mod tests {
     fn add_connects_every_direction() {
         let mut memory = memory_of(&["a"], vec![node("a", &[])]);
         memory
-            .add_node(node("基础", &[]), linked_from(&["a"]), &sources())
+            .add_node(node("基础", &[]), &linked_from(&["a"]), &sources())
             .unwrap();
         let mut new = based_on("新", &["基础"]);
         new.related = vec!["a".into()];
 
         let added = memory
-            .add_node(new.clone(), linked_from(&["基础"]), &sources())
+            .add_node(new.clone(), &linked_from(&["基础"]), &sources())
             .unwrap();
         assert_eq!(added.to_node(), new);
         assert_eq!(ids(added.related()), ["a"]);
@@ -1754,21 +1820,97 @@ mod tests {
     }
 
     #[test]
-    fn add_to_a_section_updates_the_catalog() {
+    fn catalog_operations_update_sections() {
         let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        memory.add_node(node("b", &[]), &[], &sources()).unwrap();
 
-        memory
-            .add_node(node("b", &[]), section("板块"), &sources())
-            .unwrap();
-        memory
-            .add_node(node("c", &[]), section("新板块"), &sources())
-            .unwrap();
+        memory.catalog_create("新板块", "描述").unwrap();
+        memory.catalog_add("b", "新板块").unwrap();
+        memory.catalog_add("b", "板块").unwrap();
+        memory.catalog_describe("新板块", "新描述").unwrap();
+        memory.catalog_rename("新板块", "改名").unwrap();
+        memory.set_title("b", "新标题").unwrap();
 
         let sections = &memory.catalog().sections;
         assert_eq!(sections[0].nodes[1].id, "b");
-        assert_eq!(sections[0].nodes[1].title, "标题b");
-        assert_eq!(sections[1].name, "新板块");
-        assert_eq!(sections[1].nodes[0].id, "c");
+        assert_eq!(sections[0].nodes[1].title, "新标题");
+        assert_eq!(sections[1].name, "改名");
+        assert_eq!(sections[1].description, "新描述");
+        assert_eq!(sections[1].nodes[0].title, "新标题");
+
+        memory.catalog_remove("b", "板块").unwrap();
+        assert_eq!(memory.catalog().sections[0].nodes.len(), 1);
+        let entries = memory.catalog_delete("改名").unwrap();
+        assert_eq!(entries[0].id, "b");
+        assert_eq!(memory.catalog().sections.len(), 1);
+        // 节点本身还在，只是走不到了。
+        assert_eq!(memory.unreachable(), ["b"]);
+    }
+
+    #[test]
+    fn catalog_operations_report_mistakes() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        let problem = |error: Error| match error {
+            Error::InvalidMemory(problems) => problems[0].clone(),
+            other => panic!("{other}"),
+        };
+
+        assert_eq!(
+            problem(memory.catalog_create("板块", "d").unwrap_err()),
+            Problem::DuplicateSection {
+                name: "板块".into()
+            }
+        );
+        assert_eq!(
+            problem(memory.catalog_add("a", "不存在").unwrap_err()),
+            Problem::UnknownSection {
+                name: "不存在".into()
+            }
+        );
+        assert_eq!(
+            problem(memory.catalog_add("a", "板块").unwrap_err()),
+            Problem::AlreadyRepresentative {
+                id: "a".into(),
+                section: "板块".into()
+            }
+        );
+        memory.catalog_create("空", "d").unwrap();
+        assert_eq!(
+            problem(memory.catalog_remove("a", "空").unwrap_err()),
+            Problem::NotRepresentative {
+                id: "a".into(),
+                section: "空".into()
+            }
+        );
+        assert!(matches!(
+            memory.catalog_add("幽灵", "板块"),
+            Err(Error::UnknownNode(_))
+        ));
+        assert_eq!(
+            problem(memory.catalog_rename("空", "板块").unwrap_err()),
+            Problem::DuplicateSection {
+                name: "板块".into()
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_section_names_fail_validation() {
+        let mut duplicate = catalog(&["a"]);
+        duplicate.sections.push(duplicate.sections[0].clone());
+        let parsed = ParsedKnowledge {
+            catalog: duplicate,
+            nodes: vec![node("a", &[])],
+        };
+
+        let problems = Memory::validate(&parsed, &sources());
+
+        assert_eq!(
+            problems,
+            [Problem::DuplicateSection {
+                name: "板块".into()
+            }]
+        );
     }
 
     #[test]
@@ -1779,7 +1921,7 @@ mod tests {
             let mut new = node(&format!("n{index}"), &["hub"]);
             new.evidence.push(Evidence::Node { id: "hub".into() });
             memory
-                .add_node(new, linked_from(&["hub"]), &sources())
+                .add_node(new, &linked_from(&["hub"]), &sources())
                 .unwrap();
         }
 
@@ -1795,7 +1937,7 @@ mod tests {
         let mut memory = memory_of(&["a"], vec![node("a", &[])]);
 
         memory
-            .add_node(node("自己", &["自己", "a"]), section("板块"), &sources())
+            .add_node(node("自己", &["自己", "a"]), &[], &sources())
             .unwrap();
 
         let itself = memory.node("自己").unwrap();
@@ -1809,25 +1951,12 @@ mod tests {
         let missing_source = source_id(b"not stored");
 
         let cases = [
-            (node("a", &[]), section("板块"), "重复"),
-            (node("../x", &[]), section("板块"), "不合法"),
-            (
-                node("b", &["幽灵"]),
-                section("板块"),
-                "关联的节点 幽灵 不存在",
-            ),
-            (
-                based_on("b", &["幽灵"]),
-                section("板块"),
-                "证据节点 幽灵 不存在",
-            ),
-            (based_on("b", &["b"]), section("板块"), "证据节点 b 不存在"),
-            (
-                node_with_evidence("b", vec![]),
-                section("板块"),
-                "没有任何证据",
-            ),
-            (node("b", &[]), Placement::default(), "无法从总表到达"),
+            (node("a", &[]), Vec::new(), "重复"),
+            (node("../x", &[]), Vec::new(), "不合法"),
+            (node("b", &["幽灵"]), Vec::new(), "关联的节点 幽灵 不存在"),
+            (based_on("b", &["幽灵"]), Vec::new(), "证据节点 幽灵 不存在"),
+            (based_on("b", &["b"]), Vec::new(), "证据节点 b 不存在"),
+            (node_with_evidence("b", vec![]), Vec::new(), "没有任何证据"),
             (node("b", &[]), linked_from(&["幽灵"]), "节点 幽灵 不存在"),
             (
                 node_with_evidence(
@@ -1837,13 +1966,13 @@ mod tests {
                         locator: Locator::TextRange { start: 0, end: 1 },
                     }],
                 ),
-                section("板块"),
+                Vec::new(),
                 "来源",
             ),
         ];
-        for (new, placement, expected) in cases {
+        for (new, related_by, expected) in cases {
             let message = memory
-                .add_node(new, placement, &sources())
+                .add_node(new, &related_by, &sources())
                 .unwrap_err()
                 .to_string();
             assert!(message.contains(expected), "{expected}：{message}");
@@ -1931,7 +2060,7 @@ mod tests {
         assert_eq!(memory.unreachable(), ["c", "d"]);
         // 模型可以把它们重新接回来。
         memory
-            .add_node(node("新桥", &["c"]), linked_from(&["a"]), &sources())
+            .add_node(node("新桥", &["c"]), &linked_from(&["a"]), &sources())
             .unwrap();
         assert!(memory.unreachable().is_empty());
     }
@@ -1952,7 +2081,7 @@ mod tests {
         for index in 0..20 {
             let id = format!("n{index}");
             memory
-                .add_node(node(&id, &["hub"]), linked_from(&["hub"]), &sources())
+                .add_node(node(&id, &["hub"]), &linked_from(&["hub"]), &sources())
                 .unwrap();
         }
 
@@ -1996,11 +2125,8 @@ mod tests {
                 new.related = pick(next());
                 new.evidence
                     .extend(pick(next()).into_iter().map(|id| Evidence::Node { id }));
-                let placement = Placement {
-                    related_by: pick(next()),
-                    section: Some("板块".into()),
-                };
-                memory.add_node(new, placement, &sources()).unwrap();
+                let related_by = pick(next());
+                memory.add_node(new, &related_by, &sources()).unwrap();
             } else {
                 let target = live[next() % live.len()].clone();
                 let based_by = memory.node(&target).unwrap().based_by().len();

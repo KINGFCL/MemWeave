@@ -47,7 +47,11 @@ pub struct Catalog {
 /// 总表中的一个板块。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Section {
+    /// 名字，在总表内唯一。
     pub name: String,
+    /// 这个领域包含什么，模型靠它判断查询是否属于这个领域。
+    #[serde(default)]
+    pub description: String,
     pub nodes: Vec<CatalogEntry>,
 }
 

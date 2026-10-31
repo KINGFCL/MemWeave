@@ -121,6 +121,7 @@ fn bench_graph(count: usize, links: usize, shape: Shape) {
     let catalog = Catalog {
         sections: vec![Section {
             name: "板块".into(),
+            description: String::new(),
             nodes: vec![CatalogEntry {
                 id: node_id(0),
                 title: "入口".into(),

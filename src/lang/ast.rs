@@ -26,7 +26,6 @@ pub struct AddNode {
     pub based_on: Vec<Name>,
     pub related: Vec<Name>,
     pub related_by: Vec<Name>,
-    pub section: Option<String>,
     /// 要存入的新原文。
     pub text: Option<String>,
 }
@@ -37,9 +36,37 @@ pub enum Field {
     Description,
 }
 
+/// 脚本里写的一段文字，记着位置，报错时用。板块的名字就是这种。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Label {
+    pub text: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
-    Catalog,
+    CatalogShow,
+    CatalogCreate {
+        name: Label,
+        description: Label,
+    },
+    CatalogDescribe {
+        name: Label,
+        description: Label,
+    },
+    CatalogRename {
+        name: Label,
+        new_name: Label,
+    },
+    CatalogDelete(Label),
+    CatalogAdd {
+        id: Name,
+        section: Label,
+    },
+    CatalogRemove {
+        id: Name,
+        section: Label,
+    },
     Check,
     Show(Name),
     Links {
@@ -86,7 +113,7 @@ impl Statement {
     pub fn writes(&self) -> bool {
         !matches!(
             self,
-            Statement::Catalog
+            Statement::CatalogShow
                 | Statement::Check
                 | Statement::Show(_)
                 | Statement::Links { .. }

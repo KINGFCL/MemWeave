@@ -8,8 +8,11 @@ use std::fmt::Write;
 use super::ast::{AddNode, Field, Located, Statement};
 use crate::error::Error;
 use crate::knowledge::{Evidence, Locator, Node};
-use crate::memory::{Memory, NodeRef, Placement, RemovedNode};
+use crate::memory::{Memory, NodeRef, RemovedNode};
 use crate::source::{LoadedEvidence, SourceStore, source_id};
+
+/// 板块的代表超过这个数量时提醒模型：总表不是索引。
+const MANY_REPRESENTATIVES: usize = 5;
 
 /// 执行结果。
 pub struct Report {
@@ -44,7 +47,69 @@ fn statement(
 ) -> Result<(), Error> {
     let output = &mut report.text;
     match statement {
-        Statement::Catalog => render_catalog(memory, output),
+        Statement::CatalogShow => render_catalog(memory, output),
+        Statement::CatalogCreate { name, description } => {
+            memory.catalog_create(&name.text, &description.text)?;
+            let _ = writeln!(output, "created section {}", quote(&name.text));
+        }
+        Statement::CatalogDescribe { name, description } => {
+            memory.catalog_describe(&name.text, &description.text)?;
+            let _ = writeln!(output, "described section {}", quote(&name.text));
+        }
+        Statement::CatalogRename { name, new_name } => {
+            memory.catalog_rename(&name.text, &new_name.text)?;
+            let _ = writeln!(
+                output,
+                "renamed section {} to {}",
+                quote(&name.text),
+                quote(&new_name.text)
+            );
+        }
+        Statement::CatalogDelete(name) => {
+            let entries = memory.catalog_delete(&name.text)?;
+            let _ = writeln!(output, "deleted section {}", quote(&name.text));
+            if !entries.is_empty() {
+                let ids: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+                let _ = writeln!(
+                    output,
+                    "warning: {} 不再是这个板块的代表，节点本身保留",
+                    ids.join(", ")
+                );
+                let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
+            }
+        }
+        Statement::CatalogAdd { id, section } => {
+            memory.catalog_add(&id.text, &section.text)?;
+            let _ = writeln!(
+                output,
+                "added {} to section {}",
+                id.text,
+                quote(&section.text)
+            );
+            let count = memory
+                .catalog()
+                .sections
+                .iter()
+                .find(|s| s.name == section.text)
+                .map_or(0, |s| s.nodes.len());
+            if count > MANY_REPRESENTATIVES {
+                let _ = writeln!(
+                    output,
+                    "warning: 板块 {} 有 {count} 个代表节点。总表不是索引，每个领域只需要几个代表，其他节点靠 related 到达",
+                    quote(&section.text)
+                );
+            }
+        }
+        Statement::CatalogRemove { id, section } => {
+            memory.catalog_remove(&id.text, &section.text)?;
+            let _ = writeln!(
+                output,
+                "removed {} from section {}",
+                id.text,
+                quote(&section.text)
+            );
+            let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
+        }
         Statement::Check => render_check(memory, output),
         Statement::Show(id) => {
             let node = existing(memory, &id.text)?;
@@ -86,8 +151,8 @@ fn statement(
             );
         }
         Statement::Add(add) | Statement::Source(add) => {
-            let (node, placement) = build_node(add);
-            memory.add_node(node, placement, sources)?;
+            let (node, related_by) = build_node(add);
+            memory.add_node(node, &related_by, sources)?;
             let _ = writeln!(output, "added {}", add.id.text);
             if let Some(text) = &add.text {
                 let source = source_id(text.as_bytes());
@@ -141,7 +206,7 @@ fn existing<'m>(memory: &'m Memory, id: &str) -> Result<NodeRef<'m>, Error> {
         .ok_or_else(|| Error::UnknownNode(id.to_owned()))
 }
 
-fn build_node(add: &AddNode) -> (Node, Placement) {
+fn build_node(add: &AddNode) -> (Node, Vec<String>) {
     let mut evidence: Vec<Evidence> = add
         .sources
         .iter()
@@ -172,15 +237,12 @@ fn build_node(add: &AddNode) -> (Node, Placement) {
         evidence,
         related: add.related.iter().map(|name| name.text.clone()).collect(),
     };
-    let placement = Placement {
-        related_by: add
-            .related_by
-            .iter()
-            .map(|name| name.text.clone())
-            .collect(),
-        section: add.section.clone(),
-    };
-    (node, placement)
+    let related_by = add
+        .related_by
+        .iter()
+        .map(|name| name.text.clone())
+        .collect();
+    (node, related_by)
 }
 
 fn quote(text: &str) -> String {
@@ -195,6 +257,14 @@ fn render_catalog(memory: &Memory, output: &mut String) {
     }
     for section in sections {
         let _ = writeln!(output, "section {}", quote(&section.name));
+        if section.description.is_empty() {
+            output.push_str("  desc: 无\n");
+        } else {
+            let _ = writeln!(output, "  desc: {}", quote(&section.description));
+        }
+        if section.nodes.is_empty() {
+            output.push_str("  没有代表节点\n");
+        }
         for entry in &section.nodes {
             let _ = writeln!(output, "  {} {}", entry.id, quote(&entry.title));
         }
@@ -403,12 +473,27 @@ fn render_review(node: NodeRef<'_>, output: &mut String) {
 
 fn render_check(memory: &Memory, output: &mut String) {
     let unreachable = memory.unreachable();
-    if unreachable.is_empty() {
+    let empty: Vec<&str> = memory
+        .catalog()
+        .sections
+        .iter()
+        .filter(|section| section.nodes.is_empty())
+        .map(|section| section.name.as_str())
+        .collect();
+    if unreachable.is_empty() && empty.is_empty() {
         output.push_str("check: 没有问题\n");
         return;
     }
     for id in &unreachable {
         let _ = writeln!(output, "problem: 从总表到达不了 {id}");
     }
-    let _ = writeln!(output, "check: {} 个节点查不到", unreachable.len());
+    for name in &empty {
+        let _ = writeln!(output, "problem: 板块 {} 没有代表节点", quote(name));
+    }
+    let _ = writeln!(
+        output,
+        "check: {} 个节点查不到，{} 个板块没有代表节点",
+        unreachable.len(),
+        empty.len()
+    );
 }

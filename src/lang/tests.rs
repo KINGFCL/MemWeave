@@ -43,6 +43,7 @@ fn memory() -> Memory {
     let catalog = Catalog {
         sections: vec![Section {
             name: "Rust".into(),
+            description: String::new(),
             nodes: vec![CatalogEntry {
                 id: "entry".into(),
                 title: "标题entry".into(),
@@ -117,12 +118,12 @@ fn reads_catalog_and_nodes() {
 
     let text = read(
         &mut memory,
-        "catalog\nshow ownership\nlinks entry depth 2\n",
+        "catalog show\nshow ownership\nlinks entry depth 2\n",
     )
     .text;
 
     assert!(
-        text.contains("section \"Rust\"\n  entry \"标题entry\""),
+        text.contains("section \"Rust\"\n  desc: 无\n  entry \"标题entry\""),
         "{text}"
     );
     assert!(text.contains("node ownership"), "{text}");
@@ -173,7 +174,8 @@ fn show_still_lists_everything_else_when_the_source_is_damaged() {
     let mut memory = memory();
     let empty = InMemorySources::new();
 
-    let output = Session::new(&mut memory, &empty, Mode::ReadOnly).run("show ownership\ncatalog");
+    let output =
+        Session::new(&mut memory, &empty, Mode::ReadOnly).run("show ownership\ncatalog show");
 
     assert!(!output.ok);
     assert!(
@@ -342,22 +344,12 @@ fn add_works_and_can_be_used_right_away() {
 }
 
 #[test]
-fn add_to_a_section_is_listed_in_the_catalog() {
-    let mut memory = memory();
-    let script = "add new\n  title \"t\"\n  desc \"d\"\n  based_on ownership\n  section \"新板块\"\nend\ncatalog";
-
-    let text = ok(&mut memory, script);
-
-    assert!(text.contains("section \"新板块\"\n  new \"t\""), "{text}");
-}
-
-#[test]
 fn set_changes_text_and_warns_about_based_by() {
     let mut memory = memory();
 
     let text = ok(
         &mut memory,
-        "set ownership desc \"\"\"新的\n描述\"\"\"\nset entry title \"新标题\"\ncatalog",
+        "set ownership desc \"\"\"新的\n描述\"\"\"\nset entry title \"新标题\"\ncatalog show",
     );
 
     assert_eq!(
@@ -472,7 +464,7 @@ fn removed_nodes_cannot_be_used_later_in_the_script() {
 fn errors_point_at_the_problem_and_suggest_a_fix() {
     let mut memory = memory();
 
-    let text = fails(&mut memory, "catalog\nshow ownershp", "E201");
+    let text = fails(&mut memory, "catalog show\nshow ownershp", "E201");
 
     assert!(text.contains("第 2 行第 6 列"), "{text}");
     assert!(text.contains("2 | show ownershp"), "{text}");
@@ -509,30 +501,32 @@ fn add_is_checked_like_a_compiler() {
         (
             "E205",
             format!(
-                "add entry\n title \"t\"\n desc \"d\"\n source {source} 0..3\n section \"s\"\nend"
+                "add entry\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related_by entry\nend"
             ),
         ),
         (
             "E204",
             format!(
-                "add a:b\n title \"t\"\n desc \"d\"\n source {source} 0..3\n section \"s\"\nend"
+                "add a:b\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related_by entry\nend"
             ),
         ),
         (
             "E206",
-            format!("add n\n desc \"d\"\n source {source} 0..3\n section \"s\"\nend"),
+            format!("add n\n desc \"d\"\n source {source} 0..3\n related_by entry\nend"),
         ),
         (
             "E206",
-            format!("add n\n title \"t\"\n source {source} 0..3\n section \"s\"\nend"),
+            format!("add n\n title \"t\"\n source {source} 0..3\n related_by entry\nend"),
         ),
         (
             "E206",
-            format!("add n\n title \" \"\n desc \"d\"\n source {source} 0..3\n section \"s\"\nend"),
+            format!(
+                "add n\n title \" \"\n desc \"d\"\n source {source} 0..3\n related_by entry\nend"
+            ),
         ),
         (
             "E207",
-            "add n\n title \"t\"\n desc \"d\"\n section \"s\"\nend".to_owned(),
+            "add n\n title \"t\"\n desc \"d\"\n related_by entry\nend".to_owned(),
         ),
         (
             "E208",
@@ -540,30 +534,30 @@ fn add_is_checked_like_a_compiler() {
         ),
         (
             "E209",
-            "add n\n title \"t\"\n desc \"d\"\n source abc 0..3\n section \"s\"\nend".to_owned(),
+            "add n\n title \"t\"\n desc \"d\"\n source abc 0..3\n related_by entry\nend".to_owned(),
         ),
         (
             "E209",
             format!(
-                "add n\n title \"t\"\n desc \"d\"\n source {} 0..3\n section \"s\"\nend",
+                "add n\n title \"t\"\n desc \"d\"\n source {} 0..3\n related_by entry\nend",
                 source_id(b"x")
             ),
         ),
         (
             "E209",
             format!(
-                "add n\n title \"t\"\n desc \"d\"\n source {source} 0..9999\n section \"s\"\nend"
+                "add n\n title \"t\"\n desc \"d\"\n source {source} 0..9999\n related_by entry\nend"
             ),
         ),
         (
             "E201",
             format!(
-                "add n\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related ghost\n section \"s\"\nend"
+                "add n\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related ghost\n related_by entry\nend"
             ),
         ),
         (
             "E201",
-            "add n\n title \"t\"\n desc \"d\"\n based_on ghost\n section \"s\"\nend".to_owned(),
+            "add n\n title \"t\"\n desc \"d\"\n based_on ghost\n related_by entry\nend".to_owned(),
         ),
         (
             "E201",
@@ -573,7 +567,7 @@ fn add_is_checked_like_a_compiler() {
         ),
         (
             "E201",
-            "add n\n title \"t\"\n desc \"d\"\n based_on n\n section \"s\"\nend".to_owned(),
+            "add n\n title \"t\"\n desc \"d\"\n based_on n\n related_by entry\nend".to_owned(),
         ),
     ];
 
@@ -585,7 +579,7 @@ fn add_is_checked_like_a_compiler() {
     fails(&mut memory, "show ../../etc/passwd", "E001");
     fails(
         &mut memory,
-        "add n\n title \"t\"\n desc \"d\"\n source ../secret 0..3\n section \"s\"\nend",
+        "add n\n title \"t\"\n desc \"d\"\n source ../secret 0..3\n related_by entry\nend",
         "E001",
     );
 }
@@ -680,7 +674,7 @@ fn oversized_scripts_are_rejected() {
     let huge = "#".repeat(MAX_SCRIPT_BYTES + 1);
     assert!(write(&mut memory, &huge).text.contains("E302"));
 
-    let many = "catalog\n".repeat(MAX_STATEMENTS + 1);
+    let many = "catalog show\n".repeat(MAX_STATEMENTS + 1);
     assert!(write(&mut memory, &many).text.contains("E302"));
 }
 
@@ -895,7 +889,7 @@ fn duplicates_are_merged_when_adding() {
 
     let text = ok(
         &mut memory,
-        "add new\n title \"t\"\n desc \"d\"\n based_on ownership, ownership\n related borrowing, borrowing\n section \"s\"\nend\nshow new",
+        "add new\n title \"t\"\n desc \"d\"\n based_on ownership, ownership\n related borrowing, borrowing\n related_by entry\nend\nshow new",
     );
 
     assert!(text.contains("related: borrowing\n"), "{text}");
@@ -964,16 +958,22 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
                 let a = IDS[random.next() % IDS.len()];
                 let b = IDS[random.next() % IDS.len()];
                 let c = IDS[random.next() % IDS.len()];
-                let statement = match random.next() % 14 {
+                let statement = match random.next() % 20 {
+                    14 => "catalog show".to_owned(),
+                    15 => format!("catalog create \"{a}\" desc \"d\""),
+                    16 => format!("catalog delete \"{a}\""),
+                    17 => format!("catalog add {a} to \"{b}\""),
+                    18 => format!("catalog remove {a} from \"{b}\""),
+                    19 => format!("catalog rename \"{a}\" to \"{b}\""),
                     12 => format!(
-                        "source {a}\n title \"t\"\n desc \"d\"\n text \"\"\"原文{b}\"\"\"\n related {c}\n section \"s\"\nend"
+                        "source {a}\n title \"t\"\n desc \"d\"\n text \"\"\"原文{b}\"\"\"\n related {c}\n related_by entry\nend"
                     ),
                     13 => format!("full_source {a}"),
                     0 => format!("show {a}"),
                     1 => format!("evidence {a}"),
                     2 => "check".to_owned(),
                     3 => format!(
-                        "source {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n section \"s\"\nend"
+                        "source {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n related_by entry\nend"
                     ),
                     4 => format!(
                         "add {a}\n title \"t\"\n desc \"d\"\n based_on {b}, {b}\n related_by {c}\nend"
@@ -1090,7 +1090,7 @@ fn the_same_text_is_stored_once() {
     let count = || fs::read_dir(dir.path().join("sources")).unwrap().count();
     let before = count();
 
-    let script = "source a\n title \"t\"\n desc \"d\"\n text \"同一段\"\n section \"s\"\nend\nsource b\n title \"t\"\n desc \"d\"\n text \"同一段\"\n section \"s\"\nend";
+    let script = "source a\n title \"t\"\n desc \"d\"\n text \"同一段\"\n related_by entry\nend\nsource b\n title \"t\"\n desc \"d\"\n text \"同一段\"\n related_by entry\nend";
     let output = run_with(&mut memory, &store, script);
 
     assert!(output.ok, "{}", output.text);
@@ -1106,60 +1106,62 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
     let count = files();
     let body = "title \"t\"\n desc \"d\"";
     let cases = [
-        ("E207", format!("source n\n {body}\n section \"s\"\nend")),
+        ("E207", format!("source n\n {body}\n related_by entry\nend")),
         (
             "E206",
-            format!("source n\n {body}\n text \"  \"\n section \"s\"\nend"),
+            format!("source n\n {body}\n text \"  \"\n related_by entry\nend"),
         ),
         (
             "E206",
-            "source n\n text \"x\"\n section \"s\"\nend".to_owned(),
+            "source n\n text \"x\"\n related_by entry\nend".to_owned(),
         ),
         ("E208", format!("source n\n {body}\n text \"新原文\"\nend")),
         (
             "E205",
-            format!("source entry\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+            format!("source entry\n {body}\n text \"新原文\"\n related_by entry\nend"),
         ),
         (
             "E204",
-            format!("source a:b\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+            format!("source a:b\n {body}\n text \"新原文\"\n related_by entry\nend"),
         ),
         (
             "E201",
-            format!("source n\n {body}\n text \"新原文\"\n related ghost\n section \"s\"\nend"),
+            format!("source n\n {body}\n text \"新原文\"\n related ghost\n related_by entry\nend"),
         ),
         (
             "E209",
-            format!("source n\n {body}\n text \"新原文\"\n source abc 0..3\n section \"s\"\nend"),
+            format!(
+                "source n\n {body}\n text \"新原文\"\n source abc 0..3\n related_by entry\nend"
+            ),
         ),
         (
             "E104",
-            format!("source n\n {body}\n text \"新原文\"\n based_on entry\n section \"s\"\nend"),
+            format!("source n\n {body}\n text \"新原文\"\n based_on entry\n related_by entry\nend"),
         ),
         (
             "E105",
-            format!("source n\n {body}\n text \"a\"\n text \"b\"\n section \"s\"\nend"),
+            format!("source n\n {body}\n text \"a\"\n text \"b\"\n related_by entry\nend"),
         ),
         (
             "E103",
-            format!("source n\n {body}\n text \"新原文\"\n section \"s\"\n"),
+            format!("source n\n {body}\n text \"新原文\"\n related_by entry\n"),
         ),
         // add 必须有 based_on，不能只有原文。
-        ("E207", format!("add n\n {body}\n section \"s\"\nend")),
+        ("E207", format!("add n\n {body}\n related_by entry\nend")),
         (
             "E207",
-            format!("add n\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+            format!("add n\n {body}\n text \"新原文\"\n related_by entry\nend"),
         ),
         (
             "E207",
             format!(
-                "add n\n {body}\n source {} 0..3\n section \"s\"\nend",
+                "add n\n {body}\n source {} 0..3\n related_by entry\nend",
                 source()
             ),
         ),
         (
             "E206",
-            format!("add n\n {body}\n text \"  \"\n based_on entry\n section \"s\"\nend"),
+            format!("add n\n {body}\n text \"  \"\n based_on entry\n related_by entry\nend"),
         ),
     ];
 
@@ -1182,7 +1184,7 @@ fn add_can_append_source_text_to_a_derived_node() {
     let (_dir, store) = file_store();
     let mut memory = memory();
     let script = format!(
-        "add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n source {} 0..3\n section \"s\"\nend\nshow 结论",
+        "add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n source {} 0..3\n related_by entry\nend\nshow 结论",
         source()
     );
 
@@ -1207,7 +1209,7 @@ fn source_can_reference_existing_text_or_store_both() {
     let (_dir, store) = file_store();
     let mut memory = memory();
     let script = format!(
-        "source 甲\n title \"t\"\n desc \"d\"\n source {0} 0..3\n section \"s\"\nend\nsource 乙\n title \"t\"\n desc \"d\"\n source {0} 0..3\n text \"新原文\"\n section \"s\"\nend",
+        "source 甲\n title \"t\"\n desc \"d\"\n source {0} 0..3\n related_by entry\nend\nsource 乙\n title \"t\"\n desc \"d\"\n source {0} 0..3\n text \"新原文\"\n related_by entry\nend",
         source()
     );
 
@@ -1225,7 +1227,7 @@ fn appended_text_is_replayed() {
     let mut live = memory();
     let output = Session::new(&mut live, &store, Mode::ReadWrite)
         .with_journal(&journal)
-        .run("add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n section \"s\"\nend");
+        .run("add 结论\n title \"t\"\n desc \"d\"\n based_on ownership\n text \"新原文\"\n related_by entry\nend");
     assert!(output.ok, "{}", output.text);
 
     let mut restarted = memory();
@@ -1283,7 +1285,7 @@ fn full_source_can_page_through_a_large_file() {
     let mut memory = memory();
     let long = "长文".repeat(100_000);
     let script = format!(
-        "source 长\n title \"t\"\n desc \"d\"\n text \"\"\"{long}\"\"\"\n section \"s\"\nend"
+        "source 长\n title \"t\"\n desc \"d\"\n text \"\"\"{long}\"\"\"\n related_by entry\nend"
     );
     assert!(run_with(&mut memory, &store, &script).ok);
 
@@ -1309,7 +1311,7 @@ fn full_source_can_page_through_a_large_file() {
 fn full_source_lists_each_file_once_and_handles_nodes_without_sources() {
     let mut memory = memory();
     let two_ranges = format!(
-        "source 两段\n title \"t\"\n desc \"d\"\n source {0} 0..3\n source {0} 3..6\n section \"s\"\nend",
+        "source 两段\n title \"t\"\n desc \"d\"\n source {0} 0..3\n source {0} 3..6\n related_by entry\nend",
         source()
     );
     ok(&mut memory, &two_ranges);
@@ -1325,8 +1327,8 @@ fn full_source_lists_each_file_once_and_handles_nodes_without_sources() {
 fn full_source_reports_a_damaged_file_and_never_splits_a_character() {
     let mut memory = memory();
     let empty = InMemorySources::new();
-    let output =
-        Session::new(&mut memory, &empty, Mode::ReadOnly).run("full_source ownership\ncatalog");
+    let output = Session::new(&mut memory, &empty, Mode::ReadOnly)
+        .run("full_source ownership\ncatalog show");
     assert!(!output.ok);
     assert!(output.text.contains("error[E901]"), "{}", output.text);
     assert!(output.text.contains("section \"Rust\""), "{}", output.text);
@@ -1349,4 +1351,255 @@ fn full_source_limit_is_checked() {
     fails(&mut memory, "full_source ownership limit 999999", "E109");
     fails(&mut memory, "full_source ghost", "E201");
     fails(&mut memory, "full_source", "E102");
+}
+
+#[test]
+fn the_model_maintains_the_catalog() {
+    let mut memory = memory();
+
+    let text = ok(
+        &mut memory,
+        "catalog create \"所有权\" desc \"\"\"所有权相关的知识。\"\"\"\ncatalog add ownership to \"所有权\"\ncatalog add borrowing to \"所有权\"\ncatalog describe \"所有权\" \"\"\"新的描述。\"\"\"\ncatalog rename \"所有权\" to \"内存\"\ncatalog remove borrowing from \"内存\"\ncatalog show",
+    );
+
+    assert!(text.contains("created section \"所有权\""), "{text}");
+    assert!(
+        text.contains("renamed section \"所有权\" to \"内存\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("section \"内存\"\n  desc: \"新的描述。\"\n  ownership \"标题ownership\"\n"),
+        "{text}"
+    );
+
+    let text = ok(&mut memory, "catalog delete \"内存\"\ncatalog show");
+    assert!(
+        text.contains("ownership 不再是这个板块的代表，节点本身保留"),
+        "{text}"
+    );
+    assert!(!text.contains("\nsection \"内存\""), "{text}");
+    assert!(memory.contains("ownership"));
+}
+
+#[test]
+fn catalog_statements_are_checked_like_a_compiler() {
+    let mut memory = memory();
+
+    fails(&mut memory, "catalog", "E102");
+    let text = fails(&mut memory, "catalog shwo", "E101");
+    assert!(text.contains("你是不是想写 catalog show？"), "{text}");
+    fails(&mut memory, "catalog create 板块 desc \"d\"", "E102");
+    fails(&mut memory, "catalog create \"新\"", "E102");
+    fails(&mut memory, "catalog create \"新\" desc \"  \"", "E206");
+    fails(&mut memory, "catalog create \"  \" desc \"d\"", "E206");
+    fails(&mut memory, "catalog create \"Rust\" desc \"d\"", "E215");
+    fails(&mut memory, "catalog describe \"没有\" \"d\"", "E214");
+    fails(&mut memory, "catalog describe \"Rust\" \"  \"", "E206");
+    fails(&mut memory, "catalog rename \"Rust\" to \"Rust\"", "E215");
+    fails(&mut memory, "catalog rename \"没有\" to \"新\"", "E214");
+    fails(&mut memory, "catalog delete \"没有\"", "E214");
+    fails(&mut memory, "catalog add ghost to \"Rust\"", "E201");
+    let text = fails(&mut memory, "catalog add ownership to \"Rusty\"", "E214");
+    assert!(text.contains("你是不是想写“Rust”？"), "{text}");
+    fails(&mut memory, "catalog add entry to \"Rust\"", "E210");
+    fails(
+        &mut memory,
+        "catalog remove ownership from \"Rust\"",
+        "E211",
+    );
+    fails(&mut memory, "catalog add ownership \"Rust\"", "E102");
+
+    let read_only = read(
+        &mut memory,
+        "catalog create \"新\" desc \"d\"\ncatalog delete \"Rust\"",
+    );
+    assert!(read_only.text.contains("共 2 个错误"), "{}", read_only.text);
+    assert!(read_only.text.contains("error[E301]"), "{}", read_only.text);
+    assert!(read(&mut memory, "catalog show").ok);
+}
+
+#[test]
+fn catalog_checks_see_earlier_statements() {
+    let mut memory = memory();
+
+    ok(
+        &mut memory,
+        "catalog create \"新\" desc \"d\"\ncatalog add ownership to \"新\"\ncatalog rename \"新\" to \"改\"\ncatalog remove ownership from \"改\"\ncatalog delete \"改\"\ncatalog create \"改\" desc \"d\"\ncatalog delete \"改\"",
+    );
+    fails(
+        &mut memory,
+        "catalog delete \"Rust\"\ncatalog show\ncatalog delete \"Rust\"",
+        "E214",
+    );
+    fails(
+        &mut memory,
+        "catalog create \"新\" desc \"d\"\ncatalog create \"新\" desc \"d\"",
+        "E215",
+    );
+    // 删除节点后，它也不再是代表。
+    ok(&mut memory, "catalog add borrowing to \"Rust\"");
+    ok(&mut memory, "remove borrowing\ncatalog show");
+    fails(
+        &mut memory,
+        "catalog remove borrowing from \"Rust\"",
+        "E211",
+    );
+}
+
+#[test]
+fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let body = "title \"t\"\n desc \"d\"\n text \"原文\"";
+
+    // 没有任何路可达。
+    let output = run_with(&mut memory, &store, &format!("source a\n {body}\nend"));
+    assert!(output.text.contains("error[E208]"), "{}", output.text);
+
+    // 后面的语句接入也可以，三种写法都行。
+    for (id, join) in [
+        ("甲", "catalog add 甲 to \"Rust\"".to_owned()),
+        ("乙", "link entry -> 乙".to_owned()),
+        (
+            "丙",
+            "catalog create \"新\" desc \"d\"\ncatalog add 丙 to \"新\"".to_owned(),
+        ),
+    ] {
+        let output = run_with(
+            &mut memory,
+            &store,
+            &format!("source {id}\n {body}\nend\n{join}"),
+        );
+        assert!(output.ok, "{}", output.text);
+        assert!(memory.unreachable().is_empty(), "{id}");
+    }
+
+    // 接入后又撤掉，等于没有接入。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("source 丁\n {body}\nend\nlink entry -> 丁\nunlink entry -> 丁"),
+    );
+    assert!(output.text.contains("error[E208]"), "{}", output.text);
+    // 只有自己关联自己也不算。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("source 戊\n {body}\n related 戊\nend"),
+    );
+    assert!(output.text.contains("error[E208]"), "{}", output.text);
+    // 新节点只是互相关联，也不算接入。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("source 庚\n {body}\nend\nsource 辛\n {body}\n related 庚\nend\nlink 庚 -> 辛"),
+    );
+    assert!(
+        output.text.contains("从总表到达不了节点 庚"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.contains("从总表到达不了节点 辛"),
+        "{}",
+        output.text
+    );
+    // 通过另一个已接入的新节点到达是可以的。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!(
+            "source 壬\n {body}\nend\nsource 癸\n {body}\n related 壬\n related_by entry\nend"
+        ),
+    );
+    assert!(output.ok, "{}", output.text);
+    // 同一段脚本里删掉了，就不用接入。
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("source 己\n {body}\nend\nremove 己"),
+    );
+    assert!(output.ok, "{}", output.text);
+}
+
+#[test]
+fn a_duplicate_address_only_reports_that_it_exists() {
+    let mut memory = memory();
+    let new = "add n\n title \"t\"\n desc \"d\"\n based_on ownership\nend\n";
+
+    // 第二次写同一个地址：只报重复，也不能让到达检查停不下来。
+    let text = fails(&mut memory, &format!("{new}{new}"), "E205");
+    assert_eq!(text.matches("从总表到达不了节点 n").count(), 1, "{text}");
+
+    let text = fails(
+        &mut memory,
+        "add ownership\n title \"t\"\n desc \"d\"\n based_on entry\nend",
+        "E205",
+    );
+    assert!(!text.contains("E208"), "{text}");
+}
+
+#[test]
+fn section_is_no_longer_a_clause() {
+    let mut memory = memory();
+
+    let text = fails(
+        &mut memory,
+        "add n\n title \"t\"\n desc \"d\"\n based_on ownership\n section \"Rust\"\nend",
+        "E104",
+    );
+
+    assert!(text.contains("catalog add n to"), "{text}");
+}
+
+#[test]
+fn too_many_representatives_only_warn() {
+    let mut memory = memory();
+    let mut script = String::from("catalog create \"大\" desc \"d\"\n");
+    for id in ["entry", "ownership", "borrowing", "conclusion"] {
+        script.push_str(&format!("catalog add {id} to \"大\"\n"));
+    }
+    let few = ok(&mut memory, &script);
+    assert!(!few.contains("warning"), "{few}");
+
+    let many = ok(
+        &mut memory,
+        "add x\n title \"t\"\n desc \"d\"\n based_on ownership\n related_by entry\nend\nadd y\n title \"t\"\n desc \"d\"\n based_on ownership\n related_by entry\nend\ncatalog add x to \"大\"\ncatalog add y to \"大\"",
+    );
+
+    assert!(many.contains("板块 \"大\" 有 6 个代表节点"), "{many}");
+    assert!(many.contains("总表不是索引"), "{many}");
+}
+
+#[test]
+fn check_reports_empty_sections() {
+    let mut memory = memory();
+
+    let text = ok(
+        &mut memory,
+        "catalog create \"空\" desc \"d\"\ncheck\ncatalog show",
+    );
+
+    assert!(text.contains("problem: 板块 \"空\" 没有代表节点"), "{text}");
+    assert!(
+        text.contains("section \"空\"\n  desc: \"d\"\n  没有代表节点"),
+        "{text}"
+    );
+}
+
+#[test]
+fn catalog_changes_are_replayed() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run("catalog create \"新\" desc \"描述\"\ncatalog add ownership to \"新\"\ncatalog delete \"Rust\"");
+    assert!(output.ok, "{}", output.text);
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    assert_eq!(restarted.catalog().sections[0].description, "描述");
 }
