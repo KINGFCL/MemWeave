@@ -72,7 +72,6 @@ class Graph {
         }
         break;
       default: {
-        // 既能去掉有效的证据，也能清除依据已被删除的证据。
         const EvidenceList* evidence = node->evidence;
         for (std::size_t i = 0; i < evidence->count; ++i) {
           const Evidence& entry = evidence->entries()[i];
@@ -138,6 +137,10 @@ class Graph {
     live_[index] = live_.back();
     live_.pop_back();
     const std::string id(node->id, node->id_len);
+    // 还有结论依据它时不能删除，先把这些依据去掉。
+    while (node->backlinks->based_by->count != 0) {
+      if (!remove_node_evidence(node->backlinks->based_by->nodes()[0], bytes(id))) fail("分配失败");
+    }
     index_.erase(bytes(id));
     expected_.erase(id);
     detach_node(node);
@@ -178,8 +181,11 @@ class Graph {
       for (std::size_t i = 0; i < evidence->count; ++i) {
         const Evidence& entry = evidence->entries()[i];
         if (std::memchr(entry.id, 0, entry.id_len) != nullptr) fail("证据的 id 被破坏");
-        if (entry.node != nullptr && !contains(link_list(entry.node, LinkKind::kBasedBy), node)) {
-          fail("证据没有对应的 based_by");
+        if (entry.kind == EvidenceKind::kNode) {
+          if (entry.node == nullptr) fail("节点证据的地址是空的");
+          if (!contains(link_list(entry.node, LinkKind::kBasedBy), node)) {
+            fail("证据没有对应的 based_by");
+          }
         }
       }
       const NodeList* based_by = link_list(node, LinkKind::kBasedBy);

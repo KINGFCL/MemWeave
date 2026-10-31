@@ -295,8 +295,7 @@ inline void remove_link(Node* node, LinkKind kind, const Node* target) noexcept 
 
 // 清除其他节点里所有指向 node 的地址，之后释放它不会留下悬空指针。
 //
-// 这里只保证内存安全，不判断知识关系：依赖 node 的节点保留证据的 id，node 字段置空，
-// 它们的结论是否还成立由模型决定。
+// 调用前 node 的 based_by 必须是空的：还有结论依据它时不能删除，由调用方先处理。
 inline void detach_node(Node* node) noexcept {
   const NodeList* related_by = link_list(node, LinkKind::kRelatedBy);
   for (std::uint32_t i = 0; i < related_by->count; ++i) {
@@ -310,15 +309,6 @@ inline void detach_node(Node* node) noexcept {
   for (std::size_t i = 0; i < evidence->count; ++i) {
     if (Node* target = evidence->entries()[i].node) {
       remove_link(target, LinkKind::kBasedBy, node);
-    }
-  }
-  const NodeList* based_by = link_list(node, LinkKind::kBasedBy);
-  for (std::uint32_t i = 0; i < based_by->count; ++i) {
-    auto* entries = const_cast<EvidenceList*>(based_by->nodes()[i]->evidence);
-    for (std::size_t e = 0; e < entries->count; ++e) {
-      if (entries->entries()[e].node == node) {
-        entries->entries()[e].node = nullptr;
-      }
     }
   }
 }
@@ -453,7 +443,7 @@ inline bool add_node_evidence(Node* node, Node* target) noexcept {
   return true;
 }
 
-// 去掉指向 id 的节点证据，同时维护对方的被依赖列表。依据已被删除的证据也可以这样清除。
+// 去掉指向 id 的节点证据，同时维护对方的被依赖列表。
 // 内存不足时返回 false，图不变。
 inline bool remove_node_evidence(Node* node, Bytes id) noexcept {
   Node* target = nullptr;

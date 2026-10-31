@@ -107,21 +107,12 @@ impl<'m> NodeRef<'m> {
         node_list(unsafe { (*self.raw().backlinks).related_by })
     }
 
-    /// 这条知识依据的节点，直接沿地址到达。依据已被删除的证据不在其中。
+    /// 这条知识依据的节点，直接沿地址到达。
     pub fn based_on(self) -> impl Iterator<Item = NodeRef<'m>> + use<'m> {
         self.raw_evidence()
             .iter()
             .filter(|evidence| evidence.kind == ffi::EVIDENCE_NODE)
             .filter_map(|evidence| NonNull::new(evidence.node).map(NodeRef::new))
-    }
-
-    /// 依据已被删除的节点证据的 id。这些结论失去了依据，要由模型决定怎么处理。
-    pub fn broken_evidence(self) -> Vec<&'m str> {
-        self.raw_evidence()
-            .iter()
-            .filter(|evidence| evidence.kind == ffi::EVIDENCE_NODE && evidence.node.is_null())
-            .map(|evidence| text(evidence.id, evidence.id_len))
-            .collect()
     }
 
     /// 节点的证据。
@@ -247,6 +238,9 @@ pub enum Problem {
 
     #[error("要关联到节点 {target} 的节点 {id} 不存在")]
     MissingIncoming { id: NodeId, target: NodeId },
+
+    #[error("不能删除节点 {id}，{} 还依据它", .by.join("、"))]
+    StillBasedOn { id: NodeId, by: Vec<NodeId> },
 }
 
 /// 新节点放在图的什么位置。至少要有一项，否则从总表到达不了它，它就永远查不到。
@@ -260,13 +254,11 @@ pub struct Placement {
 
 /// 删除一个节点的结果。
 ///
-/// 内存已经安全了，但知识关系的影响要由模型判断，所以把受影响的节点都列出来。
+/// 有结论依据的节点不能删除，所以这里只有相关性受影响。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemovedNode {
     /// 被删除节点的完整内容。
     pub node: Node,
-    /// 依赖它的节点。它们的结论失去了这条依据，证据里保留 id，见 [`NodeRef::broken_evidence`]。
-    pub based_by: Vec<NodeId>,
     /// 关联它的节点。它们少了一条路径，有些节点可能因此查不到了，见 [`Memory::unreachable`]。
     pub related_by: Vec<NodeId>,
     /// 它原来是哪些板块的代表节点。这些板块可能已经空了。
@@ -564,12 +556,18 @@ impl Memory {
 
     /// 删除一个节点，并清除图里所有指向它的地址，不会留下悬空指针。
     ///
-    /// 这里只保证内存安全，不判断知识关系：依赖它的节点不会被改写或删除，结果里列出受影响的
-    /// 节点，由模型决定怎么处理。删除后如果还要写回磁盘，模型要先处理好失去依据的节点和
-    /// 查不到的节点，否则下次加载时校验会报错。
+    /// 还有结论依据它时不能删除，所以推导关系永远指向真实存在的节点。怎么处理这些结论由模型
+    /// 决定：换依据，或者先删除它们。相关性可以直接清理，但可能有节点因此查不到了，
+    /// 见 [`Memory::unreachable`]。
     pub fn remove_node(&mut self, id: &str) -> Result<RemovedNode, Error> {
         let raw = self.find(id)?;
         let node = NodeRef::new(raw);
+        if node.based_by().len() != 0 {
+            return Err(Error::InvalidMemory(vec![Problem::StillBasedOn {
+                id: id.to_owned(),
+                by: node.based_by().map(|other| other.id().to_owned()).collect(),
+            }]));
+        }
         let other_ids = |nodes: Vec<NodeRef<'_>>| -> Vec<NodeId> {
             nodes
                 .into_iter()
@@ -579,7 +577,6 @@ impl Memory {
         };
         let removed = RemovedNode {
             node: node.to_node(),
-            based_by: other_ids(node.based_by().collect()),
             related_by: other_ids(node.related_by().collect()),
             sections: self
                 .catalog
@@ -722,9 +719,10 @@ impl Memory {
         }
     }
 
-    /// 去掉 `id` 对 `on` 的依据。`on` 可以是已被删除的节点。节点不能因此失去所有证据。
+    /// 去掉 `id` 对 `on` 的依据。节点不能因此失去所有证据。
     pub fn unbase(&mut self, id: &str, on: &str) -> Result<(), Error> {
         let raw = self.find(id)?;
+        self.find(on)?;
         let evidence = NodeRef::new(raw).evidence();
         let remaining = evidence
             .iter()
@@ -1855,36 +1853,57 @@ mod tests {
         let mut memory = memory_of(
             &["入口", "x"],
             vec![
-                node("入口", &["x", "依据", "后继", "结论"]),
+                node("入口", &["x", "依据", "后继"]),
                 node("依据", &[]),
                 node("后继", &[]),
                 x,
-                based_on("结论", &["x", "依据"]),
             ],
         );
 
         let removed = memory.remove_node("x").unwrap();
 
         assert_eq!(removed.node.id, "x");
-        assert_eq!(removed.based_by, ["结论"]);
         assert_eq!(removed.related_by, ["入口"]);
         assert_eq!(removed.sections, ["板块"]);
 
         assert!(memory.node("x").is_none());
-        assert_eq!(memory.node_count(), 4);
+        assert_eq!(memory.node_count(), 3);
         assert_eq!(
             ids(memory.node("入口").unwrap().related()),
-            ["依据", "后继", "结论"]
+            ["依据", "后继"]
         );
         assert_eq!(memory.node("后继").unwrap().related_by().len(), 1);
-        assert_eq!(ids(memory.node("依据").unwrap().based_by()), ["结论"]);
+        assert_eq!(memory.node("依据").unwrap().based_by().len(), 0);
         assert_eq!(memory.catalog(), &catalog(&["入口"]));
+    }
 
-        // 知识关系不自动处理：结论还在，证据保留 id，地址已经清掉。
-        let conclusion = memory.node("结论").unwrap();
-        assert_eq!(conclusion.broken_evidence(), ["x"]);
-        assert_eq!(ids(conclusion.based_on()), ["依据"]);
-        assert_eq!(conclusion.to_node(), based_on("结论", &["x", "依据"]));
+    #[test]
+    fn a_node_that_others_are_based_on_cannot_be_removed() {
+        let mut conclusion = based_on("结论", &["依据"]);
+        conclusion.evidence.push(source_evidence(0, 3));
+        let mut memory = memory_of(
+            &["依据", "结论"],
+            vec![node("依据", &[]), conclusion.clone()],
+        );
+
+        let error = memory.remove_node("依据").unwrap_err();
+
+        assert!(matches!(
+            &error,
+            Error::InvalidMemory(problems)
+                if problems[..] == [Problem::StillBasedOn {
+                    id: "依据".into(),
+                    by: vec!["结论".into()],
+                }]
+        ));
+        // 什么都没有变。
+        assert_eq!(memory.node_count(), 2);
+        assert_eq!(memory.node("结论").unwrap().to_node(), conclusion);
+
+        // 模型先处理好依赖，就可以删除了。
+        memory.unbase("结论", "依据").unwrap();
+        memory.remove_node("依据").unwrap();
+        assert_eq!(memory.node("结论").unwrap().based_on().count(), 0);
     }
 
     #[test]
@@ -1975,7 +1994,10 @@ mod tests {
                 };
                 memory.add_node(new, placement, &sources()).unwrap();
             } else {
-                memory.remove_node(&live[next() % live.len()]).unwrap();
+                let target = live[next() % live.len()].clone();
+                let based_by = memory.node(&target).unwrap().based_by().len();
+                let result = memory.remove_node(&target);
+                assert_eq!(result.is_ok(), based_by == 0);
             }
             assert_consistent(&memory);
         }

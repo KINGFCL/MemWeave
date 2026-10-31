@@ -170,9 +170,7 @@ fn render_node(node: NodeRef<'_>, output: &mut String) {
     render_list("related", node.related(), output);
     render_list("related_by", node.related_by(), output);
 
-    let broken = node.broken_evidence();
-    let mut based_on: Vec<String> = node.based_on().map(|n| n.id().to_owned()).collect();
-    based_on.extend(broken.iter().map(|id| format!("{id}（已删除）")));
+    let based_on: Vec<String> = node.based_on().map(|n| n.id().to_owned()).collect();
     let _ = writeln!(output, "  based_on: {}", join_ids(&based_on));
     render_list("based_by", node.based_by(), output);
 
@@ -263,13 +261,6 @@ fn render_evidence(id: &str, evidence: Vec<LoadedEvidence>, output: &mut String)
 fn render_removed(removed: &RemovedNode, output: &mut String) {
     let _ = writeln!(output, "removed {}", removed.node.id);
     let _ = writeln!(output, "  desc: {}", quote(&removed.node.description));
-    for id in &removed.based_by {
-        let _ = writeln!(
-            output,
-            "warning: {id} 失去了依据 {}，用 show {id} 查看，再决定保留、改写还是删除",
-            removed.node.id
-        );
-    }
     for id in &removed.related_by {
         let _ = writeln!(
             output,
@@ -296,34 +287,13 @@ fn render_review(node: NodeRef<'_>, output: &mut String) {
 }
 
 fn render_check(memory: &Memory, output: &mut String) {
-    let mut broken: Vec<(String, Vec<String>)> = memory
-        .nodes()
-        .filter_map(|node| {
-            let ids = node.broken_evidence();
-            (!ids.is_empty()).then(|| {
-                (
-                    node.id().to_owned(),
-                    ids.into_iter().map(str::to_owned).collect(),
-                )
-            })
-        })
-        .collect();
-    broken.sort_unstable();
     let unreachable = memory.unreachable();
-    if broken.is_empty() && unreachable.is_empty() {
+    if unreachable.is_empty() {
         output.push_str("check: 没有问题\n");
         return;
-    }
-    for (id, targets) in &broken {
-        let _ = writeln!(output, "problem: {id} 失去了依据 {}", targets.join(", "));
     }
     for id in &unreachable {
         let _ = writeln!(output, "problem: 从总表到达不了 {id}");
     }
-    let _ = writeln!(
-        output,
-        "check: {} 个节点失去依据，{} 个节点查不到",
-        broken.len(),
-        unreachable.len()
-    );
+    let _ = writeln!(output, "check: {} 个节点查不到", unreachable.len());
 }

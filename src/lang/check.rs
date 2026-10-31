@@ -70,10 +70,10 @@ impl Checker<'_> {
             }
             Statement::Add(add) => self.add(add),
             Statement::Remove(id) => {
-                if self.require(id) {
+                if self.require(id) && !self.is_based_on(id) {
                     self.removed.insert(id.text.clone());
                     self.added.remove(&id.text);
-                    // 和执行时一样：别的节点指向它的关联没了，证据里的 id 还留着。
+                    // 和执行时一样：别的节点指向它的关联没了。
                     self.removed_ever.insert(id.text.clone());
                     for list in self.related.values_mut() {
                         list.retain(|other| *other != id.text);
@@ -255,7 +255,8 @@ impl Checker<'_> {
     }
 
     fn unbase(&mut self, id: &Name, on: &Name) {
-        if !self.require(id) {
+        let known = self.require(id) & self.require(on);
+        if !known {
             return;
         }
         let sources = self.source_count_of(&id.text);
@@ -279,6 +280,34 @@ impl Checker<'_> {
             return;
         }
         list.retain(|other| *other != on.text);
+    }
+
+    /// 还有结论依据这个节点时不能删除，推导关系必须永远指向真实存在的节点。
+    fn is_based_on(&mut self, id: &Name) -> bool {
+        let mut candidates: Vec<String> = self.based_on.keys().cloned().collect();
+        if let Some(node) = self.memory.node(&id.text) {
+            candidates.extend(node.based_by().map(|other| other.id().to_owned()));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|candidate| {
+            self.exists(candidate) && self.based_on_of(candidate).contains(&id.text)
+        });
+        if candidates.is_empty() {
+            return false;
+        }
+        self.errors.push(
+            Diagnostic::new(
+                "E213",
+                id.span,
+                format!("不能删除 {}，{} 还依据它", id.text, candidates.join("、")),
+            )
+            .with_hint(format!(
+                "先用 base 和 unbase 给它们换依据，或者先删除它们，比如 unbase {} on {}",
+                candidates[0], id.text
+            )),
+        );
+        true
     }
 
     /// `node` 是否直接或间接依据 `target`。

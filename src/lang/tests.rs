@@ -238,31 +238,63 @@ fn base_and_unbase_update_both_directions() {
 }
 
 #[test]
-fn remove_reports_impact_and_ai_can_repair_it() {
+fn remove_is_refused_while_others_are_based_on_the_node() {
     let mut memory = memory();
 
-    let text = ok(&mut memory, "remove ownership\ncheck");
+    let text = fails(&mut memory, "remove ownership", "E213");
+
+    assert!(
+        text.contains("不能删除 ownership，conclusion 还依据它"),
+        "{text}"
+    );
+    assert!(text.contains("unbase conclusion on ownership"), "{text}");
+}
+
+#[test]
+fn dependencies_can_be_settled_in_the_same_script() {
+    let mut memory = memory();
+
+    // 换依据后再删除。
+    let text = ok(
+        &mut memory,
+        "base conclusion on borrowing\nunbase conclusion on ownership\nremove ownership\ncheck",
+    );
+
     assert!(text.contains("removed ownership"), "{text}");
-    assert!(text.contains("conclusion 失去了依据 ownership"), "{text}");
     assert!(
         text.contains("entry 少了一条指向 ownership 的关联"),
         "{text}"
     );
-    assert!(
-        text.contains("problem: conclusion 失去了依据 ownership"),
-        "{text}"
-    );
     assert!(text.contains("problem: 从总表到达不了 borrowing"), "{text}");
-
-    let shown = read(&mut memory, "show conclusion").text;
-    assert!(shown.contains("ownership（已删除）"), "{shown}");
-
-    // 模型决定怎么处理：换一个依据，接回查不到的节点。
-    let repaired = ok(
-        &mut memory,
-        "base conclusion on borrowing\nunbase conclusion on ownership\nlink entry -> borrowing\ncheck",
+    assert_eq!(
+        memory.node("conclusion").unwrap().to_node().evidence,
+        [Evidence::Node {
+            id: "borrowing".into()
+        }]
     );
-    assert!(repaired.contains("check: 没有问题"), "{repaired}");
+
+    // 也可以连结论一起删，顺序要对。
+    let mut other = self::memory();
+    fails(&mut other, "remove ownership\nremove conclusion", "E213");
+    ok(&mut other, "remove conclusion\nremove ownership");
+    assert!(other.node("ownership").is_none());
+}
+
+#[test]
+fn every_reference_stays_valid_after_a_remove() {
+    let mut memory = memory();
+
+    ok(&mut memory, "remove conclusion");
+
+    // 依据被处理掉之后，节点就不再记着它。
+    let shown = read(&mut memory, "show ownership").text;
+    assert!(shown.contains("based_by: 无"), "{shown}");
+    assert!(memory.nodes().all(|node| {
+        node.evidence().iter().all(|evidence| match evidence {
+            Evidence::Node { id } => memory.contains(id),
+            Evidence::Source { .. } => true,
+        })
+    }));
 }
 
 #[test]
@@ -612,6 +644,11 @@ fn assert_consistent(memory: &Memory) {
         for dependent in node.based_by() {
             assert!(dependent.based_on().any(|other| other == node));
         }
+        for evidence in node.evidence() {
+            if let Evidence::Node { id } = evidence {
+                assert!(memory.contains(&id), "{} 依据了不存在的 {id}", node.id());
+            }
+        }
     }
 }
 
@@ -702,42 +739,6 @@ fn duplicates_are_merged_when_adding() {
     assert!(text.contains("related: borrowing\n"), "{text}");
     assert!(text.contains("based_on: ownership\n"), "{text}");
     fails(&mut memory, "unbase new on ownership", "E207");
-}
-
-#[test]
-fn removing_all_copies_of_a_lost_basis_is_caught_by_the_check() {
-    // 这是之前的 bug：同名依据有多份时，检查以为还剩证据，执行时才报错。
-    let mut conclusion = node("conclusion", &[]);
-    conclusion.evidence = vec![
-        Evidence::Node { id: "a".into() },
-        Evidence::Node { id: "a".into() },
-    ];
-    let catalog = Catalog {
-        sections: vec![Section {
-            name: "s".into(),
-            nodes: vec![
-                CatalogEntry {
-                    id: "a".into(),
-                    title: "t".into(),
-                },
-                CatalogEntry {
-                    id: "conclusion".into(),
-                    title: "t".into(),
-                },
-            ],
-        }],
-    };
-    let mut memory = Memory::from_parsed(
-        ParsedKnowledge {
-            catalog,
-            nodes: vec![node("a", &[]), conclusion],
-        },
-        &sources(),
-    )
-    .unwrap();
-
-    ok(&mut memory, "remove a");
-    fails(&mut memory, "unbase conclusion on a", "E207");
 }
 
 #[test]
