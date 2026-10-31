@@ -433,44 +433,167 @@ fn all_text(result: &Value) -> Vec<String> {
         .collect()
 }
 
+const ATTACHED: &str = "当前工作板和总表";
+
+/// 脚本的结果和附带的内容。
+fn call_blocks(client: &mut Client, tool: &str, script: &str) -> Vec<String> {
+    all_text(&client.call(tool, json!({ "script": script })))
+}
+
+/// 这是这个行为存在的原因：一次查询走多少层，总表都只出现一次。
 #[test]
-fn every_call_comes_with_the_board_and_catalog() {
+fn walking_the_graph_does_not_repeat_the_catalog() {
     let dir = TempDir::new().unwrap();
     let kb = demo_copy(&dir);
     let mut client = Client::start(&kb, true);
-    let header = "当前工作板和总表（每次调用自动附带）";
 
-    // 读、写、报错和说明书都带。
-    let blocks = all_text(&client.call("memory_read", json!({ "script": "show drop" })));
+    // 第一次调用带上。
+    let blocks = call_blocks(&mut client, "memory_read", "show ownership");
     assert_eq!(blocks.len(), 2, "{blocks:?}");
-    assert!(blocks[0].starts_with("node drop"), "{blocks:?}");
-    assert!(blocks[1].contains(header), "{blocks:?}");
+    assert!(blocks[0].starts_with("node ownership"), "{blocks:?}");
+    assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
     assert!(
         blocks[1].contains("section \"Rust 内存管理\""),
         "{blocks:?}"
     );
 
-    let blocks = all_text(&client.call(
-        "memory_write",
-        json!({ "script": "goal create g \"目标\"\n desc \"d\"\n step \"一\"\nend" }),
-    ));
-    assert!(blocks[1].contains("[>] 1 \"一\""), "{blocks:?}");
-    assert!(blocks[1].contains("goal create g"), "{blocks:?}");
+    // 之后沿关联走多少层都不带。
+    for script in [
+        "show borrowing, drop",
+        "show send-sync",
+        "evidence send-sync",
+        "check",
+        "timeline",
+    ] {
+        let blocks = call_blocks(&mut client, "memory_read", script);
+        assert_eq!(blocks.len(), 1, "{script}：{blocks:?}");
+    }
+    // 读说明书也不带。
+    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "recall" })));
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    client.stop();
+}
 
-    let result = client.call("memory_write", json!({ "script": "show 没有" }));
+#[test]
+fn the_first_call_brings_the_catalog_whatever_it_is() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+
+    // 说明书。
+    let mut client = Client::start(&kb, true);
+    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "work" })));
+    assert!(blocks[0].contains("工作板"), "{blocks:?}");
+    assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
+    client.stop();
+
+    // 报错的脚本。什么都没执行，但模型正好需要总表来改正。
+    let mut client = Client::start(&kb, true);
+    let result = client.call("memory_read", json!({ "script": "show 没有" }));
     assert_eq!(result["isError"], true);
     let blocks = all_text(&result);
     assert!(blocks[0].contains("error[E201]"), "{blocks:?}");
-    assert!(blocks[1].contains(header), "{blocks:?}");
+    assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
+    let result = client.call("memory_read", json!({ "script": "show 也没有" }));
+    assert_eq!(all_text(&result).len(), 1);
+    client.stop();
 
-    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "work" })));
-    assert!(blocks[0].contains("工作板"), "{blocks:?}");
-    assert!(blocks[1].contains(header), "{blocks:?}");
+    // 写了 catalog show 但脚本报错时，输出里其实没有总表，要带上。
+    let mut client = Client::start(&kb, true);
+    let blocks = call_blocks(&mut client, "memory_read", "catalog show\nshow 没有");
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    client.stop();
+}
 
-    // 只查总表时，结果里已经有了。
-    let blocks = all_text(&client.call("memory_read", json!({ "script": " catalog show\n" })));
+#[test]
+fn listing_the_catalog_is_not_repeated() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+
+    // 输出里已经有了，不再带，之后也不带。
+    let blocks = call_blocks(&mut client, "memory_read", " catalog show\n");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
-    assert!(blocks[0].contains("工作板"), "{blocks:?}");
+    assert!(
+        blocks[0].contains("section \"Rust 内存管理\""),
+        "{blocks:?}"
+    );
+    let blocks = call_blocks(&mut client, "memory_read", "show drop");
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+    // 上层每次查询开始时都可以再看一次。
+    let blocks = call_blocks(&mut client, "memory_read", "catalog show\nshow drop");
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert!(blocks[0].contains("section"), "{blocks:?}");
+    client.stop();
+}
+
+#[test]
+fn the_catalog_comes_back_only_when_it_changes() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+    assert_eq!(call_blocks(&mut client, "memory_read", "check").len(), 2);
+
+    // 只写节点和 log，总表和工作板都没变。
+    let note = "source a\n title \"t\"\n desc \"d\"\n text \"原文\"\n related_by drop\nend";
+    for script in [note, "log \"做过\"", "set a desc \"新\"", "link a -> drop"] {
+        let blocks = call_blocks(&mut client, "memory_write", script);
+        assert_eq!(blocks.len(), 1, "{script}：{blocks:?}");
+    }
+    // 改了节点标题，总表里的标题变了。
+    let blocks = call_blocks(
+        &mut client,
+        "memory_write",
+        "set ownership title \"所有权规则\"",
+    );
+    assert!(blocks[1].contains("所有权规则"), "{blocks:?}");
+
+    // 总表变了就带一次最新的，下一次就不带了。
+    let blocks = call_blocks(
+        &mut client,
+        "memory_write",
+        "catalog create \"新领域\" desc \"d\"",
+    );
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert!(blocks[1].contains("section \"新领域\""), "{blocks:?}");
+    assert_eq!(
+        call_blocks(&mut client, "memory_read", "show drop").len(),
+        1
+    );
+
+    // 工作板变了也一样。
+    let goal = "goal create g \"目标\"\n desc \"d\"\n step \"一\"\n step \"二\"\nend";
+    let blocks = call_blocks(&mut client, "memory_write", goal);
+    assert!(blocks[1].contains("[>] 1 \"一\""), "{blocks:?}");
+    let blocks = call_blocks(&mut client, "memory_write", "step done g 1");
+    assert!(blocks[1].contains("[>] 2 \"二\""), "{blocks:?}");
+    assert_eq!(
+        call_blocks(&mut client, "memory_read", "show drop").len(),
+        1
+    );
+
+    // 报错的脚本没有改变任何东西。
+    let result = client.call(
+        "memory_write",
+        json!({ "script": "catalog create \"新领域\" desc \"d\"" }),
+    );
+    assert_eq!(result["isError"], true);
+    assert_eq!(all_text(&result).len(), 1);
+
+    // 输出里的总表已经最新，不重复；后面的语句又改了总表时，输出里的过时了，要带上。
+    let blocks = call_blocks(
+        &mut client,
+        "memory_write",
+        "catalog create \"甲\" desc \"d\"\ncatalog show",
+    );
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    let blocks = call_blocks(
+        &mut client,
+        "memory_write",
+        "catalog show\ncatalog create \"乙\" desc \"d\"",
+    );
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert!(blocks[1].contains("section \"乙\""), "{blocks:?}");
     client.stop();
 }
 

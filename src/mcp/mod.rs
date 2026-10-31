@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 40 * 1024;
 const READ_TOOL: &str = "memory_read";
 const WRITE_TOOL: &str = "memory_write";
 const MANUAL_TOOL: &str = "memory_manual";
-const ATTACHED_HEADER: &str = "--- 当前工作板和总表（每次调用自动附带）---";
+const ATTACHED_HEADER: &str = "--- 当前工作板和总表（第一次调用和它们变化时附带）---";
 
 /// 在标准输入输出上提供服务，标准输入关闭时返回。
 ///
@@ -107,7 +107,8 @@ fn create_if_empty(knowledge_base: &Path) -> Result<(), Error> {
 /// 脚本的结果和执行后的工作板、总表。
 struct Reply {
     output: Option<Output>,
-    overview: String,
+    /// 模型还没看到过的工作板和总表。
+    overview: Option<String>,
 }
 
 struct Job {
@@ -123,20 +124,65 @@ fn run_scripts(
     max_output_bytes: usize,
     queue: &mpsc::Receiver<Job>,
 ) {
+    // 模型最后一次看到的总表。一样就不再附带，所以一次查询走多少层，总表都不会重复出现。
+    let mut shown: Option<Catalog> = None;
     for job in queue {
+        let listed = job
+            .script
+            .as_ref()
+            .map_or(Listed::No, |(script, _)| listed(script));
+        let before = (listed == Listed::Before).then(|| memory.catalog().clone());
         let output = job.script.map(|(script, mode)| {
             Session::new(&mut memory, sources, mode)
                 .with_journal(journal)
                 .with_output_limit(max_output_bytes)
                 .run(&script)
         });
-        let overview = attached_overview(&memory, max_output_bytes);
+        let current = memory.catalog();
+        // 脚本报错时什么都没执行，输出里没有总表。
+        let succeeded = output.as_ref().is_some_and(|output| output.ok);
+        let in_output = succeeded
+            && match listed {
+                Listed::No => false,
+                Listed::Last => true,
+                // 后面的语句可能又改了总表，那样输出里的就过时了。
+                Listed::Before => before.as_ref() == Some(current),
+            };
+        let overview = if in_output {
+            shown = Some(current.clone());
+            None
+        } else if shown.as_ref() == Some(current) {
+            None
+        } else {
+            shown = Some(current.clone());
+            Some(attached_overview(&memory, max_output_bytes))
+        };
         // 客户端已经取消时没有人接收结果，脚本的效果不受影响。
         let _ = job.reply.send(Reply { output, overview });
     }
 }
 
-/// 每次调用都附带的内容。最多占输出上限的一半，总能留出位置给脚本的结果。
+/// 脚本有没有写 `catalog show`，写在哪。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listed {
+    No,
+    Before,
+    Last,
+}
+
+fn listed(script: &str) -> Listed {
+    let is_listing = |line: &str| line.trim() == "catalog show";
+    let mut lines = script.lines().filter(|line| !line.trim().is_empty());
+    if lines.next_back().is_some_and(is_listing) {
+        Listed::Last
+    } else if lines.any(is_listing) {
+        Listed::Before
+    } else {
+        Listed::No
+    }
+}
+
+/// 附带的内容。最多占输出上限的一半，总能留出位置给脚本的结果。
 fn attached_overview(memory: &Memory, max_output_bytes: usize) -> String {
     let mut text = render_overview(memory);
     let limit = max_output_bytes / 2;
@@ -166,10 +212,7 @@ impl Server {
         let reply = self.ask(Some((script.to_owned(), mode))).await?;
         let output = reply.output.ok_or_else(lost_worker)?;
         let mut content = vec![ContentBlock::text(output.text)];
-        // 只查总表时，结果里已经有了。
-        if script.trim() != "catalog show" {
-            content.push(ContentBlock::text(reply.overview));
-        }
+        content.extend(reply.overview.map(ContentBlock::text));
         // 脚本写错是模型能自己改正的错误，不是协议错误。
         Ok(if output.ok {
             CallToolResult::success(content)
@@ -291,7 +334,9 @@ impl ServerHandler for Server {
             MANUAL_TOOL => {
                 let mut result = read_manual(&request)?;
                 let reply = self.ask(None).await?;
-                result.content.push(ContentBlock::text(reply.overview));
+                result
+                    .content
+                    .extend(reply.overview.map(ContentBlock::text));
                 result
             }
             other => {

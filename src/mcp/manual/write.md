@@ -166,7 +166,7 @@ catalog add hand-brew-temperature to "咖啡"
 
 ## 写完之后
 
-- 看结果附带的总表。新内容超出了领域描述，就用 `catalog describe` 更新描述。发现了更好的入口，就调整代表。总表由你维护，它写得越准，以后回忆越顺。
+- 对照总表。新内容超出了领域描述，就用 `catalog describe` 更新描述。发现了更好的入口，就调整代表。总表由你维护，它写得越准，以后回忆越顺。
 - 输出里的 `warning` 要处理，见 `repair`。
 - 用了 `remove`、`unlink`、`catalog remove` 或 `catalog delete`，就运行 `check`。
 - 用一句话告诉用户记了什么。
