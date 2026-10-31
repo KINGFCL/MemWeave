@@ -50,11 +50,22 @@ pub(crate) struct RawEvidenceList {
     pub(crate) count: usize,
 }
 
+/// 和 C++ 的 `TextField` 取值相同。
+pub(crate) const TEXT_TITLE: u32 = 0;
+pub(crate) const TEXT_DESCRIPTION: u32 = 1;
+
+/// C++ 的 `NodeIndex`：文本地址到节点的 set。
+#[repr(C)]
+pub(crate) struct RawIndex {
+    _opaque: [u8; 0],
+}
+
 /// 和 C++ 的 `Backlinks` 布局相同。
 #[repr(C)]
 pub(crate) struct RawBacklinks {
     pub(crate) dependents: *const RawNodeList,
     pub(crate) related_by: *const RawNodeList,
+    pub(crate) cold: *mut u8,
 }
 
 /// 和 C++ 的 `Node` 布局相同，正好占一条缓存行。
@@ -102,6 +113,7 @@ pub(crate) struct RawLayout {
     pub(crate) backlinks_size: usize,
     pub(crate) backlinks_dependents: usize,
     pub(crate) backlinks_related_by: usize,
+    pub(crate) backlinks_cold: usize,
 }
 
 unsafe extern "C" {
@@ -133,6 +145,19 @@ unsafe extern "C" {
     pub(crate) fn mw_node_append_link(node: *mut RawNode, kind: u32, target: *mut RawNode);
     pub(crate) fn mw_node_detach(node: *mut RawNode);
     pub(crate) fn mw_node_free(node: *mut RawNode);
+    pub(crate) fn mw_node_set_text(node: *mut RawNode, field: u32, text: RawBytes) -> bool;
+    pub(crate) fn mw_node_link(from: *mut RawNode, to: *mut RawNode) -> bool;
+    pub(crate) fn mw_node_unlink(from: *mut RawNode, to: *mut RawNode);
+    pub(crate) fn mw_node_add_evidence(node: *mut RawNode, target: *mut RawNode) -> bool;
+    pub(crate) fn mw_node_remove_evidence(node: *mut RawNode, id: RawBytes) -> bool;
+
+    pub(crate) fn mw_index_new() -> *mut RawIndex;
+    pub(crate) fn mw_index_free(index: *mut RawIndex);
+    pub(crate) fn mw_index_size(index: *const RawIndex) -> usize;
+    pub(crate) fn mw_index_find(index: *const RawIndex, id: RawBytes) -> *mut RawNode;
+    pub(crate) fn mw_index_insert(index: *mut RawIndex, node: *mut RawNode) -> bool;
+    pub(crate) fn mw_index_erase(index: *mut RawIndex, id: RawBytes);
+    pub(crate) fn mw_index_next(index: *const RawIndex, cursor: *mut usize) -> *mut RawNode;
 }
 
 #[cfg(test)]
@@ -171,6 +196,7 @@ mod tests {
             backlinks_size: size_of::<RawBacklinks>(),
             backlinks_dependents: offset_of!(RawBacklinks, dependents),
             backlinks_related_by: offset_of!(RawBacklinks, related_by),
+            backlinks_cold: offset_of!(RawBacklinks, cold),
         };
 
         assert_eq!(unsafe { mw_layout() }, expected);

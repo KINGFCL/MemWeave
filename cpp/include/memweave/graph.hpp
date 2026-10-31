@@ -65,6 +65,7 @@ struct EvidenceList {
 struct Backlinks {
   const NodeList* dependents;  // 谁依赖我：证据里引用了这个节点的节点。这个节点变了，它们要复查。
   const NodeList* related_by;  // 谁关联我：related 里有这个节点的节点。删除这个节点时要清理它们。
+  char* cold;                  // 冷块的开头，释放节点时用。
 };
 
 // 这个布局是和 Rust 共享的（src/ffi.rs），Rust 读取时直接解引用，不经过函数调用。
@@ -85,14 +86,14 @@ struct alignas(64) Node {
   std::uint32_t id_len;
   std::uint32_t title_len;
   std::uint32_t description_len;
-  std::uint32_t flags;  // 哪些列表已经搬到单独分配的内存里，释放节点时要单独释放它们。
+  std::uint32_t flags;  // 哪些内容已经搬到单独分配的内存里，释放节点时要单独释放它们。
 };
 
 static_assert(sizeof(Node) == 64, "节点必须正好占一条缓存行");
 static_assert(sizeof(NodeList) == sizeof(std::size_t));
 static_assert(sizeof(EvidenceList) == sizeof(std::size_t));
 static_assert(sizeof(Evidence) == 40);
-static_assert(sizeof(Backlinks) == 2 * sizeof(void*));
+static_assert(sizeof(Backlinks) == 3 * sizeof(void*));
 
 // 按一对相邻缓存行对齐，硬件的相邻行预取通常会把节点和关联列表一起取回。
 inline constexpr std::align_val_t kNodeAlignment{128};
@@ -134,6 +135,11 @@ inline void replace_link_list(Node* node, LinkKind kind, const NodeList* list) n
 inline std::uint32_t heap_flag(LinkKind kind) noexcept {
   return std::uint32_t{1} << static_cast<std::uint32_t>(kind);
 }
+
+// flags 里的其他位：修改过的内容不再放在冷块里。
+inline constexpr std::uint32_t kTitleOnHeap = std::uint32_t{1} << 3;
+inline constexpr std::uint32_t kDescriptionOnHeap = std::uint32_t{1} << 4;
+inline constexpr std::uint32_t kEvidenceOnHeap = std::uint32_t{1} << 5;
 
 // 创建节点，并预留 related_capacity 条关联，以及两个反向列表的位置。
 // evidence 里的 id 会被复制，node 字段之后用 set_evidence_target 填写。
@@ -180,7 +186,7 @@ inline Node* new_node(Bytes id, Bytes title, Bytes description, const Evidence* 
       new (backlinks + 1) NodeList{0, static_cast<std::uint32_t>(dependents_capacity)};
   auto* related_by = new (dependents->nodes() + dependents_capacity)
       NodeList{0, static_cast<std::uint32_t>(related_by_capacity)};
-  new (backlinks) Backlinks{dependents, related_by};
+  new (backlinks) Backlinks{dependents, related_by, cold};
 
   char* cursor = cold + lists_size;
   auto append = [&cursor](const char* data, std::size_t len) {
@@ -317,6 +323,157 @@ inline void detach_node(Node* node) noexcept {
   }
 }
 
+// 节点的文本字段。id 不能修改，别的节点的证据里还存着它。
+enum class TextField : std::uint32_t {
+  kTitle = 0,
+  kDescription = 1,
+};
+
+// 替换标题或描述。内存不足或文本超过 4 GiB 时返回 false，内容不变。
+inline bool set_text(Node* node, TextField field, Bytes text) noexcept {
+  if (text.len > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  char* memory = new (std::nothrow) char[text.len == 0 ? 1 : text.len];
+  if (memory == nullptr) {
+    return false;
+  }
+  if (text.len != 0) {
+    std::memcpy(memory, text.data, text.len);
+  }
+  const bool is_title = field == TextField::kTitle;
+  const char*& pointer = is_title ? node->title : node->description;
+  std::uint32_t& length = is_title ? node->title_len : node->description_len;
+  const std::uint32_t flag = is_title ? kTitleOnHeap : kDescriptionOnHeap;
+  if ((node->flags & flag) != 0) {
+    delete[] pointer;
+  }
+  pointer = memory;
+  length = static_cast<std::uint32_t>(text.len);
+  node->flags |= flag;
+  return true;
+}
+
+inline bool list_contains(const NodeList* list, const Node* target) noexcept {
+  for (std::uint32_t i = 0; i < list->count; ++i) {
+    if (list->nodes()[i] == target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 新增一条关联 from -> to，同时维护 to 的反向列表。内存不足时返回 false，图不变。
+inline bool link_nodes(Node* from, Node* to) noexcept {
+  const bool has_reverse = list_contains(link_list(to, LinkKind::kRelatedBy), from);
+  if (!reserve_links(from, LinkKind::kRelated, 1) ||
+      (!has_reverse && !reserve_links(to, LinkKind::kRelatedBy, 1))) {
+    return false;
+  }
+  append_link(from, LinkKind::kRelated, to);
+  if (!has_reverse) {
+    append_link(to, LinkKind::kRelatedBy, from);
+  }
+  return true;
+}
+
+// 去掉关联 from -> to，同时维护 to 的反向列表。
+inline void unlink_nodes(Node* from, Node* to) noexcept {
+  remove_link(from, LinkKind::kRelated, to);
+  remove_link(to, LinkKind::kRelatedBy, from);
+}
+
+// 重写证据列表：去掉 drop 指向的节点证据，再追加 extra。
+//
+// 新列表和它用到的所有 id 文本放在同一块内存里，旧的那块可以直接释放。内存不足时返回 false，列表不变。
+inline bool rewrite_evidence(Node* node, Bytes drop, const Evidence* extra) noexcept {
+  const EvidenceList* old = node->evidence;
+  const auto dropped = [&drop](const Evidence& entry) {
+    return entry.kind == EvidenceKind::kNode && entry.id_len == drop.len &&
+           std::memcmp(entry.id, drop.data, drop.len) == 0;
+  };
+
+  std::size_t count = extra == nullptr ? 0 : 1;
+  std::size_t text_size = extra == nullptr ? 0 : extra->id_len;
+  for (std::size_t i = 0; i < old->count; ++i) {
+    if (drop.data == nullptr || !dropped(old->entries()[i])) {
+      ++count;
+      text_size += old->entries()[i].id_len;
+    }
+  }
+
+  const std::size_t lists_size = sizeof(EvidenceList) + count * sizeof(Evidence);
+  char* memory = new (std::nothrow) char[lists_size + text_size];
+  if (memory == nullptr) {
+    return false;
+  }
+  auto* list = new (memory) EvidenceList{count};
+  char* cursor = memory + lists_size;
+  std::size_t written = 0;
+  const auto copy_entry = [&](const Evidence& entry) {
+    Evidence copied = entry;
+    if (entry.id_len != 0) {
+      std::memcpy(cursor, entry.id, entry.id_len);
+    }
+    copied.id = cursor;
+    cursor += entry.id_len;
+    new (list->entries() + written) Evidence(copied);
+    ++written;
+  };
+  for (std::size_t i = 0; i < old->count; ++i) {
+    if (drop.data == nullptr || !dropped(old->entries()[i])) {
+      copy_entry(old->entries()[i]);
+    }
+  }
+  if (extra != nullptr) {
+    copy_entry(*extra);
+  }
+
+  if ((node->flags & kEvidenceOnHeap) != 0) {
+    delete[] reinterpret_cast<const char*>(old);
+  }
+  node->evidence = list;
+  node->flags |= kEvidenceOnHeap;
+  return true;
+}
+
+// 新增一条节点证据：node 依据 target，同时维护 target 的被依赖列表。内存不足时返回 false，图不变。
+inline bool add_node_evidence(Node* node, Node* target) noexcept {
+  const bool has_reverse = list_contains(link_list(target, LinkKind::kDependents), node);
+  if (!has_reverse && !reserve_links(target, LinkKind::kDependents, 1)) {
+    return false;
+  }
+  const Evidence extra{EvidenceKind::kNode, target->id_len, target->id, target, 0, 0};
+  if (!rewrite_evidence(node, Bytes{nullptr, 0}, &extra)) {
+    return false;
+  }
+  if (!has_reverse) {
+    append_link(target, LinkKind::kDependents, node);
+  }
+  return true;
+}
+
+// 去掉指向 id 的节点证据，同时维护对方的被依赖列表。依据已被删除的证据也可以这样清除。
+// 内存不足时返回 false，图不变。
+inline bool remove_node_evidence(Node* node, Bytes id) noexcept {
+  Node* target = nullptr;
+  const EvidenceList* old = node->evidence;
+  for (std::size_t i = 0; i < old->count; ++i) {
+    const Evidence& entry = old->entries()[i];
+    if (entry.kind == EvidenceKind::kNode && entry.id_len == id.len &&
+        std::memcmp(entry.id, id.data, id.len) == 0 && entry.node != nullptr) {
+      target = entry.node;
+    }
+  }
+  if (!rewrite_evidence(node, id, nullptr)) {
+    return false;
+  }
+  if (target != nullptr) {
+    remove_link(target, LinkKind::kDependents, node);
+  }
+  return true;
+}
+
 // 释放节点。释放前必须先调用 detach_node，除非整张图都在销毁。
 inline void delete_node(Node* node) noexcept {
   for (LinkKind kind : {LinkKind::kRelated, LinkKind::kDependents, LinkKind::kRelatedBy}) {
@@ -324,9 +481,151 @@ inline void delete_node(Node* node) noexcept {
       delete[] reinterpret_cast<const char*>(link_list(node, kind));
     }
   }
-  delete[] reinterpret_cast<const char*>(node->evidence);
+  if ((node->flags & kTitleOnHeap) != 0) {
+    delete[] node->title;
+  }
+  if ((node->flags & kDescriptionOnHeap) != 0) {
+    delete[] node->description;
+  }
+  if ((node->flags & kEvidenceOnHeap) != 0) {
+    delete[] reinterpret_cast<const char*>(node->evidence);
+  }
+  // 反向列表的结构体在冷块里，所以冷块最后释放。
+  delete[] node->backlinks->cold;
   node->~Node();
   ::operator delete(node, kNodeAlignment);
 }
+
+// 节点的 set：文本地址到内存地址。保证 agent 用文本地址访问的节点是存在的。
+//
+// 开放寻址，线性探测，删除时向前搬动后面的元素，所以没有墓碑。key 就是节点自己的 id，不额外存一份。
+class NodeIndex {
+ public:
+  NodeIndex() noexcept = default;
+  NodeIndex(const NodeIndex&) = delete;
+  NodeIndex& operator=(const NodeIndex&) = delete;
+  ~NodeIndex() { delete[] slots_; }
+
+  std::size_t size() const noexcept { return size_; }
+
+  Node* find(Bytes id) const noexcept {
+    if (capacity_ == 0) {
+      return nullptr;
+    }
+    const std::uint64_t hash = hash_of(id);
+    for (std::size_t i = hash & (capacity_ - 1);; i = (i + 1) & (capacity_ - 1)) {
+      const Slot& slot = slots_[i];
+      if (slot.node == nullptr) {
+        return nullptr;
+      }
+      if (slot.hash == hash && slot.node->id_len == id.len &&
+          (id.len == 0 || std::memcmp(slot.node->id, id.data, id.len) == 0)) {
+        return slot.node;
+      }
+    }
+  }
+
+  // 加入节点。id 不能已经存在。内存不足时返回 false，内容不变。
+  bool insert(Node* node) noexcept {
+    if ((size_ + 1) * 10 > capacity_ * 7 && !grow()) {
+      return false;
+    }
+    place(node, hash_of(Bytes{node->id, node->id_len}));
+    ++size_;
+    return true;
+  }
+
+  // 去掉节点，节点不存在时什么也不做。
+  void erase(Bytes id) noexcept {
+    if (capacity_ == 0) {
+      return;
+    }
+    const std::uint64_t hash = hash_of(id);
+    const std::size_t mask = capacity_ - 1;
+    std::size_t hole = hash & mask;
+    while (true) {
+      const Slot& slot = slots_[hole];
+      if (slot.node == nullptr) {
+        return;
+      }
+      if (slot.hash == hash && slot.node->id_len == id.len &&
+          (id.len == 0 || std::memcmp(slot.node->id, id.data, id.len) == 0)) {
+        break;
+      }
+      hole = (hole + 1) & mask;
+    }
+    // 把后面原本应该排在洞之前的元素搬过来，探测链才不会断。
+    for (std::size_t next = (hole + 1) & mask; slots_[next].node != nullptr;
+         next = (next + 1) & mask) {
+      const std::size_t home = slots_[next].hash & mask;
+      if (((next - home) & mask) >= ((next - hole) & mask)) {
+        slots_[hole] = slots_[next];
+        hole = next;
+      }
+    }
+    slots_[hole] = Slot{nullptr, 0};
+    --size_;
+  }
+
+  // 遍历：从 cursor 开始找下一个节点并移动 cursor，没有了返回 nullptr。顺序不固定。
+  Node* next(std::size_t* cursor) const noexcept {
+    while (*cursor < capacity_) {
+      Node* node = slots_[*cursor].node;
+      ++*cursor;
+      if (node != nullptr) {
+        return node;
+      }
+    }
+    return nullptr;
+  }
+
+ private:
+  struct Slot {
+    Node* node;
+    std::uint64_t hash;
+  };
+
+  // FNV-1a，最后再混合一次，让低位也足够均匀。
+  static std::uint64_t hash_of(Bytes id) noexcept {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (std::size_t i = 0; i < id.len; ++i) {
+      hash ^= static_cast<unsigned char>(id.data[i]);
+      hash *= 0x100000001b3ULL;
+    }
+    hash ^= hash >> 32;
+    return hash * 0x9e3779b97f4a7c15ULL;
+  }
+
+  void place(Node* node, std::uint64_t hash) noexcept {
+    std::size_t i = hash & (capacity_ - 1);
+    while (slots_[i].node != nullptr) {
+      i = (i + 1) & (capacity_ - 1);
+    }
+    slots_[i] = Slot{node, hash};
+  }
+
+  bool grow() noexcept {
+    const std::size_t capacity = capacity_ == 0 ? 16 : capacity_ * 2;
+    Slot* slots = new (std::nothrow) Slot[capacity]();
+    if (slots == nullptr) {
+      return false;
+    }
+    Slot* old = slots_;
+    const std::size_t old_capacity = capacity_;
+    slots_ = slots;
+    capacity_ = capacity;
+    for (std::size_t i = 0; i < old_capacity; ++i) {
+      if (old[i].node != nullptr) {
+        place(old[i].node, old[i].hash);
+      }
+    }
+    delete[] old;
+    return true;
+  }
+
+  Slot* slots_ = nullptr;
+  std::size_t capacity_ = 0;
+  std::size_t size_ = 0;
+};
 
 }  // namespace memweave

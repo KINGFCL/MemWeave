@@ -1,0 +1,86 @@
+//! 写入日志：修改记忆的脚本先记到磁盘上再执行，进程重启后重放就能恢复。
+//!
+//! 每行一条 JSON，只追加不修改，所以它同时也是修改历史。写到一半崩溃时，最后一行不完整，
+//! 那段脚本还没有开始执行，重放时跳过它是安全的。
+
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::{Mode, Session};
+use crate::error::Error;
+use crate::memory::Memory;
+use crate::source::SourceStore;
+
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    script: String,
+}
+
+/// 知识库目录下的 `journal.jsonl`。
+pub struct Journal {
+    path: PathBuf,
+}
+
+impl Journal {
+    pub fn new(knowledge_base: &Path) -> Self {
+        Self {
+            path: knowledge_base.join("journal.jsonl"),
+        }
+    }
+
+    /// 追加一段脚本，并确保已经落到磁盘上。
+    pub fn append(&self, script: &str) -> Result<(), Error> {
+        let mut line = serde_json::to_string(&Entry {
+            script: script.to_owned(),
+        })
+        .expect("字符串总是可以序列化");
+        line.push('\n');
+
+        let failed = |e: std::io::Error| Error::Save(format!("{}：{e}", self.path.display()));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(failed)?;
+        file.write_all(line.as_bytes()).map_err(failed)?;
+        file.sync_all().map_err(failed)
+    }
+
+    /// 把日志里的脚本依次重放到 `memory` 上。没有日志时什么也不做。
+    pub fn replay(&self, memory: &mut Memory, sources: &dyn SourceStore) -> Result<(), Error> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::Save(format!("{}：{e}", self.path.display()))),
+        };
+        let complete = text.ends_with('\n');
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let entry: Entry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                // 最后一行没写完：崩溃发生在追加日志时，这段脚本没有执行过。
+                Err(_) if index + 1 == lines.len() && !complete => return Ok(()),
+                Err(e) => {
+                    return Err(Error::Save(format!(
+                        "{} 第 {} 行损坏：{e}",
+                        self.path.display(),
+                        index + 1
+                    )));
+                }
+            };
+            let output = Session::new(memory, sources, Mode::ReadWrite).run(&entry.script);
+            if !output.ok {
+                return Err(Error::Save(format!(
+                    "{} 第 {} 行重放失败：\n{}",
+                    self.path.display(),
+                    index + 1,
+                    output.text
+                )));
+            }
+        }
+        Ok(())
+    }
+}

@@ -9,6 +9,8 @@ using memweave::Evidence;
 using memweave::EvidenceList;
 using memweave::LinkKind;
 using memweave::Node;
+using memweave::NodeIndex;
+using memweave::TextField;
 using memweave::NodeList;
 
 extern "C" {
@@ -40,6 +42,7 @@ struct MwLayout {
   std::size_t backlinks_size;
   std::size_t backlinks_dependents;
   std::size_t backlinks_related_by;
+  std::size_t backlinks_cold;
 };
 
 MwLayout mw_layout() noexcept {
@@ -70,6 +73,7 @@ MwLayout mw_layout() noexcept {
       sizeof(Backlinks),
       offsetof(Backlinks, dependents),
       offsetof(Backlinks, related_by),
+      offsetof(Backlinks, cold),
   };
 }
 
@@ -99,5 +103,37 @@ void mw_node_append_link(Node* node, LinkKind kind, Node* target) noexcept {
 void mw_node_detach(Node* node) noexcept { memweave::detach_node(node); }
 
 void mw_node_free(Node* node) noexcept { memweave::delete_node(node); }
+
+bool mw_node_set_text(Node* node, TextField field, Bytes text) noexcept {
+  return memweave::set_text(node, field, text);
+}
+
+bool mw_node_link(Node* from, Node* to) noexcept { return memweave::link_nodes(from, to); }
+
+void mw_node_unlink(Node* from, Node* to) noexcept { memweave::unlink_nodes(from, to); }
+
+bool mw_node_add_evidence(Node* node, Node* target) noexcept {
+  return memweave::add_node_evidence(node, target);
+}
+
+bool mw_node_remove_evidence(Node* node, Bytes id) noexcept {
+  return memweave::remove_node_evidence(node, id);
+}
+
+NodeIndex* mw_index_new() noexcept { return new (std::nothrow) NodeIndex(); }
+
+void mw_index_free(NodeIndex* index) noexcept { delete index; }
+
+std::size_t mw_index_size(const NodeIndex* index) noexcept { return index->size(); }
+
+Node* mw_index_find(const NodeIndex* index, Bytes id) noexcept { return index->find(id); }
+
+bool mw_index_insert(NodeIndex* index, Node* node) noexcept { return index->insert(node); }
+
+void mw_index_erase(NodeIndex* index, Bytes id) noexcept { index->erase(id); }
+
+Node* mw_index_next(const NodeIndex* index, std::size_t* cursor) noexcept {
+  return index->next(cursor);
+}
 
 }  // extern "C"

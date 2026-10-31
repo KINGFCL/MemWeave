@@ -3,12 +3,13 @@
 //   g++ -std=c++20 -g -fsanitize=address,undefined -Icpp/include cpp/test/graph_test.cpp -o /tmp/graph_test
 //   /tmp/graph_test
 //
-// 随机增删节点，并定期走遍所有活着的节点和它们的全部地址。只要留下一个悬空指针，
-// 读取它就会被 AddressSanitizer 拦住。
+// 随机增删改节点，并定期走遍所有活着的节点和它们的全部地址。只要留下一个悬空指针，
+// 读取它就会被 AddressSanitizer 拦住。同时用 std::map 当参照，核对 NodeIndex 的结果。
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -41,6 +42,48 @@ class Graph {
  public:
   ~Graph() {
     for (Node* node : live_) delete_node(node);
+  }
+
+  // 随机修改一个节点：文本、关联和证据。
+  void change(std::mt19937& random) {
+    if (live_.empty()) return;
+    Node* node = live_[random() % live_.size()];
+    Node* other = live_[random() % live_.size()];
+    switch (random() % 6) {
+      case 0: {
+        const std::string text(random() % 200, 'x');
+        if (!set_text(node, TextField::kDescription, bytes(text))) fail("分配失败");
+        break;
+      }
+      case 1: {
+        const std::string text(random() % 50, 'y');
+        if (!set_text(node, TextField::kTitle, bytes(text))) fail("分配失败");
+        break;
+      }
+      case 2:
+        if (!link_nodes(node, other)) fail("分配失败");
+        break;
+      case 3:
+        unlink_nodes(node, other);
+        break;
+      case 4:
+        if (node != other && !has_evidence(node, other) && !has_evidence(other, node)) {
+          if (!add_node_evidence(node, other)) fail("分配失败");
+        }
+        break;
+      default: {
+        // 既能去掉有效的证据，也能清除依据已被删除的证据。
+        const EvidenceList* evidence = node->evidence;
+        for (std::size_t i = 0; i < evidence->count; ++i) {
+          const Evidence& entry = evidence->entries()[i];
+          if (entry.kind == EvidenceKind::kNode) {
+            const std::string id(entry.id, entry.id_len);
+            if (!remove_node_evidence(node, bytes(id))) fail("分配失败");
+            break;
+          }
+        }
+      }
+    }
   }
 
   std::size_t size() const { return live_.size(); }
@@ -83,6 +126,8 @@ class Graph {
       if (!reserve_links(from, LinkKind::kRelated, 1)) fail("分配失败");
       append_link(from, LinkKind::kRelated, node);
     }
+    if (!index_.insert(node)) fail("分配失败");
+    expected_[id] = node;
     live_.push_back(node);
   }
 
@@ -92,13 +137,31 @@ class Graph {
     Node* node = live_[index];
     live_[index] = live_.back();
     live_.pop_back();
+    const std::string id(node->id, node->id_len);
+    index_.erase(bytes(id));
+    expected_.erase(id);
     detach_node(node);
     delete_node(node);
   }
 
   // 走遍所有地址：悬空指针会被 AddressSanitizer 拦住，关系不对称会被这里拦住。
   void check() const {
+    if (index_.size() != expected_.size()) fail("NodeIndex 的数量不对");
+    for (const auto& [id, node] : expected_) {
+      if (index_.find(bytes(id)) != node) fail("NodeIndex 找到的节点不对");
+    }
+    const std::string gone = "n" + std::to_string(next_id_);
+    if (index_.find(bytes(gone)) != nullptr) fail("NodeIndex 找到了不存在的节点");
+    std::size_t cursor = 0;
+    std::size_t visited = 0;
+    while (Node* node = index_.next(&cursor)) {
+      if (expected_.count(std::string(node->id, node->id_len)) == 0) fail("NodeIndex 遍历到了已删除的节点");
+      ++visited;
+    }
+    if (visited != expected_.size()) fail("NodeIndex 遍历的数量不对");
+
     for (const Node* node : live_) {
+      if (std::memchr(node->description, 0, node->description_len) != nullptr) fail("描述被破坏");
       const NodeList* related = link_list(node, LinkKind::kRelated);
       for (std::uint32_t i = 0; i < related->count; ++i) {
         if (!contains(link_list(related->nodes()[i], LinkKind::kRelatedBy), node)) {
@@ -132,6 +195,19 @@ class Graph {
   }
 
  private:
+  static bool has_evidence(const Node* node, const Node* target) {
+    const EvidenceList* evidence = node->evidence;
+    for (std::size_t i = 0; i < evidence->count; ++i) {
+      const Evidence& entry = evidence->entries()[i];
+      if (entry.node == target ||
+          (entry.kind == EvidenceKind::kNode && entry.id_len == target->id_len &&
+           std::memcmp(entry.id, target->id, target->id_len) == 0)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // 选几个活着的节点。个数偶尔很大，用来触发列表搬家。
   std::vector<Node*> pick(std::mt19937& random) const {
     std::vector<Node*> nodes;
@@ -144,6 +220,8 @@ class Graph {
   }
 
   std::vector<Node*> live_;
+  NodeIndex index_;
+  std::map<std::string, Node*> expected_;
   std::size_t next_id_ = 0;
 };
 
@@ -156,7 +234,9 @@ int main() {
   for (int step = 0; step < 20000; ++step) {
     // 节点数在 300 上下来回变化。
     const bool grow = graph.size() < 300 ? random() % 100 < 60 : random() % 100 < 40;
-    if (grow) {
+    if (random() % 3 == 0) {
+      graph.change(random);
+    } else if (grow) {
       graph.add(random);
     } else {
       graph.remove(random);

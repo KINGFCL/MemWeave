@@ -5,6 +5,7 @@
 pub mod error;
 mod ffi;
 pub mod knowledge;
+pub mod lang;
 pub mod memory;
 pub mod model;
 pub mod parse;

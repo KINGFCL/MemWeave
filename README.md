@@ -39,7 +39,16 @@ memweave query my-kb "你的问题"
 
 # 读取节点的证据原文，不调用模型
 memweave evidence my-kb <节点地址>
+
+# 用记忆指令直接操作记忆，默认只读，不调用模型
+memweave run my-kb "show ownership"
+memweave run --write my-kb "link a -> b"
+
+# 输出记忆指令的说明，放进模型的提示词
+memweave spec
 ```
+
+记忆指令写错时会像编译器一样报错，指出位置和改法，这时记忆完全不变。修改会记入知识库目录的 `journal.jsonl`，下次加载时自动恢复。
 
 Weaver 目前只支持文本文件，每次生成一个全新的知识库。输入会原样保存为来源，证据的位置由程序算出，模型无法改写；每一行都必须归入至少一个节点。文本超出单次模型调用的能力时会报错，不会截断。
 

@@ -21,8 +21,8 @@ const MAX_ID_BYTES: usize = 200;
 
 /// 内存中的知识图。创建和 [`add_node`](Memory::add_node) 时都会校验，所以节点之间的地址总是有效的。
 ///
-/// 节点由 C++ 分配，节点之间直接用地址相连。文本地址的索引只用在边界上：
-/// 把模型的回答和命令行参数对应回节点，遍历时不经过它。
+/// 节点由 C++ 分配，节点之间直接用地址相连。文本地址只用在边界上：
+/// 把模型的回答和命令行参数对应回节点，遍历时不经过它。这个 set 由 C++ 的 `NodeIndex` 实现。
 ///
 /// 一张图只属于一个线程。编译器会拒绝跨线程共享：
 ///
@@ -32,7 +32,7 @@ const MAX_ID_BYTES: usize = 200;
 /// ```
 pub struct Memory {
     catalog: Catalog,
-    index: HashMap<NodeId, NonNull<RawNode>>,
+    index: NonNull<ffi::RawIndex>,
 }
 
 // 整张图可以移动到另一个线程，但不实现 Sync：一张图只属于一个线程，别的线程要用就自己加载一份。
@@ -41,16 +41,22 @@ unsafe impl Send for Memory {}
 impl fmt::Debug for Memory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Memory")
-            .field("nodes", &self.index.len())
+            .field("nodes", &self.node_count())
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        for raw in self.index.values() {
-            unsafe { ffi::mw_node_free(raw.as_ptr()) }
+        let mut cursor = 0;
+        loop {
+            let raw = unsafe { ffi::mw_index_next(self.index.as_ptr(), &raw mut cursor) };
+            if raw.is_null() {
+                break;
+            }
+            unsafe { ffi::mw_node_free(raw) };
         }
+        unsafe { ffi::mw_index_free(self.index.as_ptr()) };
     }
 }
 
@@ -289,10 +295,8 @@ impl Memory {
         let backlinks = ReverseLinks::new(&nodes);
 
         // 先放进结构体：中途失败时由 Drop 释放已创建的节点。
-        let mut memory = Self {
-            catalog,
-            index: HashMap::with_capacity(nodes.len()),
-        };
+        let index = NonNull::new(unsafe { ffi::mw_index_new() }).ok_or(Error::OutOfMemory)?;
+        let memory = Self { catalog, index };
         // 先创建所有节点，再连接它们，这样节点之间可以直接存地址。
         for node in &nodes {
             let raw = new_node(
@@ -300,32 +304,35 @@ impl Memory {
                 reverse_ids(&backlinks.dependents, &node.id).len(),
                 reverse_ids(&backlinks.related_by, &node.id).len(),
             )?;
-            memory.index.insert(node.id.clone(), raw);
+            if let Err(error) = memory.index_insert(raw) {
+                unsafe { ffi::mw_node_free(raw.as_ptr()) };
+                return Err(error);
+            }
         }
 
         let mut addresses = Vec::new();
         for node in &nodes {
-            let raw = memory.index[&node.id].as_ptr();
+            let raw = memory.lookup(&node.id).as_ptr();
 
             addresses.clear();
-            addresses.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
+            addresses.extend(node.related.iter().map(|id| memory.lookup(id).as_ptr()));
             set_links(raw, ffi::LINK_RELATED, &addresses);
 
             for (index, evidence) in node.evidence.iter().enumerate() {
                 if let Evidence::Node { id } = evidence {
-                    let target = memory.index[id].as_ptr();
+                    let target = memory.lookup(id).as_ptr();
                     unsafe { ffi::mw_node_set_evidence_target(raw, index, target) };
                 }
             }
 
             addresses.clear();
             let dependents = reverse_ids(&backlinks.dependents, &node.id);
-            addresses.extend(dependents.iter().map(|id| memory.index[*id].as_ptr()));
+            addresses.extend(dependents.iter().map(|id| memory.lookup(id).as_ptr()));
             set_links(raw, ffi::LINK_DEPENDENTS, &addresses);
 
             addresses.clear();
             let related_by = reverse_ids(&backlinks.related_by, &node.id);
-            addresses.extend(related_by.iter().map(|id| memory.index[*id].as_ptr()));
+            addresses.extend(related_by.iter().map(|id| memory.lookup(id).as_ptr()));
             set_links(raw, ffi::LINK_RELATED_BY, &addresses);
         }
         Ok(memory)
@@ -416,14 +423,14 @@ impl Memory {
             .related
             .iter()
             .filter(|id| **id != node.id && seen.insert(id.as_str()))
-            .map(|id| self.index[id])
+            .map(|id| self.lookup(id))
             .collect();
         let mut seen = HashSet::new();
         let evidence_targets: Vec<NonNull<RawNode>> = node
             .evidence
             .iter()
             .filter_map(|evidence| match evidence {
-                Evidence::Node { id } if seen.insert(id.as_str()) => Some(self.index[id]),
+                Evidence::Node { id } if seen.insert(id.as_str()) => Some(self.lookup(id)),
                 _ => None,
             })
             .collect();
@@ -432,7 +439,7 @@ impl Memory {
             .related_by
             .iter()
             .filter(|id| seen.insert(id.as_str()))
-            .map(|id| self.index[id])
+            .map(|id| self.lookup(id))
             .collect();
 
         let links_to_itself = node.related.contains(&node.id);
@@ -448,7 +455,8 @@ impl Memory {
             && incoming
                 .iter()
                 .all(|from| reserve_link(*from, ffi::LINK_RELATED));
-        if !reserved {
+        // set 也可能需要扩容，放在连接之前，这样后面的步骤都不会失败。
+        if !reserved || self.index_insert(raw).is_err() {
             unsafe { ffi::mw_node_free(raw.as_ptr()) };
             return Err(Error::OutOfMemory);
         }
@@ -460,7 +468,7 @@ impl Memory {
                 if *id == node.id {
                     raw.as_ptr()
                 } else {
-                    self.index[id].as_ptr()
+                    self.lookup(id).as_ptr()
                 }
             })
             .collect();
@@ -468,7 +476,7 @@ impl Memory {
 
         for (index, evidence) in node.evidence.iter().enumerate() {
             if let Evidence::Node { id } = evidence {
-                let target = self.index[id].as_ptr();
+                let target = self.lookup(id).as_ptr();
                 unsafe { ffi::mw_node_set_evidence_target(raw.as_ptr(), index, target) };
             }
         }
@@ -502,7 +510,6 @@ impl Memory {
                 }),
             }
         }
-        self.index.insert(node.id, raw);
         Ok(NodeRef::new(raw))
     }
 
@@ -518,13 +525,13 @@ impl Memory {
                 id: node.id.clone(),
             });
         }
-        if self.index.contains_key(&node.id) {
+        if self.contains(&node.id) {
             problems.push(Problem::DuplicateNode {
                 id: node.id.clone(),
             });
         }
         for related in &node.related {
-            if *related != node.id && !self.index.contains_key(related) {
+            if *related != node.id && !self.contains(related) {
                 problems.push(Problem::BrokenLink {
                     id: related.clone(),
                     referrer: node.id.clone(),
@@ -532,7 +539,7 @@ impl Memory {
             }
         }
         for id in &placement.related_by {
-            if !self.index.contains_key(id) {
+            if !self.contains(id) {
                 problems.push(Problem::MissingIncoming {
                     id: id.clone(),
                     target: node.id.clone(),
@@ -546,7 +553,7 @@ impl Memory {
         }
         check_evidence(
             slice::from_ref(node),
-            &|id| self.index.contains_key(id),
+            &|id| self.contains(id),
             sources,
             &mut problems,
         );
@@ -559,10 +566,7 @@ impl Memory {
     /// 节点，由模型决定怎么处理。删除后如果还要写回磁盘，模型要先处理好失去依据的节点和
     /// 查不到的节点，否则下次加载时校验会报错。
     pub fn remove_node(&mut self, id: &str) -> Result<RemovedNode, Error> {
-        let raw = *self
-            .index
-            .get(id)
-            .ok_or_else(|| Error::UnknownNode(id.to_owned()))?;
+        let raw = self.find(id)?;
         let node = NodeRef::new(raw);
         let other_ids = |nodes: Vec<NodeRef<'_>>| -> Vec<NodeId> {
             nodes
@@ -587,8 +591,8 @@ impl Memory {
         for section in &mut self.catalog.sections {
             section.nodes.retain(|entry| entry.id != id);
         }
-        self.index.remove(id);
         unsafe {
+            ffi::mw_index_erase(self.index.as_ptr(), RawBytes::from_slice(id.as_bytes()));
             ffi::mw_node_detach(raw.as_ptr());
             ffi::mw_node_free(raw.as_ptr());
         }
@@ -647,16 +651,127 @@ impl Memory {
 
     /// 按文本地址找节点。这是边界上的入口，遍历时用 [`NodeRef::related`]。
     pub fn node(&self, id: &str) -> Option<NodeRef<'_>> {
-        self.index.get(id).map(|raw| NodeRef::new(*raw))
+        self.find_raw(id).map(NodeRef::new)
+    }
+
+    /// 这个文本地址是否存在。由 C++ 的 set 回答，模型访问的每个地址都要经过它。
+    pub fn contains(&self, id: &str) -> bool {
+        self.find_raw(id).is_some()
     }
 
     /// 所有节点，顺序不固定。
     pub fn nodes(&self) -> impl Iterator<Item = NodeRef<'_>> {
-        self.index.values().map(|raw| NodeRef::new(*raw))
+        let mut cursor = 0;
+        std::iter::from_fn(move || {
+            let raw = unsafe { ffi::mw_index_next(self.index.as_ptr(), &raw mut cursor) };
+            NonNull::new(raw).map(NodeRef::new)
+        })
     }
 
     pub fn node_count(&self) -> usize {
-        self.index.len()
+        unsafe { ffi::mw_index_size(self.index.as_ptr()) }
+    }
+
+    /// 修改节点的标题，总表里的标题也跟着改。
+    pub fn set_title(&mut self, id: &str, title: &str) -> Result<(), Error> {
+        self.set_text(id, ffi::TEXT_TITLE, title)?;
+        for entry in self.catalog.sections.iter_mut().flat_map(|s| &mut s.nodes) {
+            if entry.id == id {
+                title.clone_into(&mut entry.title);
+            }
+        }
+        Ok(())
+    }
+
+    /// 修改节点的描述。
+    pub fn set_description(&mut self, id: &str, description: &str) -> Result<(), Error> {
+        self.set_text(id, ffi::TEXT_DESCRIPTION, description)
+    }
+
+    /// 新增一条关联 `from -> to`，两个方向都会更新。
+    pub fn link(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let (from, to) = (self.find(from)?, self.find(to)?);
+        if unsafe { ffi::mw_node_link(from.as_ptr(), to.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// 去掉关联 `from -> to`，两个方向都会更新。之后可能有节点查不到了，见 [`Memory::unreachable`]。
+    pub fn unlink(&mut self, from: &str, to: &str) -> Result<(), Error> {
+        let (from, to) = (self.find(from)?, self.find(to)?);
+        unsafe { ffi::mw_node_unlink(from.as_ptr(), to.as_ptr()) };
+        Ok(())
+    }
+
+    /// 让 `id` 依据 `on`，两个方向都会更新。证据不能形成循环。
+    pub fn base(&mut self, id: &str, on: &str) -> Result<(), Error> {
+        let (node, target) = (self.find(id)?, self.find(on)?);
+        if id == on || depends_on(NodeRef::new(target), NodeRef::new(node)) {
+            return Err(Error::InvalidMemory(vec![Problem::EvidenceCycle {
+                ids: vec![id.to_owned(), on.to_owned()],
+            }]));
+        }
+        if unsafe { ffi::mw_node_add_evidence(node.as_ptr(), target.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// 去掉 `id` 对 `on` 的依据。`on` 可以是已被删除的节点。节点不能因此失去所有证据。
+    pub fn unbase(&mut self, id: &str, on: &str) -> Result<(), Error> {
+        let raw = self.find(id)?;
+        let evidence = NodeRef::new(raw).evidence();
+        let remaining = evidence
+            .iter()
+            .filter(|entry| !matches!(entry, Evidence::Node { id: other } if other == on))
+            .count();
+        if remaining == 0 {
+            return Err(Error::InvalidMemory(vec![Problem::MissingEvidence {
+                id: id.to_owned(),
+            }]));
+        }
+        let bytes = RawBytes::from_slice(on.as_bytes());
+        if unsafe { ffi::mw_node_remove_evidence(raw.as_ptr(), bytes) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    fn set_text(&mut self, id: &str, field: u32, text: &str) -> Result<(), Error> {
+        let raw = self.find(id)?;
+        let bytes = RawBytes::from_slice(text.as_bytes());
+        if unsafe { ffi::mw_node_set_text(raw.as_ptr(), field, bytes) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    fn find_raw(&self, id: &str) -> Option<NonNull<RawNode>> {
+        let bytes = RawBytes::from_slice(id.as_bytes());
+        NonNull::new(unsafe { ffi::mw_index_find(self.index.as_ptr(), bytes) })
+    }
+
+    fn find(&self, id: &str) -> Result<NonNull<RawNode>, Error> {
+        self.find_raw(id)
+            .ok_or_else(|| Error::UnknownNode(id.to_owned()))
+    }
+
+    /// 校验已经保证这个地址存在。
+    fn lookup(&self, id: &str) -> NonNull<RawNode> {
+        self.find_raw(id).expect("校验已经保证节点存在")
+    }
+
+    fn index_insert(&self, raw: NonNull<RawNode>) -> Result<(), Error> {
+        if unsafe { ffi::mw_index_insert(self.index.as_ptr(), raw.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
     }
 }
 
@@ -744,6 +859,39 @@ fn new_node(
     NonNull::new(raw).ok_or(Error::OutOfMemory)
 }
 
+/// `node` 是否直接或间接依据 `target`。
+fn depends_on(node: NodeRef<'_>, target: NodeRef<'_>) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending = vec![node.raw];
+    while let Some(raw) = pending.pop() {
+        if raw == target.raw {
+            return true;
+        }
+        if seen.insert(raw) {
+            pending.extend(NodeRef::new(raw).based_on().map(|other| other.raw));
+        }
+    }
+    false
+}
+
+/// 检查一组证据指向的来源是否存在、范围是否有效。
+pub(crate) fn check_sources(
+    id: &str,
+    evidence: &[Evidence],
+    sources: &dyn SourceStore,
+) -> Vec<Problem> {
+    let node = Node {
+        id: id.to_owned(),
+        title: String::new(),
+        description: String::new(),
+        evidence: evidence.to_vec(),
+        related: Vec::new(),
+    };
+    let mut problems = Vec::new();
+    check_evidence(slice::from_ref(&node), &|_| true, sources, &mut problems);
+    problems
+}
+
 fn set_links(raw: *mut RawNode, kind: u32, nodes: &[*mut RawNode]) {
     unsafe { ffi::mw_node_set_links(raw, kind, nodes.as_ptr(), nodes.len()) };
 }
@@ -756,7 +904,7 @@ fn append_link(raw: NonNull<RawNode>, kind: u32, target: NonNull<RawNode>) {
     unsafe { ffi::mw_node_append_link(raw.as_ptr(), kind, target.as_ptr()) };
 }
 
-fn is_valid_id(id: &str) -> bool {
+pub(crate) fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ID_BYTES
         && id
