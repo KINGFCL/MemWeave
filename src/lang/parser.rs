@@ -244,6 +244,7 @@ impl Parser {
         let id = self.name("节点地址")?;
         let mut depth = 1;
         let mut limit = DEFAULT_LINK_LIMIT;
+        let mut offset = 0;
         while let Some(token) = self.peek_word() {
             let span = token.span;
             let option = word_of(&token);
@@ -270,10 +271,19 @@ impl Parser {
                         ));
                     }
                 }
+                "offset" => {
+                    self.position += 1;
+                    offset = self.number("起始位置")?;
+                }
                 _ => break,
             }
         }
-        Ok(Statement::Links { id, depth, limit })
+        Ok(Statement::Links {
+            id,
+            depth,
+            limit,
+            offset,
+        })
     }
 
     fn arrow(&mut self) -> Result<(Name, Name), Skip> {
@@ -707,13 +717,14 @@ mod tests {
 
     #[test]
     fn links_has_defaults_and_options() {
-        let parsed = statements("links a\nlinks a limit 3 depth 2");
+        let parsed = statements("links a\nlinks a limit 3 depth 2\nlinks a offset 7 limit 3");
 
         assert!(matches!(
             &parsed[0],
             Statement::Links {
                 depth: 1,
                 limit: 50,
+                offset: 0,
                 ..
             }
         ));
@@ -722,6 +733,16 @@ mod tests {
             Statement::Links {
                 depth: 2,
                 limit: 3,
+                offset: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parsed[2],
+            Statement::Links {
+                depth: 1,
+                limit: 3,
+                offset: 7,
                 ..
             }
         ));

@@ -136,8 +136,13 @@ fn statement(
             let node = existing(memory, &id.text)?;
             render_node(node, sources, output, &mut report.failures);
         }
-        Statement::Links { id, depth, limit } => {
-            render_links(existing(memory, &id.text)?, *depth, *limit, output);
+        Statement::Links {
+            id,
+            depth,
+            limit,
+            offset,
+        } => {
+            render_links(existing(memory, &id.text)?, *depth, *limit, *offset, output);
         }
         Statement::Evidence(id) => match memory.evidence(&id.text, sources) {
             Ok(evidence) => render_evidence(&id.text, evidence, output),
@@ -409,7 +414,13 @@ fn join_ids(ids: &[String]) -> String {
     }
 }
 
-fn render_links(start: NodeRef<'_>, depth: usize, limit: usize, output: &mut String) {
+fn render_links(
+    start: NodeRef<'_>,
+    depth: usize,
+    limit: usize,
+    offset: usize,
+    output: &mut String,
+) {
     let mut seen = HashSet::from([start]);
     let mut pending = VecDeque::from([(start, 0)]);
     let mut total = 0;
@@ -419,11 +430,11 @@ fn render_links(start: NodeRef<'_>, depth: usize, limit: usize, output: &mut Str
             continue;
         }
         for target in node.related() {
-            total += 1;
-            if shown < limit {
+            if total >= offset && shown < limit {
                 let _ = writeln!(output, "{} -> {}", node.id(), target.id());
                 shown += 1;
             }
+            total += 1;
             if seen.insert(target) {
                 pending.push_back((target, level + 1));
             }
@@ -431,11 +442,21 @@ fn render_links(start: NodeRef<'_>, depth: usize, limit: usize, output: &mut Str
     }
     if total == 0 {
         let _ = writeln!(output, "{} 没有关联", start.id());
+    } else if offset >= total {
+        let _ = writeln!(output, "（共 {total} 条，offset {offset} 已经超过末尾）");
     } else if total > shown {
-        let _ = writeln!(
-            output,
-            "（共 {total} 条，只显示前 {shown} 条，可以调大 limit）"
-        );
+        let (first, last) = (offset + 1, offset + shown);
+        if last < total {
+            let _ = writeln!(
+                output,
+                "（共 {total} 条，这里是第 {first}–{last} 条，下一段用 offset {last}）"
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "（共 {total} 条，这里是第 {first}–{last} 条，后面没有了）"
+            );
+        }
     }
 }
 

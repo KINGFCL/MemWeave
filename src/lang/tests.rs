@@ -324,7 +324,10 @@ fn links_reports_when_the_limit_cuts_output() {
 
     let text = read(&mut memory, "links entry limit 1").text;
 
-    assert!(text.contains("共 2 条，只显示前 1 条"), "{text}");
+    assert!(
+        text.contains("共 2 条，这里是第 1–1 条，下一段用 offset 1"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1942,4 +1945,106 @@ fn truncated_errors_do_not_claim_the_script_ran() {
         output.text.len()
     );
     assert!(!output.text.contains("语句都已执行"));
+}
+
+/// `links` 输出里的边，不含说明。
+fn edges(text: &str) -> Vec<&str> {
+    text.lines().filter(|line| line.contains(" -> ")).collect()
+}
+
+#[test]
+fn links_can_be_read_in_pages() {
+    let mut memory = memory();
+
+    // entry -> ownership、entry -> conclusion、ownership -> borrowing，共 3 条。
+    let whole = read(&mut memory, "links entry depth 2").text;
+    assert_eq!(edges(&whole).len(), 3, "{whole}");
+    assert!(!whole.contains("共 3 条"), "看全了就不用说明：{whole}");
+
+    let first = read(&mut memory, "links entry depth 2 limit 2").text;
+    assert_eq!(edges(&first), edges(&whole)[..2]);
+    assert!(
+        first.contains("共 3 条，这里是第 1–2 条，下一段用 offset 2"),
+        "{first}"
+    );
+
+    let last = read(&mut memory, "links entry depth 2 limit 2 offset 2").text;
+    assert_eq!(edges(&last), edges(&whole)[2..]);
+    assert!(
+        last.contains("共 3 条，这里是第 3–3 条，后面没有了"),
+        "{last}"
+    );
+
+    let middle = read(&mut memory, "links entry depth 2 limit 1 offset 1").text;
+    assert_eq!(edges(&middle), edges(&whole)[1..2]);
+    assert!(
+        middle.contains("这里是第 2–2 条，下一段用 offset 2"),
+        "{middle}"
+    );
+
+    // 不从头看但看到了末尾，也要说明。
+    let tail = read(&mut memory, "links entry depth 2 offset 1").text;
+    assert_eq!(edges(&tail), edges(&whole)[1..]);
+    assert!(tail.contains("这里是第 2–3 条，后面没有了"), "{tail}");
+
+    // 超过末尾不是错误。
+    for offset in [3, 1000, usize::MAX] {
+        let output = read(&mut memory, &format!("links entry depth 2 offset {offset}"));
+        assert!(output.ok, "{}", output.text);
+        assert!(edges(&output.text).is_empty(), "{}", output.text);
+        assert!(output.text.contains("已经超过末尾"), "{}", output.text);
+    }
+
+    let leaf = read(&mut memory, "links borrowing offset 5").text;
+    assert!(leaf.contains("borrowing 没有关联"), "{leaf}");
+}
+
+#[test]
+fn links_offset_is_checked() {
+    let mut memory = memory();
+
+    let output = read(&mut memory, "links entry offset");
+    assert!(output.text.contains("error[E102]"), "{}", output.text);
+    let output = read(&mut memory, "links entry offset -1");
+    assert!(!output.ok, "{}", output.text);
+    let output = read(&mut memory, "links entry offset 99999999999999999999999999");
+    assert!(!output.ok, "{}", output.text);
+}
+
+/// 这是 `offset` 存在的原因：一层就超过 `limit` 上限时，后面的边也要看得到。
+#[test]
+fn pages_reach_edges_beyond_the_largest_limit() {
+    let targets: Vec<String> = (0..2500).map(|i| format!("n{i}")).collect();
+    let related: Vec<&str> = targets.iter().map(String::as_str).collect();
+    let mut nodes = vec![node("hub", &related)];
+    nodes.extend(targets.iter().map(|id| node(id, &[])));
+    let catalog = Catalog {
+        sections: vec![Section {
+            name: "大".into(),
+            description: String::new(),
+            nodes: vec![CatalogEntry {
+                id: "hub".into(),
+                title: "标题hub".into(),
+            }],
+        }],
+    };
+    let mut memory = Memory::from_parsed(ParsedKnowledge { catalog, nodes }, &sources()).unwrap();
+
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let text = read(
+            &mut memory,
+            &format!("links hub limit 1000 offset {offset}"),
+        )
+        .text;
+        seen.extend(edges(&text).iter().map(|edge| edge.to_string()));
+        match text.split_once("下一段用 offset ") {
+            Some((_, next)) => offset = next.trim_end().trim_end_matches('）').parse().unwrap(),
+            None => break,
+        }
+    }
+
+    let expected: Vec<String> = targets.iter().map(|id| format!("hub -> {id}")).collect();
+    assert_eq!(seen, expected);
 }

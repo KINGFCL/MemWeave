@@ -74,6 +74,7 @@ pub enum Statement {
         id: Name,
         depth: usize,
         limit: usize,
+        offset: usize,
     },
     Evidence(Name),
     BasedBy(Name),

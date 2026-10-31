@@ -28,7 +28,7 @@ pub const SPEC: &str = r####"用下面的语言操作记忆。每条语句占一
 读取：
 catalog show                             查看总表：每个领域的名字、描述和代表节点
 show 节点                                 查看节点的全部内容：标题、描述、所有关系和证据原文
-links 节点 [depth N] [limit N]            沿关联往外看，默认 depth 1，limit 50
+links 节点 [depth N] [limit N] [offset N] 沿关联往外看，默认 depth 1，limit 50。没看完时用 offset 接着看
 evidence 节点                             读取证据指向的原文
 based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
 related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
