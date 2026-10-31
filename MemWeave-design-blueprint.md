@@ -365,7 +365,7 @@ memweave run --write my-kb -                   # 从标准输入读脚本
 
 | 类型 | 语句 |
 | --- | --- |
-| 读 | `catalog`、`show`、`links`、`evidence`、`check` |
+| 读 | `catalog`、`show`、`links`、`evidence`、`based_by`、`check` |
 | 写 | `add`、`remove`、`set`、`link`、`unlink`、`base`、`unbase` |
 
 agent 不一定要从总表开始，知道地址就可以直接 `show`，再用 `links` 沿关系走。

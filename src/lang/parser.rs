@@ -4,9 +4,9 @@ use super::ast::{AddNode, Field, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-const KEYWORDS: [&str; 12] = [
-    "catalog", "check", "show", "links", "evidence", "add", "remove", "link", "unlink", "set",
-    "base", "unbase",
+const KEYWORDS: [&str; 13] = [
+    "catalog", "check", "show", "links", "evidence", "based_by", "add", "remove", "link", "unlink",
+    "set", "base", "unbase",
 ];
 const ADD_CLAUSES: [&str; 8] = [
     "title",
@@ -74,6 +74,7 @@ impl Parser {
             "check" => Statement::Check,
             "show" => Statement::Show(self.name("节点地址")?),
             "evidence" => Statement::Evidence(self.name("节点地址")?),
+            "based_by" => Statement::BasedBy(self.name("节点地址")?),
             "remove" => Statement::Remove(self.name("节点地址")?),
             "links" => self.links()?,
             "link" => {

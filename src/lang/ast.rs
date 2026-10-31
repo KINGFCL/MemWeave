@@ -46,6 +46,7 @@ pub enum Statement {
         limit: usize,
     },
     Evidence(Name),
+    BasedBy(Name),
     Add(Box<AddNode>),
     Remove(Name),
     Link {
@@ -81,6 +82,7 @@ impl Statement {
                 | Statement::Show(_)
                 | Statement::Links { .. }
                 | Statement::Evidence(_)
+                | Statement::BasedBy(_)
         )
     }
 }

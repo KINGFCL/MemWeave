@@ -62,7 +62,7 @@ impl Checker<'_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
             Statement::Catalog | Statement::Check => {}
-            Statement::Show(id) | Statement::Evidence(id) => {
+            Statement::Show(id) | Statement::Evidence(id) | Statement::BasedBy(id) => {
                 self.require(id);
             }
             Statement::Links { id, .. } => {

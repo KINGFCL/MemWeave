@@ -60,6 +60,13 @@ fn statement(
                 let _ = writeln!(output, "error[E901] evidence {} 读取失败：{error}", id.text);
             }
         },
+        Statement::BasedBy(id) => {
+            let ids: Vec<String> = existing(memory, &id.text)?
+                .based_by()
+                .map(|node| node.id().to_owned())
+                .collect();
+            let _ = writeln!(output, "based_by {}: {}", id.text, join_ids(&ids));
+        }
         Statement::Add(add) => {
             let (node, placement) = build_node(add);
             memory.add_node(node, placement, sources)?;

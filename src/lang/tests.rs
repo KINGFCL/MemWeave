@@ -192,6 +192,54 @@ fn show_still_lists_everything_else_when_the_source_is_damaged() {
 }
 
 #[test]
+fn based_by_lists_only_the_nodes_derived_from_this_one() {
+    let mut memory = memory();
+
+    let output = read(&mut memory, "based_by ownership\nbased_by borrowing");
+
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(
+        output.text,
+        "based_by ownership: conclusion\nbased_by borrowing: 无\n"
+    );
+}
+
+#[test]
+fn based_by_does_not_need_the_sources() {
+    let mut memory = memory();
+    let empty = InMemorySources::new();
+
+    let output = Session::new(&mut memory, &empty, Mode::ReadOnly).run("based_by ownership");
+
+    assert!(output.ok, "{}", output.text);
+}
+
+#[test]
+fn based_by_sees_earlier_changes_in_the_script() {
+    let mut memory = memory();
+
+    let text = ok(
+        &mut memory,
+        "base borrowing on ownership\nbased_by ownership\nunbase conclusion on ownership",
+    );
+
+    assert!(
+        text.contains("based_by ownership: conclusion, borrowing"),
+        "{text}"
+    );
+}
+
+#[test]
+fn based_by_has_compiler_errors() {
+    let mut memory = memory();
+
+    fails(&mut memory, "based_by ownershp", "E201");
+    fails(&mut memory, "based_by", "E102");
+    let text = fails(&mut memory, "base_by ownership", "E101");
+    assert!(text.contains("你是不是想写 based_by？"), "{text}");
+}
+
+#[test]
 fn agents_can_go_straight_to_a_node() {
     let mut memory = memory();
 

@@ -30,6 +30,7 @@ catalog                                  查看总表：按领域分类的代表
 show 节点                                 查看节点的全部内容：标题、描述、所有关系和证据原文
 links 节点 [depth N] [limit N]            沿关联往外看，默认 depth 1，limit 50
 evidence 节点                             读取证据指向的原文
+based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
 check                                    列出从总表走不到的节点
 
 修改：
