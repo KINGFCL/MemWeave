@@ -53,7 +53,7 @@ pub enum Error {
     #[error("节点 {0} 不存在")]
     UnknownNode(NodeId),
 
-    #[error("内存不足")]
+    #[error("内存不足，或单个节点的文本超过 4 GiB")]
     OutOfMemory,
 
     #[error("模型调用失败：{0}")]

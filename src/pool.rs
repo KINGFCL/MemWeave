@@ -103,7 +103,9 @@ mod tests {
             for _ in 0..100 {
                 let address = allocator.allocate(size).unwrap().as_ptr() as usize;
                 assert_eq!(address % 16, 0, "{size}");
-                if size >= 64 {
+                if size >= 128 {
+                    assert_eq!(address % 128, 0, "{size}");
+                } else if size >= 64 {
                     assert_eq!(address % 64, 0, "{size}");
                 }
                 blocks.push((address, size.max(1)));

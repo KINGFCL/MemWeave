@@ -68,15 +68,15 @@ impl<'m> NodeRef<'m> {
     }
 
     pub fn id(self) -> &'m str {
-        text(self.raw().id)
+        text(self.raw().id, self.raw().id_len)
     }
 
     pub fn title(self) -> &'m str {
-        text(self.raw().title)
+        text(self.raw().title, self.raw().title_len)
     }
 
     pub fn description(self) -> &'m str {
-        text(self.raw().description)
+        text(self.raw().description, self.raw().description_len)
     }
 
     /// 相关节点。遍历时只解引用地址，不做任何查找。
@@ -93,9 +93,11 @@ impl<'m> NodeRef<'m> {
 
     /// 解析节点的证据。证据只有在需要时才解析。
     pub fn evidence(self) -> Vec<Evidence> {
-        let bytes = self.raw().evidence;
-        serde_json::from_slice(unsafe { slice::from_raw_parts(bytes.data, bytes.len) })
-            .expect("证据是创建节点时序列化的")
+        let raw = self.raw();
+        serde_json::from_slice(unsafe {
+            slice::from_raw_parts(raw.evidence, raw.evidence_len as usize)
+        })
+        .expect("证据是创建节点时序列化的")
     }
 
     /// 复制出完整的节点。
@@ -130,9 +132,9 @@ impl Hash for NodeRef<'_> {
     }
 }
 
-fn text<'m>(bytes: RawBytes) -> &'m str {
+fn text<'m>(data: *const u8, len: u32) -> &'m str {
     // 内容是创建节点时从 &str 复制的，在 Memory 存活期间不变。
-    unsafe { str::from_utf8_unchecked(slice::from_raw_parts(bytes.data, bytes.len)) }
+    unsafe { str::from_utf8_unchecked(slice::from_raw_parts(data, len as usize)) }
 }
 
 /// 校验时发现的问题。
@@ -230,7 +232,7 @@ impl Memory {
         Ok(memory)
     }
 
-    fn add_node(&mut self, node: &Node) -> Result<NonNull<RawNode>, Error> {
+    fn add_node(&self, node: &Node) -> Result<NonNull<RawNode>, Error> {
         let evidence = serde_json::to_vec(&node.evidence).expect("证据总是可以序列化");
         let raw = unsafe {
             ffi::mw_graph_add_node(
@@ -239,6 +241,7 @@ impl Memory {
                 RawBytes::from_slice(node.title.as_bytes()),
                 RawBytes::from_slice(node.description.as_bytes()),
                 RawBytes::from_slice(&evidence),
+                node.related.len(),
             )
         };
         NonNull::new(raw).ok_or(Error::OutOfMemory)
@@ -964,6 +967,18 @@ mod tests {
         let memory = build(&["a"], vec![large.clone()]).unwrap();
 
         assert_eq!(memory.node("a").unwrap().description(), large.description);
+    }
+
+    #[test]
+    fn nodes_and_their_links_share_a_cache_line_pair() {
+        let memory = build(&["a"], vec![node("a", &["b"]), node("b", &[])]).unwrap();
+
+        let a = memory.node("a").unwrap();
+        let address = a.raw.as_ptr() as usize;
+        let list = a.raw().related.load(Ordering::Acquire) as usize;
+
+        assert_eq!(address % 128, 0);
+        assert_eq!(list, address + 64);
     }
 
     #[test]

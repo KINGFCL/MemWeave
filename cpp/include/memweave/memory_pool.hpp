@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <new>
 
+#if defined(__linux__) && !defined(MEMWEAVE_NO_HUGEPAGES)
+#include <sys/mman.h>
+#endif
+
 namespace memweave {
 
 class MemoryPool {
@@ -28,13 +32,14 @@ class MemoryPool {
     Chunk* chunk = chunks_;
     while (chunk != nullptr) {
       Chunk* next = chunk->next;
-      ::operator delete(chunk, std::align_val_t{kCacheLine});
+      ::operator delete(chunk, std::align_val_t{kChunkSize});
       chunk = next;
     }
   }
 
   // 只能由分配线程调用。内存不足时返回 nullptr。
-  // 返回的块至少按 16 字节对齐，64 字节及以上的块按缓存行对齐。
+  // 返回的块按自身大小对齐，上限 128 字节，所以 64 字节的块独占一条缓存行，
+  // 128 字节及以上的块从一对相邻缓存行的开头开始，硬件的相邻行预取会一起取回。
   [[nodiscard]] void* allocate(std::size_t size) noexcept {
     if (size > kMaxSize) {
       return nullptr;
@@ -77,8 +82,8 @@ class MemoryPool {
     std::atomic<Block*> head{nullptr};
   };
 
-  static constexpr std::size_t kCacheLine = 64;
-  static constexpr std::size_t kChunkHeader = kCacheLine;
+  static constexpr std::size_t kMaxBlockAlignment = 128;
+  static constexpr std::size_t kChunkHeader = kMaxBlockAlignment;
   static constexpr std::size_t kChunkSize = std::size_t{2} * 1024 * 1024;
   // 超过这个大小的块单独申请一个 chunk，避免浪费 chunk 的剩余空间。
   static constexpr std::size_t kMaxBumpSize = kChunkSize / 4;
@@ -103,7 +108,7 @@ class MemoryPool {
       return chunk == nullptr ? nullptr : chunk + kChunkHeader;
     }
 
-    const std::size_t alignment = size < kCacheLine ? size : kCacheLine;
+    const std::size_t alignment = size < kMaxBlockAlignment ? size : kMaxBlockAlignment;
     std::uintptr_t start = align_up(reinterpret_cast<std::uintptr_t>(bump_), alignment);
     if (bump_ == nullptr || start + size > reinterpret_cast<std::uintptr_t>(bump_end_)) {
       char* chunk = new_chunk(kChunkSize - kChunkHeader);
@@ -119,11 +124,16 @@ class MemoryPool {
   }
 
   char* new_chunk(std::size_t payload) noexcept {
-    void* memory =
-        ::operator new(payload + kChunkHeader, std::align_val_t{kCacheLine}, std::nothrow);
+    // 按大页对齐并申请大页：节点随机分布时，TLB 未命中的代价和缓存未命中一样高。
+    const std::size_t total = payload + kChunkHeader;
+    void* memory = ::operator new(total, std::align_val_t{kChunkSize}, std::nothrow);
     if (memory == nullptr) {
       return nullptr;
     }
+#if defined(__linux__) && !defined(MEMWEAVE_NO_HUGEPAGES)
+    // 只是优化建议，失败也不影响使用。
+    (void)madvise(memory, total, MADV_HUGEPAGE);
+#endif
     Chunk* chunk = new (memory) Chunk{chunks_};
     chunks_ = chunk;
     return static_cast<char*>(memory);
