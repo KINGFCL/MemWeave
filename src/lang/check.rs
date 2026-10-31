@@ -3,10 +3,12 @@
 //! 通过检查后才开始执行，所以脚本写错时记忆完全不变。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use super::Mode;
 use super::ast::{AddNode, Label, Located, Name, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
+use crate::export::target_problem;
 use crate::knowledge::{Evidence, Locator};
 use crate::memory::{Memory, check_sources, is_valid_id};
 use crate::source::SourceStore;
@@ -39,13 +41,16 @@ pub fn check(
             })
             .collect(),
         new_nodes: Vec::new(),
+        export_targets: HashSet::new(),
         errors: Vec::new(),
     };
     for located in statements {
-        if mode == Mode::ReadOnly && located.statement.writes() {
+        if mode == Mode::ReadOnly && located.statement.needs_write_session() {
             checker.errors.push(
-                Diagnostic::new("E301", located.span, "当前会话是只读的，不能修改记忆")
-                    .with_hint("只读会话只能用 catalog、show、links、evidence、check"),
+                Diagnostic::new("E301", located.span, "当前会话是只读的，不能修改记忆或导出")
+                    .with_hint(
+                        "只读会话只能用 catalog show、show、links、evidence、based_by、related_by、full_source、check",
+                    ),
             );
             continue;
         }
@@ -70,6 +75,8 @@ struct Checker<'a> {
     sections: Vec<(String, Vec<String>)>,
     /// 本脚本新建的节点，脚本结束时要确认它们有路可达。
     new_nodes: Vec<Name>,
+    /// 本脚本已经导出过的路径。
+    export_targets: HashSet<String>,
     errors: Vec<Diagnostic>,
 }
 
@@ -77,6 +84,7 @@ impl Checker<'_> {
     fn statement(&mut self, statement: &Statement) {
         match statement {
             Statement::CatalogShow | Statement::Check => {}
+            Statement::Export(path) => self.export(path),
             Statement::CatalogCreate { name, description } => {
                 self.nonblank(name, "板块的名字");
                 self.nonblank(description, "板块的描述");
@@ -422,6 +430,74 @@ impl Checker<'_> {
             || self.related.iter().any(|(from, list)| {
                 !unjoined.contains(from) && self.exists(from) && list.contains(id)
             })
+    }
+
+    /// 导出的是这条语句执行时的状态，所以用模拟到这里的总表和关联判断。
+    fn export(&mut self, path: &Label) {
+        self.nonblank(path, "导出路径");
+        let hint = "换一个不存在的目录，或者空目录";
+        if !self.export_targets.insert(path.text.clone()) {
+            self.errors.push(
+                Diagnostic::new(
+                    "E216",
+                    path.span,
+                    format!("这段脚本前面已经导出到 {}", path.text),
+                )
+                .with_hint(hint),
+            );
+        } else if let Some(problem) = target_problem(Path::new(&path.text)) {
+            self.errors
+                .push(Diagnostic::new("E216", path.span, problem).with_hint(hint));
+        }
+
+        let lost = self.unreachable();
+        if !lost.is_empty() {
+            self.errors.push(
+                Diagnostic::new(
+                    "E217",
+                    path.span,
+                    format!("有 {} 个节点从总表到达不了，不能导出", lost.len()),
+                )
+                .with_hint(format!(
+                    "先用 catalog add 或 link 接入，或者 remove 删除：{}",
+                    lost.join(", ")
+                )),
+            );
+        }
+    }
+
+    /// 模拟到当前语句时，从总表走不到的节点，和执行后 [`Memory::unreachable`] 的结果一致。
+    fn unreachable(&self) -> Vec<String> {
+        let mut reachable = HashSet::new();
+        let mut pending: Vec<String> = self
+            .sections
+            .iter()
+            .flat_map(|(_, nodes)| nodes.iter().cloned())
+            .collect();
+        while let Some(id) = pending.pop() {
+            if !self.exists(&id) || !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(list) = self.related.get(&id) {
+                pending.extend(list.iter().cloned());
+            } else if let Some(node) = self.memory.node(&id) {
+                pending.extend(
+                    node.related()
+                        .map(|other| other.id().to_owned())
+                        .filter(|other| !self.removed_ever.contains(other)),
+                );
+            }
+        }
+        let mut lost: Vec<String> = self
+            .memory
+            .nodes()
+            .map(|node| node.id().to_owned())
+            .chain(self.added.iter().cloned())
+            .filter(|id| self.exists(id) && !reachable.contains(id))
+            .collect();
+        lost.sort();
+        lost.dedup();
+        lost
     }
 
     fn section(&self, name: &str) -> Option<usize> {

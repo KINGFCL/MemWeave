@@ -727,6 +727,51 @@ impl Random {
     }
 }
 
+const IDS: [&str; 8] = [
+    "entry",
+    "ownership",
+    "borrowing",
+    "conclusion",
+    "p",
+    "q",
+    "r",
+    "ghost",
+];
+
+fn random_statement(random: &mut Random, source: &str) -> String {
+    let a = IDS[random.next() % IDS.len()];
+    let b = IDS[random.next() % IDS.len()];
+    let c = IDS[random.next() % IDS.len()];
+    match random.next() % 20 {
+        14 => "catalog show".to_owned(),
+        15 => format!("catalog create \"{a}\" desc \"d\""),
+        16 => format!("catalog delete \"{a}\""),
+        17 => format!("catalog add {a} to \"{b}\""),
+        18 => format!("catalog remove {a} from \"{b}\""),
+        19 => format!("catalog rename \"{a}\" to \"{b}\""),
+        12 => format!(
+            "source {a}\n title \"t\"\n desc \"d\"\n text \"\"\"原文{b}\"\"\"\n related {c}\n related_by entry\nend"
+        ),
+        13 => format!("full_source {a}"),
+        0 => format!("show {a}"),
+        1 => format!("evidence {a}"),
+        2 => "check".to_owned(),
+        3 => format!(
+            "source {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n related_by entry\nend"
+        ),
+        4 => {
+            format!("add {a}\n title \"t\"\n desc \"d\"\n based_on {b}, {b}\n related_by {c}\nend")
+        }
+        5 => format!("remove {a}"),
+        6 => format!("set {a} desc \"新\""),
+        7 => format!("set {a} title \"新\""),
+        8 => format!("link {a} -> {b}"),
+        9 => format!("unlink {a} -> {b}"),
+        10 => format!("base {a} on {b}"),
+        _ => format!("unbase {a} on {b}"),
+    }
+}
+
 /// 乱码不能让它崩溃，也不能改动记忆。
 #[test]
 fn random_garbage_never_panics_or_changes_memory() {
@@ -933,16 +978,6 @@ fn a_damaged_source_cannot_lock_the_knowledge_base() {
 /// 通过检查的脚本，执行时不能报语义错误，重放后的状态也必须和实际执行完全一致。
 #[test]
 fn whatever_passes_the_check_executes_and_replays_exactly() {
-    const IDS: [&str; 8] = [
-        "entry",
-        "ownership",
-        "borrowing",
-        "conclusion",
-        "p",
-        "q",
-        "r",
-        "ghost",
-    ];
     let (_dir, store) = file_store();
     let source = source();
     let mut random = Random(0x1234_5678_9abc_def1);
@@ -955,37 +990,7 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
         for _ in 0..40 {
             let mut script = String::new();
             for _ in 0..1 + random.next() % 5 {
-                let a = IDS[random.next() % IDS.len()];
-                let b = IDS[random.next() % IDS.len()];
-                let c = IDS[random.next() % IDS.len()];
-                let statement = match random.next() % 20 {
-                    14 => "catalog show".to_owned(),
-                    15 => format!("catalog create \"{a}\" desc \"d\""),
-                    16 => format!("catalog delete \"{a}\""),
-                    17 => format!("catalog add {a} to \"{b}\""),
-                    18 => format!("catalog remove {a} from \"{b}\""),
-                    19 => format!("catalog rename \"{a}\" to \"{b}\""),
-                    12 => format!(
-                        "source {a}\n title \"t\"\n desc \"d\"\n text \"\"\"原文{b}\"\"\"\n related {c}\n related_by entry\nend"
-                    ),
-                    13 => format!("full_source {a}"),
-                    0 => format!("show {a}"),
-                    1 => format!("evidence {a}"),
-                    2 => "check".to_owned(),
-                    3 => format!(
-                        "source {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n related_by entry\nend"
-                    ),
-                    4 => format!(
-                        "add {a}\n title \"t\"\n desc \"d\"\n based_on {b}, {b}\n related_by {c}\nend"
-                    ),
-                    5 => format!("remove {a}"),
-                    6 => format!("set {a} desc \"新\""),
-                    7 => format!("set {a} title \"新\""),
-                    8 => format!("link {a} -> {b}"),
-                    9 => format!("unlink {a} -> {b}"),
-                    10 => format!("base {a} on {b}"),
-                    _ => format!("unbase {a} on {b}"),
-                };
+                let statement = random_statement(&mut random, &source);
                 script.push_str(&statement);
                 script.push('\n');
             }
@@ -1602,4 +1607,339 @@ fn catalog_changes_are_replayed() {
 
     assert_eq!(snapshot(&restarted), snapshot(&live));
     assert_eq!(restarted.catalog().sections[0].description, "描述");
+}
+
+/// 比较两份记忆。反向列表的顺序由加载顺序决定，这里只比内容。
+fn same_content(memory: &Memory) -> (Vec<Node>, Vec<String>, Catalog) {
+    let mut nodes: Vec<Node> = memory.nodes().map(|n| n.to_node()).collect();
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut backlinks: Vec<String> = memory
+        .nodes()
+        .map(|n| {
+            let mut related_by: Vec<&str> = n.related_by().map(|o| o.id()).collect();
+            let mut based_by: Vec<&str> = n.based_by().map(|o| o.id()).collect();
+            related_by.sort_unstable();
+            based_by.sort_unstable();
+            format!("{}:{related_by:?}:{based_by:?}", n.id())
+        })
+        .collect();
+    backlinks.sort();
+    (nodes, backlinks, memory.catalog().clone())
+}
+
+fn load_exported(target: &std::path::Path) -> Memory {
+    let sources = crate::source::file::FileSources::new(target);
+    Memory::load(&crate::parse::json::JsonParser, &sources, target).unwrap()
+}
+
+fn export_to(target: &std::path::Path) -> String {
+    format!("export \"{}\"", target.display())
+}
+
+#[test]
+fn export_writes_the_current_state() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+
+    let script = format!(
+        "set entry title \"新标题\"\ncatalog create \"空\" desc \"d\"\n{}",
+        export_to(&target)
+    );
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.ok, "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains("exported 4 nodes, 2 sections, 1 sources to"),
+        "{}",
+        output.text
+    );
+    assert_eq!(same_content(&load_exported(&target)), same_content(&memory));
+    assert!(!target.join("journal.jsonl").exists());
+}
+
+#[test]
+fn export_leaves_out_sources_nothing_cites() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+    assert!(run_with(&mut memory, &store, NEW_SOURCE).ok);
+    assert!(run_with(&mut memory, &store, "remove 观察").ok);
+
+    let output = run_with(&mut memory, &store, &export_to(&target));
+
+    assert!(output.text.contains("1 sources"), "{}", output.text);
+    assert_eq!(fs::read_dir(target.join("sources")).unwrap().count(), 1);
+    // 原知识库里的原文还在。
+    assert_eq!(fs::read_dir(dir.path().join("sources")).unwrap().count(), 2);
+}
+
+#[test]
+fn export_lists_unreachable_nodes_and_nothing_runs() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+    let before = snapshot(&memory);
+
+    let script = format!("unlink ownership -> borrowing\n{}", export_to(&target));
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(output.text.contains("error[E217]"), "{}", output.text);
+    assert!(output.text.contains("有 1 个节点"), "{}", output.text);
+    assert!(output.text.contains("删除：borrowing"), "{}", output.text);
+    assert_eq!(snapshot(&memory), before);
+    assert!(!target.exists());
+}
+
+#[test]
+fn export_sees_the_state_at_its_own_position() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+
+    // 同一段脚本里先修复。
+    let repaired = dir.path().join("修复后");
+    let script = format!(
+        "unlink ownership -> borrowing\ncatalog add borrowing to \"Rust\"\n{}",
+        export_to(&repaired)
+    );
+    let output = run_with(&mut memory, &store, &script);
+    assert!(output.ok, "{}", output.text);
+    assert!(repaired.join("nodes/borrowing.json").exists());
+
+    // 导出之后才断开，导出的还是断开前的状态。
+    let earlier = dir.path().join("断开前");
+    let script = format!(
+        "{}\ncatalog remove borrowing from \"Rust\"",
+        export_to(&earlier)
+    );
+    let output = run_with(&mut memory, &store, &script);
+    assert!(output.ok, "{}", output.text);
+    assert!(load_exported(&earlier).catalog().sections[0].nodes.len() == 2);
+    assert_eq!(memory.unreachable(), ["borrowing"]);
+
+    // 导出之前断开，导出之后才接上，也不行。
+    let script = format!(
+        "{}\ncatalog add borrowing to \"Rust\"",
+        export_to(&dir.path().join("不行"))
+    );
+    let output = run_with(&mut memory, &store, &script);
+    assert!(output.text.contains("error[E217]"), "{}", output.text);
+}
+
+#[test]
+fn export_targets_are_checked() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let run = |memory: &mut Memory, script: &str| run_with(memory, &store, script);
+
+    // sources 目录已有内容，不会覆盖。
+    let output = run(&mut memory, &export_to(&dir.path().join("sources")));
+    assert!(output.text.contains("error[E216]"), "{}", output.text);
+    assert!(output.text.contains("不会覆盖"), "{}", output.text);
+
+    // 同一段脚本导出两次到同一个目录。
+    let twice = dir.path().join("两次");
+    let script = format!("{0}\n{0}", export_to(&twice));
+    let output = run(&mut memory, &script);
+    assert!(output.text.contains("error[E216]"), "{}", output.text);
+    assert!(!twice.exists());
+
+    // 空目录可以。
+    let empty = dir.path().join("空目录");
+    fs::create_dir(&empty).unwrap();
+    assert!(run(&mut memory, &export_to(&empty)).ok);
+    assert!(empty.join("catalog.json").exists());
+
+    let output = run(&mut memory, "export \"  \"");
+    assert!(output.text.contains("error[E206]"), "{}", output.text);
+    let output = run(&mut memory, "export 路径");
+    assert!(output.text.contains("error[E102]"), "{}", output.text);
+    let output = run(&mut memory, "expotr \"路径\"");
+    assert!(output.text.contains("export"), "{}", output.text);
+}
+
+#[test]
+fn read_only_sessions_cannot_export() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+
+    let output = Session::new(&mut memory, &store, Mode::ReadOnly).run(&export_to(&target));
+
+    assert!(output.text.contains("error[E301]"), "{}", output.text);
+    assert!(!target.exists());
+}
+
+#[test]
+fn export_is_not_replayed() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let journal_path = dir.path().join("journal.jsonl");
+    let mut live = memory();
+
+    // 只有导出的脚本不写日志。
+    let only = dir.path().join("只有导出");
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&export_to(&only));
+    assert!(output.ok, "{}", output.text);
+    assert!(!journal_path.exists());
+
+    // 混在写脚本里时，脚本写日志，重放时不再导出。
+    let mixed = dir.path().join("混合");
+    let script = format!("set entry title \"新\"\n{}", export_to(&mixed));
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&script);
+    assert!(output.ok, "{}", output.text);
+
+    // 目标已经存在也不影响重放；删掉后重放也不会再出现。
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    fs::remove_dir_all(&mixed).unwrap();
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    assert!(!mixed.exists());
+}
+
+#[test]
+fn export_failure_keeps_the_other_statements() {
+    let (dir, store) = file_store();
+    let target = dir.path().join("导出");
+    let mut memory = memory();
+    let path = dir
+        .path()
+        .join("sources")
+        .join(&source()["sha256:".len()..]);
+    fs::write(&path, "内容被改动").unwrap();
+
+    let script = format!(
+        "set entry title \"新\"\n{}\nset entry desc \"新描述\"",
+        export_to(&target)
+    );
+    let output = run_with(&mut memory, &store, &script);
+
+    assert!(!output.ok);
+    assert!(output.text.contains("error[E902]"), "{}", output.text);
+    assert!(output.text.contains("其余语句都已执行"), "{}", output.text);
+    assert_eq!(memory.node("entry").unwrap().title(), "新");
+    assert_eq!(memory.node("entry").unwrap().description(), "新描述");
+    assert!(!target.exists());
+    let names: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(names.len(), 1, "不应该留下临时目录：{names:?}");
+}
+
+/// 检查阶段预测的结果必须和实际执行一致；导出成功的知识库必须能读回来，内容不变。
+#[test]
+fn random_scripts_export_exactly_what_execution_produces() {
+    let (dir, store) = file_store();
+    let source = source();
+    let mut random = Random(0x0fed_cba9_8765_4321);
+    let (mut exported, mut refused) = (0, 0);
+
+    for round in 0..80 {
+        let mut live = memory();
+        // 随机语句很少让节点走不到，一半的轮次从走不到的状态开始。
+        if round % 2 == 1 {
+            assert!(run_with(&mut live, &store, "unlink ownership -> borrowing").ok);
+        }
+        for step in 0..20 {
+            let mut script = String::new();
+            for _ in 0..1 + random.next() % 4 {
+                script.push_str(&random_statement(&mut random, &source));
+                script.push('\n');
+            }
+            let target = dir.path().join(format!("导出{round}-{step}"));
+            let with_export = format!("{script}{}\n", export_to(&target));
+
+            let (tokens, lexer_errors) = lexer::tokenize(&with_export);
+            let (statements, parse_errors) = parser::parse(tokens);
+            assert!(
+                lexer_errors.is_empty() && parse_errors.is_empty(),
+                "{script}"
+            );
+            let errors = check::check(&statements, &live, &store, Mode::ReadWrite);
+            if errors.iter().any(|error| error.code != "E217") {
+                continue;
+            }
+
+            if let Some(error) = errors.first() {
+                refused += 1;
+                let hint = error.hint.as_deref().unwrap();
+                let (_, listed) = hint.split_once("删除：").unwrap();
+                assert!(run_with(&mut live, &store, &script).ok, "{script}");
+                assert_eq!(live.unreachable().join(", "), listed, "{script}");
+                assert!(!target.exists());
+            } else {
+                exported += 1;
+                let output = run_with(&mut live, &store, &with_export);
+                assert!(output.ok, "{script}\n{}", output.text);
+                assert_eq!(same_content(&load_exported(&target)), same_content(&live));
+            }
+        }
+    }
+
+    assert!(exported > 100 && refused > 100, "{exported} {refused}");
+}
+
+#[test]
+fn load_current_includes_the_journal() {
+    let dir = TempDir::new().unwrap();
+    let store = crate::source::file::FileSources::new(dir.path());
+    let mut memory = crate::lang::journal::load_current(
+        &crate::parse::json::JsonParser,
+        &crate::source::file::FileSources::new(demo_path()),
+        demo_path(),
+    )
+    .unwrap();
+    let target = dir.path().join("知识库");
+    let output = Session::new(
+        &mut memory,
+        &crate::source::file::FileSources::new(demo_path()),
+        Mode::ReadWrite,
+    )
+    .run(&export_to(&target));
+    assert!(output.ok, "{}", output.text);
+
+    let exported = crate::source::file::FileSources::new(&target);
+    let journal = Journal::new(&target);
+    let mut live = load_exported(&target);
+    let output = Session::new(&mut live, &exported, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run("set ownership title \"新标题\"");
+    assert!(output.ok, "{}", output.text);
+    drop(store);
+
+    let loaded =
+        crate::lang::journal::load_current(&crate::parse::json::JsonParser, &exported, &target)
+            .unwrap();
+    assert_eq!(loaded.node("ownership").unwrap().title(), "新标题");
+    assert_eq!(
+        load_exported(&target).node("ownership").unwrap().title(),
+        "所有权"
+    );
+}
+
+fn demo_path() -> &'static std::path::Path {
+    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"))
+}
+
+#[test]
+fn truncated_errors_do_not_claim_the_script_ran() {
+    let mut memory = memory();
+    let long = "地".repeat(60);
+    let script: String = (0..1000).map(|_| format!("show {long}\n")).collect();
+
+    let output = read(&mut memory, &script);
+
+    assert!(
+        output.text.contains("脚本没有执行"),
+        "{}",
+        output.text.len()
+    );
+    assert!(!output.text.contains("语句都已执行"));
 }

@@ -12,7 +12,19 @@ use serde::{Deserialize, Serialize};
 use super::{Mode, Session};
 use crate::error::Error;
 use crate::memory::Memory;
+use crate::parse::Parser;
 use crate::source::SourceStore;
+
+/// 读出知识库的当前状态：先解析快照，再重放日志。只调用 [`Memory::load`] 得到的是最初的状态。
+pub fn load_current(
+    parser: &dyn Parser,
+    sources: &dyn SourceStore,
+    knowledge_base: &Path,
+) -> Result<Memory, Error> {
+    let mut memory = Memory::load(parser, sources, knowledge_base)?;
+    Journal::new(knowledge_base).replay(&mut memory, sources)?;
+    Ok(memory)
+}
 
 #[derive(Serialize, Deserialize)]
 struct Entry {

@@ -4,13 +4,15 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
-use memweave::lang::journal::Journal;
+use memweave::export::json::JsonExporter;
+use memweave::export::{self, Exporter};
+use memweave::lang::journal::{self, Journal};
 use memweave::lang::{self, Mode, Session};
 use memweave::memory::Memory;
 use memweave::model::Model;
 use memweave::model::anthropic::{self, AnthropicModel};
 use memweave::model::deepseek::{self, DeepSeekModel};
-use memweave::parse::json::{self, JsonParser};
+use memweave::parse::json::JsonParser;
 use memweave::retrieve::retrieve;
 use memweave::source::file::FileSources;
 use memweave::weave::Weaver;
@@ -75,14 +77,16 @@ fn run_query(kb: &str, query: &str) -> Result<String, String> {
 fn run_weave(input: &str, kb: &str) -> Result<String, String> {
     let target = Path::new(kb);
     // 先确认能写入：目标不可用时不必调用模型。
-    json::check_target(target).map_err(|e| e.to_string())?;
+    export::check_target(target).map_err(|e| e.to_string())?;
     let model = connect_model()?;
     let woven = TextWeaver
         .weave(Path::new(input), model.as_ref())
         .map_err(|e| e.to_string())?;
     let sections = woven.knowledge.catalog.sections.len();
     let memory = Memory::from_parsed(woven.knowledge, &woven.sources).map_err(|e| e.to_string())?;
-    json::save(&memory, &woven.sources, target).map_err(|e| e.to_string())?;
+    JsonExporter
+        .export(&memory, &woven.sources, target)
+        .map_err(|e| e.to_string())?;
     Ok(format!(
         "已生成 {} 个节点、{sections} 个板块，写入 {kb}",
         memory.node_count()
@@ -158,12 +162,7 @@ fn lock_for_writing(path: &Path) -> Result<File, String> {
 /// 加载知识库，并重放写入日志，恢复上次的修改。
 fn load_memory(kb: &str) -> Result<Memory, String> {
     let path = Path::new(kb);
-    let sources = FileSources::new(path);
-    let mut memory = Memory::load(&JsonParser, &sources, path).map_err(|e| e.to_string())?;
-    Journal::new(path)
-        .replay(&mut memory, &sources)
-        .map_err(|e| e.to_string())?;
-    Ok(memory)
+    journal::load_current(&JsonParser, &FileSources::new(path), path).map_err(|e| e.to_string())
 }
 
 /// 根据环境变量创建模型。接入新厂商时，在这里加一个分支。

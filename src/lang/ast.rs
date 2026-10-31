@@ -68,6 +68,7 @@ pub enum Statement {
         section: Label,
     },
     Check,
+    Export(Label),
     Show(Name),
     Links {
         id: Name,
@@ -121,7 +122,13 @@ impl Statement {
                 | Statement::BasedBy(_)
                 | Statement::RelatedBy(_)
                 | Statement::FullSource { .. }
+                | Statement::Export(_)
         )
+    }
+
+    /// 只读会话能不能执行。`export` 不改图，不写日志，但会写磁盘，所以也要写权限。
+    pub fn needs_write_session(&self) -> bool {
+        self.writes() || matches!(self, Statement::Export(_))
     }
 }
 

@@ -1,8 +1,8 @@
 //! 模型操作记忆用的指令语言。
 //!
 //! 一段脚本依次经过词法分析、语法分析和语义检查，全部通过才开始执行。写错时返回和编译器一样的
-//! 报错，记忆完全不变。语言里没有内存地址和文件路径，所以从语法上就碰不到它们：模型只能用文本
-//! 地址引用节点，地址是否存在由 C++ 的 set 回答。
+//! 报错，记忆完全不变。语言里没有内存地址，所以从语法上就碰不到它：模型只能用文本地址引用节点，
+//! 地址是否存在由 C++ 的 set 回答。只有 `export` 会写文件路径，它只会新建目录，不会覆盖已有内容。
 
 pub mod ast;
 pub mod check;
@@ -66,6 +66,7 @@ set 节点 title "新标题"
 set 节点 desc """新描述"""
 base 结论 on 依据
 unbase 结论 on 依据
+export "路径"                             把当前记忆导出成新的知识库目录，只带节点引用到的原文
 
 规则：
 - add 必须有 title、desc、based_on。
@@ -78,6 +79,7 @@ unbase 结论 on 依据
 - 还有结论依据某个节点时不能删除它。先用 base 和 unbase 给这些结论换依据，或者先删除它们，可以写在同一段脚本里。
 - 修改描述后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
 - 删除节点或减少关联后，可能有节点走不到了，用 check 确认。
+- export 的目标必须不存在或是空目录，不会覆盖。有节点走不到时会拒绝导出并列出它们，接入或删除后再导出。
 "####;
 
 /// 会话的权限。
@@ -166,15 +168,15 @@ impl<'a> Session<'a> {
         }
 
         match exec::execute(&statements, self.memory, self.sources) {
-            Ok(report) if report.read_failures == 0 => Output {
+            Ok(report) if report.failures == 0 => Output {
                 ok: true,
                 text: limit_output(report.text),
             },
             Ok(report) => Output {
                 ok: false,
                 text: limit_output(format!(
-                    "{}有 {} 条读取失败，其余语句都已执行。",
-                    report.text, report.read_failures
+                    "{}有 {} 条语句失败，其余语句都已执行。",
+                    report.text, report.failures
                 )),
             },
             // 检查已经通过，只有内存不足才会走到这里。
@@ -243,11 +245,21 @@ impl Session<'_> {
 fn failure(errors: &[Diagnostic], script: &str) -> Output {
     Output {
         ok: false,
-        text: limit_output(render(errors, script)),
+        text: truncate(
+            render(errors, script),
+            "\n（输出超过上限，后面的内容被截断了。脚本没有执行。）",
+        ),
     }
 }
 
-fn limit_output(mut text: String) -> String {
+fn limit_output(text: String) -> String {
+    truncate(
+        text,
+        "\n（输出超过上限，后面的内容被截断了。语句都已执行，可以用 limit 或分多次查看。）",
+    )
+}
+
+fn truncate(mut text: String, note: &str) -> String {
     if text.len() <= MAX_OUTPUT_BYTES {
         return text;
     }
@@ -256,9 +268,7 @@ fn limit_output(mut text: String) -> String {
         end -= 1;
     }
     text.truncate(end);
-    text.push_str(
-        "\n（输出超过上限，后面的内容被截断了。语句都已执行，可以用 limit 或分多次查看。）",
-    );
+    text.push_str(note);
     text
 }
 

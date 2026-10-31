@@ -4,9 +4,12 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
+use std::path::Path;
 
 use super::ast::{AddNode, Field, Located, Statement};
 use crate::error::Error;
+use crate::export::Exporter;
+use crate::export::json::JsonExporter;
 use crate::knowledge::{Evidence, Locator, Node};
 use crate::memory::{Memory, NodeRef, RemovedNode};
 use crate::source::{LoadedEvidence, SourceStore, source_id};
@@ -17,8 +20,8 @@ const MANY_REPRESENTATIVES: usize = 5;
 /// 执行结果。
 pub struct Report {
     pub text: String,
-    /// 读取失败的语句数。读取失败不影响后面的语句，这样实际效果才和重放日志一致。
-    pub read_failures: usize,
+    /// 读取或导出失败的语句数。它们不影响后面的语句，这样实际效果才和重放日志一致。
+    pub failures: usize,
 }
 
 /// 依次执行语句。`Err` 里的 usize 是已经执行完的语句数，只有内存不足这类意外才会走到那里。
@@ -29,7 +32,7 @@ pub fn execute(
 ) -> Result<Report, (usize, String, Error)> {
     let mut report = Report {
         text: String::new(),
-        read_failures: 0,
+        failures: 0,
     };
     for (done, located) in statements.iter().enumerate() {
         if let Err(error) = statement(&located.statement, memory, sources, &mut report) {
@@ -48,6 +51,24 @@ fn statement(
     let output = &mut report.text;
     match statement {
         Statement::CatalogShow => render_catalog(memory, output),
+        Statement::Export(path) => {
+            match JsonExporter.export(memory, sources, Path::new(&path.text)) {
+                Ok(exported) => {
+                    let _ = writeln!(
+                        output,
+                        "exported {} nodes, {} sections, {} sources to {}",
+                        exported.nodes,
+                        exported.sections,
+                        exported.sources,
+                        quote(&path.text)
+                    );
+                }
+                Err(error) => {
+                    report.failures += 1;
+                    let _ = writeln!(output, "error[E902] 导出失败，目标目录没有变化：{error}");
+                }
+            }
+        }
         Statement::CatalogCreate { name, description } => {
             memory.catalog_create(&name.text, &description.text)?;
             let _ = writeln!(output, "created section {}", quote(&name.text));
@@ -113,7 +134,7 @@ fn statement(
         Statement::Check => render_check(memory, output),
         Statement::Show(id) => {
             let node = existing(memory, &id.text)?;
-            render_node(node, sources, output, &mut report.read_failures);
+            render_node(node, sources, output, &mut report.failures);
         }
         Statement::Links { id, depth, limit } => {
             render_links(existing(memory, &id.text)?, *depth, *limit, output);
@@ -121,7 +142,7 @@ fn statement(
         Statement::Evidence(id) => match memory.evidence(&id.text, sources) {
             Ok(evidence) => render_evidence(&id.text, evidence, output),
             Err(error) => {
-                report.read_failures += 1;
+                report.failures += 1;
                 let _ = writeln!(output, "error[E901] evidence {} 读取失败：{error}", id.text);
             }
         },
@@ -141,14 +162,7 @@ fn statement(
         }
         Statement::FullSource { id, offset, limit } => {
             let node = existing(memory, &id.text)?;
-            render_full_source(
-                node,
-                *offset,
-                *limit,
-                sources,
-                output,
-                &mut report.read_failures,
-            );
+            render_full_source(node, *offset, *limit, sources, output, &mut report.failures);
         }
         Statement::Add(add) | Statement::Source(add) => {
             let (node, related_by) = build_node(add);
@@ -276,7 +290,7 @@ fn render_node(
     node: NodeRef<'_>,
     sources: &dyn SourceStore,
     output: &mut String,
-    read_failures: &mut usize,
+    failures: &mut usize,
 ) {
     let _ = writeln!(output, "node {}", node.id());
     let _ = writeln!(output, "  title: {}", quote(node.title()));
@@ -298,7 +312,7 @@ fn render_node(
                     );
                 }
                 Err(error) => {
-                    *read_failures += 1;
+                    *failures += 1;
                     let _ = writeln!(output, "  source: {source} {start}..{end}");
                     let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
                 }
@@ -314,7 +328,7 @@ fn render_full_source(
     limit: usize,
     sources: &dyn SourceStore,
     output: &mut String,
-    read_failures: &mut usize,
+    failures: &mut usize,
 ) {
     let _ = writeln!(output, "full_source {}", node.id());
     let mut seen = HashSet::new();
@@ -328,14 +342,14 @@ fn render_full_source(
         let bytes = match sources.read_all(&source) {
             Ok(bytes) => bytes,
             Err(error) => {
-                *read_failures += 1;
+                *failures += 1;
                 let _ = writeln!(output, "  source: {source}");
                 let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
                 continue;
             }
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            *read_failures += 1;
+            *failures += 1;
             let _ = writeln!(output, "  source: {source}");
             let _ = writeln!(output, "error[E901] 这份原文不是文本，无法显示");
             continue;

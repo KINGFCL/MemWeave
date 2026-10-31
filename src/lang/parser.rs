@@ -4,9 +4,10 @@ use super::ast::{AddNode, Field, Label, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-const KEYWORDS: [&str; 16] = [
+const KEYWORDS: [&str; 17] = [
     "catalog",
     "check",
+    "export",
     "show",
     "links",
     "evidence",
@@ -100,6 +101,7 @@ impl Parser {
         self.position += 1;
         let statement = match keyword.as_str() {
             "catalog" => self.catalog(token)?,
+            "export" => Statement::Export(self.label("导出路径")?),
             "check" => Statement::Check,
             "show" => Statement::Show(self.name("节点地址")?),
             "evidence" => Statement::Evidence(self.name("节点地址")?),
@@ -233,7 +235,7 @@ impl Parser {
             }
             _ => self.fail(
                 Diagnostic::new("E102", self.current_span(), format!("这里应该写{what}"))
-                    .with_hint("要写在引号里，比如 \"咖啡\""),
+                    .with_hint("要写在引号里"),
             ),
         }
     }
