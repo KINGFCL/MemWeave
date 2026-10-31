@@ -1,0 +1,17 @@
+{
+  "sections": [
+    {
+      "name": "Rust 内存管理",
+      "nodes": [
+        { "id": "ownership", "title": "所有权" },
+        { "id": "borrowing", "title": "借用" }
+      ]
+    },
+    {
+      "name": "Rust 并发",
+      "nodes": [
+        { "id": "send-sync", "title": "Send 与 Sync" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "id": "drop",
+  "title": "Drop 与资源释放",
+  "raw": "值被释放时会调用其 Drop 实现，字段按声明顺序依次释放，局部变量按声明的逆序释放。",
+  "understanding": "Drop 让文件句柄、锁等资源也能跟随所有权自动释放，这就是 Rust 中的 RAII。",
+  "related": ["ownership"]
+}

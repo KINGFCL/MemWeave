@@ -1,0 +1,7 @@
+{
+  "id": "send-sync",
+  "title": "Send 与 Sync",
+  "raw": "实现 Send 的类型可以把所有权转移到其他线程；当 &T 是 Send 时，T 是 Sync，即可以在线程间共享引用。两者都是自动派生的标记 trait。",
+  "understanding": "这两个 trait 把借用规则延伸到了线程之间，让大多数数据竞争变成编译错误。",
+  "related": ["borrowing"]
+}
