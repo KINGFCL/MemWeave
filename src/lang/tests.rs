@@ -949,7 +949,7 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
         "r",
         "ghost",
     ];
-    let store = sources();
+    let (_dir, store) = file_store();
     let source = source();
     let mut random = Random(0x1234_5678_9abc_def1);
     let mut accepted = 0;
@@ -964,7 +964,11 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
                 let a = IDS[random.next() % IDS.len()];
                 let b = IDS[random.next() % IDS.len()];
                 let c = IDS[random.next() % IDS.len()];
-                let statement = match random.next() % 12 {
+                let statement = match random.next() % 14 {
+                    12 => format!(
+                        "source {a}\n title \"t\"\n desc \"d\"\n text \"\"\"原文{b}\"\"\"\n related {c}\n section \"s\"\nend"
+                    ),
+                    13 => format!("full_source {a}"),
                     0 => format!("show {a}"),
                     1 => format!("evidence {a}"),
                     2 => "check".to_owned(),
@@ -1009,4 +1013,273 @@ fn whatever_passes_the_check_executes_and_replays_exactly() {
     // 确认这个测试真的走到了两种情况。
     assert!(accepted > 500, "只接受了 {accepted} 段");
     assert!(rejected > 500, "只拒绝了 {rejected} 段");
+}
+
+/// 能写入新原文的来源，里面已经有测试用的那份原文。
+fn file_store() -> (TempDir, crate::source::file::FileSources) {
+    let dir = TempDir::new().unwrap();
+    let store = crate::source::file::FileSources::new(dir.path());
+    store.put(TEXT.as_bytes()).unwrap();
+    (dir, store)
+}
+
+fn run_with(memory: &mut Memory, store: &crate::source::file::FileSources, script: &str) -> Output {
+    Session::new(memory, store, Mode::ReadWrite).run(script)
+}
+
+const NEW_SOURCE: &str = "source 观察\n  title \"观察\"\n  desc \"\"\"用户说咖啡因半衰期约五小时。\"\"\"\n  text \"\"\"用户说：咖啡因的半衰期约五小时。\"\"\"\n  related_by entry\nend";
+
+#[test]
+fn source_stores_the_text_and_creates_a_node_pointing_at_it() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+
+    let output = run_with(&mut memory, &store, &format!("{NEW_SOURCE}\nshow 观察"));
+
+    assert!(output.ok, "{}", output.text);
+    let id = source_id("用户说：咖啡因的半衰期约五小时。".as_bytes());
+    assert!(
+        output.text.contains(&format!("source: {id} 0..48")),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("based_on: 无"), "{}", output.text);
+    assert!(
+        output.text.contains("用户说：咖啡因的半衰期约五小时。"),
+        "{}",
+        output.text
+    );
+    assert_eq!(store.size(&id).unwrap(), Some(48));
+    assert!(
+        memory
+            .node("entry")
+            .unwrap()
+            .related()
+            .any(|n| n.id() == "观察")
+    );
+}
+
+#[test]
+fn source_is_written_before_it_is_needed_and_survives_a_restart() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(NEW_SOURCE);
+    assert!(output.ok, "{}", output.text);
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+
+    // 原文文件丢了，也能从日志恢复。
+    let id = source_id("用户说：咖啡因的半衰期约五小时。".as_bytes());
+    let hash = id.strip_prefix("sha256:").unwrap();
+    fs::remove_file(dir.path().join("sources").join(hash)).unwrap();
+    let mut recovered = memory();
+    journal.replay(&mut recovered, &store).unwrap();
+    assert_eq!(store.size(&id).unwrap(), Some(48));
+}
+
+#[test]
+fn the_same_text_is_stored_once() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let count = || fs::read_dir(dir.path().join("sources")).unwrap().count();
+    let before = count();
+
+    let script = "source a\n title \"t\"\n desc \"d\"\n text \"同一段\"\n section \"s\"\nend\nsource b\n title \"t\"\n desc \"d\"\n text \"同一段\"\n section \"s\"\nend";
+    let output = run_with(&mut memory, &store, script);
+
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(count(), before + 1);
+}
+
+#[test]
+fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let before = snapshot(&memory);
+    let files = || fs::read_dir(dir.path().join("sources")).unwrap().count();
+    let count = files();
+    let body = "title \"t\"\n desc \"d\"";
+    let cases = [
+        ("E206", format!("source n\n {body}\n section \"s\"\nend")),
+        (
+            "E206",
+            format!("source n\n {body}\n text \"  \"\n section \"s\"\nend"),
+        ),
+        (
+            "E206",
+            "source n\n text \"x\"\n section \"s\"\nend".to_owned(),
+        ),
+        ("E208", format!("source n\n {body}\n text \"新原文\"\nend")),
+        (
+            "E205",
+            format!("source entry\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+        ),
+        (
+            "E204",
+            format!("source a:b\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+        ),
+        (
+            "E201",
+            format!("source n\n {body}\n text \"新原文\"\n related ghost\n section \"s\"\nend"),
+        ),
+        (
+            "E104",
+            format!("source n\n {body}\n text \"新原文\"\n based_on entry\n section \"s\"\nend"),
+        ),
+        (
+            "E104",
+            format!(
+                "source n\n {body}\n text \"新原文\"\n source {} 0..3\n section \"s\"\nend",
+                source()
+            ),
+        ),
+        (
+            "E104",
+            format!("add n\n {body}\n text \"新原文\"\n section \"s\"\nend"),
+        ),
+        (
+            "E105",
+            format!("source n\n {body}\n text \"a\"\n text \"b\"\n section \"s\"\nend"),
+        ),
+        (
+            "E103",
+            format!("source n\n {body}\n text \"新原文\"\n section \"s\"\n"),
+        ),
+    ];
+
+    for (code, script) in cases {
+        let output = run_with(&mut memory, &store, &script);
+        assert!(!output.ok, "{script}");
+        assert!(
+            output.text.contains(&format!("error[{code}]")),
+            "{code}：{}",
+            output.text
+        );
+    }
+
+    assert_eq!(snapshot(&memory), before);
+    assert_eq!(files(), count, "报错时不能写入原文");
+}
+
+#[test]
+fn read_only_sessions_cannot_store_sources() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    let count = fs::read_dir(dir.path().join("sources")).unwrap().count();
+
+    let output = Session::new(&mut memory, &store, Mode::ReadOnly).run(NEW_SOURCE);
+
+    assert!(output.text.contains("error[E301]"), "{}", output.text);
+    assert_eq!(
+        fs::read_dir(dir.path().join("sources")).unwrap().count(),
+        count
+    );
+}
+
+#[test]
+fn failing_to_store_a_source_changes_nothing() {
+    // InMemorySources 不支持写入。
+    let mut memory = memory();
+    let before = snapshot(&memory);
+
+    let output = write(&mut memory, NEW_SOURCE);
+
+    assert!(!output.ok);
+    assert!(output.text.contains("写入原文失败"), "{}", output.text);
+    assert_eq!(snapshot(&memory), before);
+}
+
+#[test]
+fn full_source_shows_the_whole_file_not_just_the_range() {
+    let mut memory = memory();
+
+    // ownership 的证据只引用了 0..3，也就是第一个字。
+    let shown = read(&mut memory, "show ownership").text;
+    assert!(shown.contains(": \"一\""), "{shown}");
+
+    let text = read(&mut memory, "full_source ownership").text;
+
+    assert!(text.contains(&format!("\"{TEXT}\"")), "{text}");
+    assert!(text.contains(&format!("共 {} 字节", TEXT.len())), "{text}");
+    assert!(!text.contains("还没有显示完"), "{text}");
+}
+
+#[test]
+fn full_source_can_page_through_a_large_file() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let long = "长文".repeat(100_000);
+    let script = format!(
+        "source 长\n title \"t\"\n desc \"d\"\n text \"\"\"{long}\"\"\"\n section \"s\"\nend"
+    );
+    assert!(run_with(&mut memory, &store, &script).ok);
+
+    let mut collected = String::new();
+    let mut offset = 0;
+    for _ in 0..100 {
+        let output = Session::new(&mut memory, &store, Mode::ReadOnly)
+            .run(&format!("full_source 长 offset {offset} limit 100000"));
+        assert!(output.ok, "{}", &output.text[..200]);
+        let quoted = output.text.split_once(": \"").unwrap().1;
+        let end = quoted.rfind('"').unwrap();
+        collected.push_str(&quoted[..end]);
+        match output.text.rsplit_once("offset ") {
+            Some((_, next)) => offset = next.trim().parse().unwrap(),
+            None => break,
+        }
+    }
+
+    assert_eq!(collected, long);
+}
+
+#[test]
+fn full_source_lists_each_file_once_and_handles_nodes_without_sources() {
+    let mut memory = memory();
+    let two_ranges = format!(
+        "add 两段\n title \"t\"\n desc \"d\"\n source {0} 0..3\n source {0} 3..6\n section \"s\"\nend",
+        source()
+    );
+    ok(&mut memory, &two_ranges);
+
+    let once = read(&mut memory, "full_source 两段").text;
+    assert_eq!(once.matches("共 ").count(), 1, "{once}");
+
+    let none = read(&mut memory, "full_source conclusion").text;
+    assert!(none.contains("没有直接指向原文"), "{none}");
+}
+
+#[test]
+fn full_source_reports_a_damaged_file_and_never_splits_a_character() {
+    let mut memory = memory();
+    let empty = InMemorySources::new();
+    let output =
+        Session::new(&mut memory, &empty, Mode::ReadOnly).run("full_source ownership\ncatalog");
+    assert!(!output.ok);
+    assert!(output.text.contains("error[E901]"), "{}", output.text);
+    assert!(output.text.contains("section \"Rust\""), "{}", output.text);
+
+    // 这份原文全是三字节的汉字：起点切在字符中间、limit 比一个字符还小，都不能崩溃或卡住。
+    let text = read(&mut memory, "full_source ownership offset 1 limit 1").text;
+    assert!(text.contains("显示 0..3"), "{text}");
+    let text = read(&mut memory, "full_source ownership offset 999999").text;
+    assert!(
+        text.contains(&format!("显示 {0}..{0}", TEXT.len())),
+        "{text}"
+    );
+}
+
+#[test]
+fn full_source_limit_is_checked() {
+    let mut memory = memory();
+
+    fails(&mut memory, "full_source ownership limit 0", "E109");
+    fails(&mut memory, "full_source ownership limit 999999", "E109");
+    fails(&mut memory, "full_source ghost", "E201");
+    fails(&mut memory, "full_source", "E102");
 }

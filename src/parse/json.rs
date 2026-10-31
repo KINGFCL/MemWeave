@@ -9,6 +9,7 @@ use super::{ParsedKnowledge, Parser};
 use crate::error::Error;
 use crate::knowledge::{Catalog, Node};
 use crate::memory::Memory;
+use crate::source::SourceStore;
 use crate::source::file::FileSources;
 use crate::source::in_memory::InMemorySources;
 
@@ -140,7 +141,7 @@ mod tests {
 
     use super::*;
     use crate::knowledge::{Evidence, Locator};
-    use crate::source::{LoadedEvidence, SourceStore, source_id};
+    use crate::source::{LoadedEvidence, source_id};
 
     const CATALOG: &str = r#"{"sections":[{"name":"板块","nodes":[{"id":"a","title":"A"}]}]}"#;
 

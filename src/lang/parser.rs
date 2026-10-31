@@ -4,7 +4,7 @@ use super::ast::{AddNode, Field, Located, Name, SourceRef, Statement};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-const KEYWORDS: [&str; 14] = [
+const KEYWORDS: [&str; 16] = [
     "catalog",
     "check",
     "show",
@@ -12,7 +12,9 @@ const KEYWORDS: [&str; 14] = [
     "evidence",
     "based_by",
     "related_by",
+    "full_source",
     "add",
+    "source",
     "remove",
     "link",
     "unlink",
@@ -30,6 +32,18 @@ const ADD_CLAUSES: [&str; 8] = [
     "section",
     "end",
 ];
+const SOURCE_CLAUSES: [&str; 7] = [
+    "title",
+    "desc",
+    "text",
+    "related",
+    "related_by",
+    "section",
+    "end",
+];
+/// `full_source` 每个文件默认和最多显示多少字节。最大值小于输出上限，所以总能看到下一段的位置。
+const DEFAULT_SOURCE_LIMIT: usize = 64 * 1024;
+const MAX_SOURCE_LIMIT: usize = 128 * 1024;
 const DEFAULT_LINK_LIMIT: usize = 50;
 const MAX_LINK_LIMIT: usize = 1000;
 const MAX_LINK_DEPTH: usize = 5;
@@ -107,7 +121,9 @@ impl Parser {
                 let (id, on) = self.on()?;
                 Statement::Unbase { id, on }
             }
-            "add" => return self.add(),
+            "full_source" => self.full_source()?,
+            "add" => return self.add("add"),
+            "source" => return self.add("source"),
             other => {
                 let mut error =
                     Diagnostic::new("E101", token.span, format!("没有 {other} 这条指令"));
@@ -213,9 +229,39 @@ impl Parser {
         })
     }
 
-    fn add(&mut self) -> Result<Statement, Skip> {
+    fn full_source(&mut self) -> Result<Statement, Skip> {
+        let id = self.name("节点地址")?;
+        let mut offset = 0;
+        let mut limit = DEFAULT_SOURCE_LIMIT;
+        while let Some(token) = self.peek_word() {
+            let span = token.span;
+            match word_of(&token).as_str() {
+                "offset" => {
+                    self.position += 1;
+                    offset = self.number("起始位置")?;
+                }
+                "limit" => {
+                    self.position += 1;
+                    limit = self.number("字节数")?;
+                    if limit == 0 || limit > MAX_SOURCE_LIMIT {
+                        return self.fail(Diagnostic::new(
+                            "E109",
+                            span,
+                            format!("limit 必须在 1 到 {MAX_SOURCE_LIMIT} 之间"),
+                        ));
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::FullSource { id, offset, limit })
+    }
+
+    /// `add` 和 `source` 写法相同：`source` 多一个必填的 `text`，不能写别的证据。
+    fn add(&mut self, keyword: &str) -> Result<Statement, Skip> {
         let id = self.name("新节点的地址")?;
         self.end_of_line()?;
+        let is_source = keyword == "source";
         let mut add = AddNode {
             id,
             title: None,
@@ -225,6 +271,14 @@ impl Parser {
             related: Vec::new(),
             related_by: Vec::new(),
             section: None,
+            text: None,
+        };
+        let finish = |add: AddNode| {
+            if is_source {
+                Statement::Source(Box::new(add))
+            } else {
+                Statement::Add(Box::new(add))
+            }
         };
         loop {
             self.skip_newlines();
@@ -233,11 +287,11 @@ impl Parser {
                     Diagnostic::new(
                         "E103",
                         add.id.span,
-                        format!("add {} 没有写 end", add.id.text),
+                        format!("{keyword} {} 没有写 end", add.id.text),
                     )
-                    .with_hint("add 的最后一行要写 end"),
+                    .with_hint(format!("{keyword} 的最后一行要写 end")),
                 );
-                return Ok(Statement::Add(Box::new(add)));
+                return Ok(finish(add));
             };
             let clause = word_of(&token);
             if clause == "end" {
@@ -245,27 +299,44 @@ impl Parser {
                 if self.end_of_line().is_err() {
                     self.skip_line();
                 }
-                return Ok(Statement::Add(Box::new(add)));
+                return Ok(finish(add));
             }
-            if self.clause(&mut add, &clause, &token).is_err() {
+            if self.clause(&mut add, keyword, &clause, &token).is_err() {
                 self.skip_line();
             }
         }
     }
 
-    fn clause(&mut self, add: &mut AddNode, clause: &str, token: &Token) -> Result<(), Skip> {
-        if !ADD_CLAUSES.contains(&clause) {
+    fn clause(
+        &mut self,
+        add: &mut AddNode,
+        keyword: &str,
+        clause: &str,
+        token: &Token,
+    ) -> Result<(), Skip> {
+        let allowed: &[&'static str] = if keyword == "source" {
+            &SOURCE_CLAUSES
+        } else {
+            &ADD_CLAUSES
+        };
+        if !allowed.contains(&clause) {
             let mut error = Diagnostic::new(
                 "E104",
                 token.span,
-                format!("add 里不能写 {}", describe(token)),
+                format!("{keyword} 里不能写 {}", describe(token)),
             );
-            error = match closest(clause, ADD_CLAUSES.into_iter()) {
-                Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
-                None => error.with_hint(format!(
-                    "add 里可以写：{}。是不是忘了写 end？",
-                    ADD_CLAUSES.join("、")
-                )),
+            error = match (keyword, clause) {
+                ("source", "source" | "based_on") => error.with_hint(
+                    "source 节点只靠 text 里的原文。要引用已有的原文或别的节点，请用 add",
+                ),
+                ("add", "text") => error.with_hint("要存入新的原文，请用 source 语句，而不是 add"),
+                _ => match closest(clause, allowed.iter().copied()) {
+                    Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
+                    None => error.with_hint(format!(
+                        "{keyword} 里可以写：{}。是不是忘了写 end？",
+                        allowed.join("、")
+                    )),
+                },
             };
             return self.fail(error);
         }
@@ -278,6 +349,10 @@ impl Parser {
             "desc" => {
                 let value = self.text()?;
                 self.once(&mut add.description, value, token.span, "desc")?;
+            }
+            "text" => {
+                let value = self.text()?;
+                self.once(&mut add.text, value, token.span, "text")?;
             }
             "section" => {
                 let value = self.text()?;

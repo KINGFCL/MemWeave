@@ -27,6 +27,8 @@ pub struct AddNode {
     pub related: Vec<Name>,
     pub related_by: Vec<Name>,
     pub section: Option<String>,
+    /// `source` 语句写入的原文。`add` 里没有这一项。
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +50,13 @@ pub enum Statement {
     Evidence(Name),
     BasedBy(Name),
     RelatedBy(Name),
+    FullSource {
+        id: Name,
+        offset: usize,
+        limit: usize,
+    },
     Add(Box<AddNode>),
+    Source(Box<AddNode>),
     Remove(Name),
     Link {
         from: Name,
@@ -85,6 +93,7 @@ impl Statement {
                 | Statement::Evidence(_)
                 | Statement::BasedBy(_)
                 | Statement::RelatedBy(_)
+                | Statement::FullSource { .. }
         )
     }
 }

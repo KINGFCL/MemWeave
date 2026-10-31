@@ -1419,6 +1419,10 @@ mod tests {
             fn read(&self, _id: &str, _locator: &Locator) -> Result<String, Error> {
                 panic!("校验时不应该读取来源内容");
             }
+
+            fn read_all(&self, _id: &str) -> Result<Vec<u8>, Error> {
+                panic!("校验时不应该读取来源内容");
+            }
         }
 
         let counting = CountingSources {
@@ -1444,6 +1448,10 @@ mod tests {
             }
 
             fn read(&self, _id: &str, _locator: &Locator) -> Result<String, Error> {
+                unreachable!()
+            }
+
+            fn read_all(&self, _id: &str) -> Result<Vec<u8>, Error> {
                 unreachable!()
             }
         }

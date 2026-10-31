@@ -9,7 +9,7 @@ use super::ast::{AddNode, Field, Located, Statement};
 use crate::error::Error;
 use crate::knowledge::{Evidence, Locator, Node};
 use crate::memory::{Memory, NodeRef, Placement, RemovedNode};
-use crate::source::{LoadedEvidence, SourceStore};
+use crate::source::{LoadedEvidence, SourceStore, source_id};
 
 /// 执行结果。
 pub struct Report {
@@ -74,10 +74,36 @@ fn statement(
                 .collect();
             let _ = writeln!(output, "related_by {}: {}", id.text, join_ids(&ids));
         }
+        Statement::FullSource { id, offset, limit } => {
+            let node = existing(memory, &id.text)?;
+            render_full_source(
+                node,
+                *offset,
+                *limit,
+                sources,
+                output,
+                &mut report.read_failures,
+            );
+        }
         Statement::Add(add) => {
             let (node, placement) = build_node(add);
             memory.add_node(node, placement, sources)?;
             let _ = writeln!(output, "added {}", add.id.text);
+        }
+        Statement::Source(add) => {
+            let (mut node, placement) = build_node(add);
+            let text = add.text.as_deref().unwrap_or_default();
+            let source = source_id(text.as_bytes());
+            node.evidence = vec![Evidence::Source {
+                source: source.clone(),
+                locator: Locator::TextRange {
+                    start: 0,
+                    end: text.len(),
+                },
+            }];
+            memory.add_node(node, placement, sources)?;
+            let _ = writeln!(output, "added {}", add.id.text);
+            let _ = writeln!(output, "  source: {source} 0..{}", text.len());
         }
         Statement::Remove(id) => {
             let removed = memory.remove_node(&id.text)?;
@@ -211,6 +237,81 @@ fn render_node(
             }
         }
     }
+}
+
+/// 输出节点指向的每个来源文件的完整内容，一个文件在多条证据里出现时只输出一次。
+fn render_full_source(
+    node: NodeRef<'_>,
+    offset: usize,
+    limit: usize,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    read_failures: &mut usize,
+) {
+    let _ = writeln!(output, "full_source {}", node.id());
+    let mut seen = HashSet::new();
+    for evidence in node.evidence() {
+        let Evidence::Source { source, .. } = evidence else {
+            continue;
+        };
+        if !seen.insert(source.clone()) {
+            continue;
+        }
+        let bytes = match sources.read_all(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                *read_failures += 1;
+                let _ = writeln!(output, "  source: {source}");
+                let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
+                continue;
+            }
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            *read_failures += 1;
+            let _ = writeln!(output, "  source: {source}");
+            let _ = writeln!(output, "error[E901] 这份原文不是文本，无法显示");
+            continue;
+        };
+        let start = floor_char_boundary(text, offset);
+        let end = floor_char_boundary(text, start.saturating_add(limit));
+        // limit 小于一个字符时也要往前走，否则永远读不完。
+        let end = if end == start {
+            text[start..]
+                .chars()
+                .next()
+                .map_or(start, |c| start + c.len_utf8())
+        } else {
+            end
+        };
+        let total = text.len();
+        let _ = writeln!(
+            output,
+            "  source: {source} 共 {total} 字节，显示 {start}..{end}: {}",
+            quote(&text[start..end])
+        );
+        if end < total {
+            let _ = writeln!(
+                output,
+                "  note: 还没有显示完，下一段用 full_source {} offset {end}",
+                node.id()
+            );
+        }
+    }
+    if seen.is_empty() {
+        let _ = writeln!(
+            output,
+            "  这个节点没有直接指向原文，用 show 查看 based_on 里的节点"
+        );
+    }
+}
+
+/// 不超过 `index` 的最近的字符边界。
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn render_list<'m>(name: &str, nodes: impl Iterator<Item = NodeRef<'m>>, output: &mut String) {

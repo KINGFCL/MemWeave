@@ -32,6 +32,7 @@ links 节点 [depth N] [limit N]            沿关联往外看，默认 depth 1�
 evidence 节点                             读取证据指向的原文
 based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
 related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
+full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
 check                                    列出从总表走不到的节点
 
 修改：
@@ -44,6 +45,14 @@ add 节点
   related_by 节点, 节点                    哪些节点关联它
   section "板块"                           成为这个板块的代表节点
 end
+source 节点
+  title "标题"
+  desc """描述"""
+  text """原文"""                          把这段文字存成不可变的原文，节点指向它
+  related 节点, 节点
+  related_by 节点, 节点
+  section "板块"
+end
 remove 节点
 link 甲 -> 乙
 unlink 甲 -> 乙
@@ -54,6 +63,7 @@ unbase 结论 on 依据
 
 规则：
 - add 必须有 title、desc，至少一条 source 或 based_on，至少一条 related_by 或 section。
+- source 必须有 title、desc、text，至少一条 related_by 或 section。要记下对话或工具结果里的新内容，就用它。
 - 节点地址只能包含字母、数字、- 和 _，不能修改。
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
@@ -128,6 +138,14 @@ impl<'a> Session<'a> {
             };
         }
 
+        // 新原文要最先写：它们不可变，也不影响图，中途失败最多留下没人引用的文件。
+        if let Err(error) = self.store_new_sources(&statements) {
+            return Output {
+                ok: false,
+                text: format!("写入原文失败，没有执行任何语句：{error}"),
+            };
+        }
+
         // 先落盘再执行：执行到一半崩溃时，重启后重放能恢复。
         if let Some(journal) = self.journal
             && statements.iter().any(|s| s.statement.writes())
@@ -181,6 +199,13 @@ impl Session<'_> {
         if !errors.is_empty() {
             return failure(&errors, script);
         }
+        // 日志里有原文，文件丢了也能恢复。
+        if let Err(error) = self.store_new_sources(&statements) {
+            return Output {
+                ok: false,
+                text: error.to_string(),
+            };
+        }
         match exec::execute(&statements, self.memory, self.sources) {
             Ok(report) => Output {
                 ok: true,
@@ -191,6 +216,19 @@ impl Session<'_> {
                 text: error.to_string(),
             },
         }
+    }
+}
+
+impl Session<'_> {
+    fn store_new_sources(&self, statements: &[ast::Located]) -> Result<(), crate::error::Error> {
+        for located in statements {
+            if let ast::Statement::Source(add) = &located.statement
+                && let Some(text) = &add.text
+            {
+                self.sources.put(text.as_bytes())?;
+            }
+        }
+        Ok(())
     }
 }
 

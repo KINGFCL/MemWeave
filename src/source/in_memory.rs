@@ -39,4 +39,11 @@ impl SourceStore for InMemorySources {
             .ok_or_else(|| Error::Source(format!("来源 {id} 不存在")))?;
         extract(bytes, id, locator)
     }
+
+    fn read_all(&self, id: &str) -> Result<Vec<u8>, Error> {
+        self.sources
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::Source(format!("来源 {id} 不存在")))
+    }
 }

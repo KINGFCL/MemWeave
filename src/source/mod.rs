@@ -24,6 +24,14 @@ pub trait SourceStore {
 
     /// 读取来源中 `locator` 指向的内容。实现必须确认内容与地址里的哈希一致。
     fn read(&self, id: &str, locator: &Locator) -> Result<String, Error>;
+
+    /// 读取来源的完整内容。实现必须确认内容与地址里的哈希一致。
+    fn read_all(&self, id: &str) -> Result<Vec<u8>, Error>;
+
+    /// 写入一份新来源，返回它的地址。内容相同的来源只保存一份，已有的不会被覆盖。
+    fn put(&self, _bytes: &[u8]) -> Result<SourceId, Error> {
+        Err(Error::Source("这里不能写入新来源".to_owned()))
+    }
 }
 
 /// 读取出来的一条证据。

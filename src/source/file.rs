@@ -19,23 +19,6 @@ impl FileSources {
         }
     }
 
-    /// 写入一份来源。内容相同的来源只保存一份，已有的文件不会被覆盖。
-    pub fn put(&self, bytes: &[u8]) -> Result<SourceId, Error> {
-        let id = source_id(bytes);
-        let path = self.path(&id)?;
-        if path.exists() {
-            return Ok(id);
-        }
-        fs::create_dir_all(&self.dir)
-            .map_err(|e| Error::Save(format!("{}：{e}", self.dir.display())))?;
-        // 先写临时文件再改名：中途失败不会留下内容和地址不符的来源。
-        let temporary = path.with_extension("tmp");
-        fs::write(&temporary, bytes)
-            .and_then(|()| fs::rename(&temporary, &path))
-            .map_err(|e| Error::Save(format!("{}：{e}", path.display())))?;
-        Ok(id)
-    }
-
     fn path(&self, id: &str) -> Result<PathBuf, Error> {
         let hash = hash_part(id).ok_or_else(|| Error::Source(format!("来源地址 {id:?} 不合法")))?;
         Ok(self.dir.join(hash))
@@ -52,12 +35,32 @@ impl SourceStore for FileSources {
     }
 
     fn read(&self, id: &str, locator: &Locator) -> Result<String, Error> {
+        extract(&self.read_all(id)?, id, locator)
+    }
+
+    fn read_all(&self, id: &str) -> Result<Vec<u8>, Error> {
         let bytes =
             fs::read(self.path(id)?).map_err(|e| Error::Source(format!("来源 {id}：{e}")))?;
         if source_id(&bytes) != id {
             return Err(Error::Source(format!("来源 {id} 的内容已被改动")));
         }
-        extract(&bytes, id, locator)
+        Ok(bytes)
+    }
+
+    fn put(&self, bytes: &[u8]) -> Result<SourceId, Error> {
+        let id = source_id(bytes);
+        let path = self.path(&id)?;
+        if path.exists() {
+            return Ok(id);
+        }
+        fs::create_dir_all(&self.dir)
+            .map_err(|e| Error::Save(format!("{}：{e}", self.dir.display())))?;
+        // 先写临时文件再改名：中途失败不会留下内容和地址不符的来源。
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, bytes)
+            .and_then(|()| fs::rename(&temporary, &path))
+            .map_err(|e| Error::Save(format!("{}：{e}", path.display())))?;
+        Ok(id)
     }
 }
 
