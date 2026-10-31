@@ -220,7 +220,7 @@ fn based_by_sees_earlier_changes_in_the_script() {
 
     let text = ok(
         &mut memory,
-        "base borrowing on ownership\nbased_by ownership\nunbase conclusion on ownership",
+        "base borrowing on ownership\nbased_by ownership",
     );
 
     assert!(
