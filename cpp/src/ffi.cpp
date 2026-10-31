@@ -4,8 +4,10 @@
 #include "memweave/graph.hpp"
 
 using memweave::Bytes;
+using memweave::Evidence;
+using memweave::EvidenceList;
 using memweave::Node;
-using memweave::RelatedList;
+using memweave::NodeList;
 
 extern "C" {
 
@@ -17,11 +19,19 @@ struct MwLayout {
   std::size_t node_title;
   std::size_t node_description;
   std::size_t node_evidence;
+  std::size_t node_dependents;
   std::size_t node_id_len;
   std::size_t node_title_len;
   std::size_t node_description_len;
-  std::size_t node_evidence_len;
-  std::size_t related_list_header;
+  std::size_t node_list_header;
+  std::size_t evidence_list_header;
+  std::size_t evidence_size;
+  std::size_t evidence_kind;
+  std::size_t evidence_id_len;
+  std::size_t evidence_id;
+  std::size_t evidence_node;
+  std::size_t evidence_start;
+  std::size_t evidence_end;
 };
 
 MwLayout mw_layout() noexcept {
@@ -33,21 +43,39 @@ MwLayout mw_layout() noexcept {
       offsetof(Node, title),
       offsetof(Node, description),
       offsetof(Node, evidence),
+      offsetof(Node, dependents),
       offsetof(Node, id_len),
       offsetof(Node, title_len),
       offsetof(Node, description_len),
-      offsetof(Node, evidence_len),
-      sizeof(RelatedList),
+      sizeof(NodeList),
+      sizeof(EvidenceList),
+      sizeof(Evidence),
+      offsetof(Evidence, kind),
+      offsetof(Evidence, id_len),
+      offsetof(Evidence, id),
+      offsetof(Evidence, node),
+      offsetof(Evidence, start),
+      offsetof(Evidence, end),
   };
 }
 
-Node* mw_node_new(Bytes id, Bytes title, Bytes description, Bytes evidence,
-                  std::size_t related_capacity) noexcept {
-  return memweave::new_node(id, title, description, evidence, related_capacity);
+Node* mw_node_new(Bytes id, Bytes title, Bytes description, const Evidence* evidence,
+                  std::size_t evidence_count, std::size_t related_capacity,
+                  std::size_t dependents_capacity) noexcept {
+  return memweave::new_node(id, title, description, evidence, evidence_count, related_capacity,
+                            dependents_capacity);
 }
 
 void mw_node_set_related(Node* node, Node* const* related, std::size_t count) noexcept {
   memweave::set_related(node, related, count);
+}
+
+void mw_node_set_evidence_target(Node* node, std::size_t index, Node* target) noexcept {
+  memweave::set_evidence_target(node, index, target);
+}
+
+void mw_node_set_dependents(Node* node, Node* const* dependents, std::size_t count) noexcept {
+  memweave::set_dependents(node, dependents, count);
 }
 
 void mw_node_free(Node* node) noexcept { memweave::delete_node(node); }

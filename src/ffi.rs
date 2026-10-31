@@ -19,24 +19,45 @@ impl RawBytes {
     }
 }
 
-/// 和 C++ 的 `RelatedList` 布局相同，后面紧跟 `count` 个 `*const RawNode`。
+/// 和 C++ 的 `NodeList` 布局相同，后面紧跟 `count` 个 `*const RawNode`。
 #[repr(C)]
-pub(crate) struct RawRelatedList {
+pub(crate) struct RawNodeList {
+    pub(crate) count: usize,
+}
+
+/// 和 C++ 的 `EvidenceKind` 取值相同。
+pub(crate) const EVIDENCE_TEXT_RANGE: u32 = 0;
+pub(crate) const EVIDENCE_NODE: u32 = 1;
+
+/// 和 C++ 的 `Evidence` 布局相同。
+#[repr(C)]
+pub(crate) struct RawEvidence {
+    pub(crate) kind: u32,
+    pub(crate) id_len: u32,
+    pub(crate) id: *const u8,
+    pub(crate) node: *mut RawNode,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+/// 和 C++ 的 `EvidenceList` 布局相同，后面紧跟 `count` 条 `RawEvidence`。
+#[repr(C)]
+pub(crate) struct RawEvidenceList {
     pub(crate) count: usize,
 }
 
 /// 和 C++ 的 `Node` 布局相同，正好占一条缓存行。
 #[repr(C, align(64))]
 pub(crate) struct RawNode {
-    pub(crate) related: AtomicPtr<RawRelatedList>,
+    pub(crate) related: AtomicPtr<RawNodeList>,
     pub(crate) id: *const u8,
     pub(crate) title: *const u8,
     pub(crate) description: *const u8,
-    pub(crate) evidence: *const u8,
+    pub(crate) evidence: *const RawEvidenceList,
+    pub(crate) dependents: *const RawNodeList,
     pub(crate) id_len: u32,
     pub(crate) title_len: u32,
     pub(crate) description_len: u32,
-    pub(crate) evidence_len: u32,
 }
 
 #[cfg(test)]
@@ -50,11 +71,19 @@ pub(crate) struct RawLayout {
     pub(crate) node_title: usize,
     pub(crate) node_description: usize,
     pub(crate) node_evidence: usize,
+    pub(crate) node_dependents: usize,
     pub(crate) node_id_len: usize,
     pub(crate) node_title_len: usize,
     pub(crate) node_description_len: usize,
-    pub(crate) node_evidence_len: usize,
-    pub(crate) related_list_header: usize,
+    pub(crate) node_list_header: usize,
+    pub(crate) evidence_list_header: usize,
+    pub(crate) evidence_size: usize,
+    pub(crate) evidence_kind: usize,
+    pub(crate) evidence_id_len: usize,
+    pub(crate) evidence_id: usize,
+    pub(crate) evidence_node: usize,
+    pub(crate) evidence_start: usize,
+    pub(crate) evidence_end: usize,
 }
 
 unsafe extern "C" {
@@ -65,12 +94,24 @@ unsafe extern "C" {
         id: RawBytes,
         title: RawBytes,
         description: RawBytes,
-        evidence: RawBytes,
+        evidence: *const RawEvidence,
+        evidence_count: usize,
         related_capacity: usize,
+        dependents_capacity: usize,
     ) -> *mut RawNode;
     pub(crate) fn mw_node_set_related(
         node: *mut RawNode,
         related: *const *mut RawNode,
+        count: usize,
+    );
+    pub(crate) fn mw_node_set_evidence_target(
+        node: *mut RawNode,
+        index: usize,
+        target: *mut RawNode,
+    );
+    pub(crate) fn mw_node_set_dependents(
+        node: *mut RawNode,
+        dependents: *const *mut RawNode,
         count: usize,
     );
     pub(crate) fn mw_node_free(node: *mut RawNode);
@@ -93,11 +134,19 @@ mod tests {
             node_title: offset_of!(RawNode, title),
             node_description: offset_of!(RawNode, description),
             node_evidence: offset_of!(RawNode, evidence),
+            node_dependents: offset_of!(RawNode, dependents),
             node_id_len: offset_of!(RawNode, id_len),
             node_title_len: offset_of!(RawNode, title_len),
             node_description_len: offset_of!(RawNode, description_len),
-            node_evidence_len: offset_of!(RawNode, evidence_len),
-            related_list_header: size_of::<RawRelatedList>(),
+            node_list_header: size_of::<RawNodeList>(),
+            evidence_list_header: size_of::<RawEvidenceList>(),
+            evidence_size: size_of::<RawEvidence>(),
+            evidence_kind: offset_of!(RawEvidence, kind),
+            evidence_id_len: offset_of!(RawEvidence, id_len),
+            evidence_id: offset_of!(RawEvidence, id),
+            evidence_node: offset_of!(RawEvidence, node),
+            evidence_start: offset_of!(RawEvidence, start),
+            evidence_end: offset_of!(RawEvidence, end),
         };
 
         assert_eq!(unsafe { mw_layout() }, expected);

@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use thiserror::Error;
 
 use crate::error::Error;
-use crate::ffi::{self, RawBytes, RawNode};
+use crate::ffi::{self, RawBytes, RawEvidence, RawNode, RawNodeList};
 use crate::knowledge::{Catalog, Evidence, Locator, Node, NodeId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
@@ -82,23 +82,49 @@ impl<'m> NodeRef<'m> {
 
     /// 相关节点。遍历时只解引用地址，不做任何查找。
     pub fn related(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
-        let list = self.raw().related.load(Ordering::Acquire);
-        let related: &'m [NonNull<RawNode>] = if list.is_null() {
-            &[]
-        } else {
-            // 列表由 C++ 分配，头部之后紧跟 count 个节点地址。
-            unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count) }
-        };
-        related.iter().map(|raw| NodeRef::new(*raw))
+        node_list(self.raw().related.load(Ordering::Acquire))
     }
 
-    /// 解析节点的证据。证据只有在需要时才解析。
+    /// 证据里引用了这个节点的节点。修改这个节点时，它们需要复查。
+    pub fn dependents(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
+        node_list(self.raw().dependents)
+    }
+
+    /// 这条知识依据的节点，直接沿地址到达。
+    pub fn based_on(self) -> impl Iterator<Item = NodeRef<'m>> + use<'m> {
+        self.raw_evidence()
+            .iter()
+            .filter(|evidence| evidence.kind == ffi::EVIDENCE_NODE)
+            .map(|evidence| {
+                NodeRef::new(NonNull::new(evidence.node).expect("建图时已填写依据节点"))
+            })
+    }
+
+    /// 节点的证据。
     pub fn evidence(self) -> Vec<Evidence> {
-        let raw = self.raw();
-        serde_json::from_slice(unsafe {
-            slice::from_raw_parts(raw.evidence, raw.evidence_len as usize)
-        })
-        .expect("证据是创建节点时序列化的")
+        self.raw_evidence()
+            .iter()
+            .map(|evidence| {
+                let id = text(evidence.id, evidence.id_len).to_owned();
+                match evidence.kind {
+                    ffi::EVIDENCE_TEXT_RANGE => Evidence::Source {
+                        source: id,
+                        locator: Locator::TextRange {
+                            start: evidence.start as usize,
+                            end: evidence.end as usize,
+                        },
+                    },
+                    ffi::EVIDENCE_NODE => Evidence::Node { id },
+                    kind => unreachable!("未知的证据种类 {kind}"),
+                }
+            })
+            .collect()
+    }
+
+    fn raw_evidence(self) -> &'m [RawEvidence] {
+        // 列表由 C++ 分配，头部之后紧跟 count 条证据。
+        let list = self.raw().evidence;
+        unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count) }
     }
 
     /// 复制出完整的节点。
@@ -131,6 +157,18 @@ impl Hash for NodeRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.raw.as_ptr().hash(state);
     }
+}
+
+fn node_list<'m>(
+    list: *const RawNodeList,
+) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
+    let nodes: &'m [NonNull<RawNode>] = if list.is_null() {
+        &[]
+    } else {
+        // 列表由 C++ 分配，头部之后紧跟 count 个节点地址。
+        unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count) }
+    };
+    nodes.iter().map(|raw| NodeRef::new(*raw))
 }
 
 fn text<'m>(data: *const u8, len: u32) -> &'m str {
@@ -202,27 +240,41 @@ impl Memory {
         }
         let ParsedKnowledge { catalog, nodes } = parsed;
 
+        // 被依赖关系从证据反推，创建节点时就要知道数量。
+        let dependents = dependents_by_id(&nodes);
+
         // 先放进结构体：中途失败时由 Drop 释放已创建的节点。
         let mut memory = Self {
             catalog,
             index: HashMap::with_capacity(nodes.len()),
         };
-        // 先分配所有节点，再连接关联，这样关联可以直接存地址。
+        // 先创建所有节点，再连接它们，这样节点之间可以直接存地址。
         for node in &nodes {
-            let raw = new_node(node)?;
+            let count = dependents.get(node.id.as_str()).map_or(0, Vec::len);
+            let raw = new_node(node, count)?;
             memory.index.insert(node.id.clone(), raw);
         }
-        let mut related = Vec::new();
+
+        let mut addresses = Vec::new();
         for node in &nodes {
-            related.clear();
-            related.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
-            unsafe {
-                ffi::mw_node_set_related(
-                    memory.index[&node.id].as_ptr(),
-                    related.as_ptr(),
-                    related.len(),
-                );
+            let raw = memory.index[&node.id].as_ptr();
+
+            addresses.clear();
+            addresses.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
+            unsafe { ffi::mw_node_set_related(raw, addresses.as_ptr(), addresses.len()) };
+
+            for (index, evidence) in node.evidence.iter().enumerate() {
+                if let Evidence::Node { id } = evidence {
+                    let target = memory.index[id].as_ptr();
+                    unsafe { ffi::mw_node_set_evidence_target(raw, index, target) };
+                }
             }
+
+            addresses.clear();
+            if let Some(ids) = dependents.get(node.id.as_str()) {
+                addresses.extend(ids.iter().map(|id| memory.index[*id].as_ptr()));
+            }
+            unsafe { ffi::mw_node_set_dependents(raw, addresses.as_ptr(), addresses.len()) };
         }
         Ok(memory)
     }
@@ -324,15 +376,53 @@ impl Memory {
     }
 }
 
-fn new_node(node: &Node) -> Result<NonNull<RawNode>, Error> {
-    let evidence = serde_json::to_vec(&node.evidence).expect("证据总是可以序列化");
+/// 反推每个节点被哪些节点依赖。一个节点多次引用同一个依据时只算一次。
+fn dependents_by_id(nodes: &[Node]) -> HashMap<&str, Vec<&str>> {
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in nodes {
+        let mut seen = HashSet::new();
+        for evidence in &node.evidence {
+            if let Evidence::Node { id } = evidence
+                && seen.insert(id.as_str())
+            {
+                dependents
+                    .entry(id.as_str())
+                    .or_default()
+                    .push(node.id.as_str());
+            }
+        }
+    }
+    dependents
+}
+
+fn new_node(node: &Node, dependents_count: usize) -> Result<NonNull<RawNode>, Error> {
+    let mut evidence = Vec::with_capacity(node.evidence.len());
+    for entry in &node.evidence {
+        let (kind, id, start, end) = match entry {
+            Evidence::Source {
+                source,
+                locator: Locator::TextRange { start, end },
+            } => (ffi::EVIDENCE_TEXT_RANGE, source, *start as u64, *end as u64),
+            Evidence::Node { id } => (ffi::EVIDENCE_NODE, id, 0, 0),
+        };
+        evidence.push(RawEvidence {
+            kind,
+            id_len: u32::try_from(id.len()).map_err(|_| Error::OutOfMemory)?,
+            id: id.as_ptr(),
+            node: ptr::null_mut(),
+            start,
+            end,
+        });
+    }
     let raw = unsafe {
         ffi::mw_node_new(
             RawBytes::from_slice(node.id.as_bytes()),
             RawBytes::from_slice(node.title.as_bytes()),
             RawBytes::from_slice(node.description.as_bytes()),
-            RawBytes::from_slice(&evidence),
+            evidence.as_ptr(),
+            evidence.len(),
             node.related.len(),
+            dependents_count,
         )
     };
     NonNull::new(raw).ok_or(Error::OutOfMemory)
@@ -1012,5 +1102,77 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn evidence_stores_the_id_and_the_address() {
+        let memory = build(
+            &["依据", "结论"],
+            vec![
+                node("依据", &[]),
+                node_with_evidence(
+                    "结论",
+                    vec![
+                        source_evidence(0, 3),
+                        Evidence::Node {
+                            id: "依据".into()
+                        },
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+
+        let conclusion = memory.node("结论").unwrap();
+
+        assert_eq!(
+            conclusion.evidence(),
+            [
+                source_evidence(0, 3),
+                Evidence::Node {
+                    id: "依据".into()
+                },
+            ]
+        );
+        let based_on: Vec<NodeRef<'_>> = conclusion.based_on().collect();
+        assert_eq!(based_on, [memory.node("依据").unwrap()]);
+        assert_eq!(memory.node("依据").unwrap().based_on().count(), 0);
+    }
+
+    #[test]
+    fn dependents_are_the_reverse_of_evidence() {
+        let memory = build(
+            &["地基", "a", "b", "c"],
+            vec![
+                node("地基", &[]),
+                based_on("a", &["地基"]),
+                // 重复引用同一个依据只算一次。
+                based_on("b", &["地基", "地基", "a"]),
+                based_on("c", &["b"]),
+            ],
+        )
+        .unwrap();
+
+        let ids = |id| -> Vec<String> {
+            memory
+                .node(id)
+                .unwrap()
+                .dependents()
+                .map(|node| node.id().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("地基"), ["a", "b"]);
+        assert_eq!(ids("a"), ["b"]);
+        assert_eq!(ids("b"), ["c"]);
+        assert!(ids("c").is_empty());
+    }
+
+    #[test]
+    fn dependents_are_not_part_of_the_stored_node() {
+        let original = based_on("结论", &["依据"]);
+        let memory = build(&["依据", "结论"], vec![node("依据", &[]), original.clone()]).unwrap();
+
+        assert_eq!(memory.node("结论").unwrap().to_node(), original);
+        assert_eq!(memory.node("依据").unwrap().to_node(), node("依据", &[]));
     }
 }
