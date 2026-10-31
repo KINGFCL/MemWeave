@@ -15,11 +15,10 @@ use std::time::Instant;
 use memweave::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, Section};
 use memweave::memory::Memory;
 use memweave::parse::ParsedKnowledge;
-use memweave::pool::memory_pool;
 use memweave::source::in_memory::InMemorySources;
 
 const NODE_COUNTS: [usize; 4] = [1_000, 10_000, 100_000, 1_000_000];
-const LINK_COUNTS: [usize; 2] = [4, 8];
+const LINK_COUNTS: [usize; 3] = [4, 7, 8];
 const HOPS: usize = 5_000_000;
 const CLUSTER_RADIUS: usize = 32;
 const DESCRIPTION: &str =
@@ -171,30 +170,6 @@ fn bench_graph(count: usize, links: usize, shape: Shape) {
     );
 }
 
-fn bench_pool() {
-    const BLOCKS: usize = 5_000_000;
-    const SIZE: usize = 128;
-
-    let (mut allocator, deallocator) = memory_pool().unwrap();
-    let start = Instant::now();
-    for _ in 0..BLOCKS {
-        let block = allocator.allocate(SIZE).unwrap();
-        // 释放后立刻重新分配，只测无锁栈本身。
-        unsafe { deallocator.deallocate(block, SIZE) };
-    }
-    let pool_nanos = start.elapsed().as_nanos() as f64 / BLOCKS as f64;
-
-    let start = Instant::now();
-    for _ in 0..BLOCKS {
-        black_box(Box::new([0u8; SIZE]));
-    }
-    let system_nanos = start.elapsed().as_nanos() as f64 / BLOCKS as f64;
-
-    println!(
-        "分配并释放 {SIZE} 字节：内存池 {pool_nanos:.1} ns，系统分配器 {system_nanos:.1} ns（含清零）"
-    );
-}
-
 fn main() {
     println!("硬件极限（一次随机内存访问）：");
     for (name, bytes) in [
@@ -216,6 +191,4 @@ fn main() {
     for count in NODE_COUNTS {
         bench_graph(count, 4, Shape::Clustered);
     }
-    println!();
-    bench_pool();
 }

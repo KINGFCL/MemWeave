@@ -21,11 +21,10 @@ const MAX_ID_BYTES: usize = 200;
 
 /// 内存中的知识图。只能通过校验后的解析结果创建，所以关联和总表都是一致的。
 ///
-/// 节点放在 C++ 内存池里，节点之间直接用地址相连。文本地址的索引只用在边界上：
+/// 节点由 C++ 分配，节点之间直接用地址相连。文本地址的索引只用在边界上：
 /// 把模型的回答和命令行参数对应回节点，遍历时不经过它。
 pub struct Memory {
     catalog: Catalog,
-    graph: NonNull<ffi::RawGraph>,
     index: HashMap<NodeId, NonNull<RawNode>>,
 }
 
@@ -43,7 +42,9 @@ impl fmt::Debug for Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        unsafe { ffi::mw_graph_free(self.graph.as_ptr()) }
+        for raw in self.index.values() {
+            unsafe { ffi::mw_node_free(raw.as_ptr()) }
+        }
     }
 }
 
@@ -201,50 +202,29 @@ impl Memory {
         }
         let ParsedKnowledge { catalog, nodes } = parsed;
 
-        let graph = NonNull::new(unsafe { ffi::mw_graph_new() }).ok_or(Error::OutOfMemory)?;
-        // 先放进结构体：中途失败时由 Drop 释放整个图。
+        // 先放进结构体：中途失败时由 Drop 释放已创建的节点。
         let mut memory = Self {
             catalog,
-            graph,
             index: HashMap::with_capacity(nodes.len()),
         };
         // 先分配所有节点，再连接关联，这样关联可以直接存地址。
         for node in &nodes {
-            let raw = memory.add_node(node)?;
+            let raw = new_node(node)?;
             memory.index.insert(node.id.clone(), raw);
         }
         let mut related = Vec::new();
         for node in &nodes {
             related.clear();
             related.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
-            let connected = unsafe {
-                ffi::mw_graph_set_related(
-                    graph.as_ptr(),
+            unsafe {
+                ffi::mw_node_set_related(
                     memory.index[&node.id].as_ptr(),
                     related.as_ptr(),
                     related.len(),
-                )
-            };
-            if !connected {
-                return Err(Error::OutOfMemory);
+                );
             }
         }
         Ok(memory)
-    }
-
-    fn add_node(&self, node: &Node) -> Result<NonNull<RawNode>, Error> {
-        let evidence = serde_json::to_vec(&node.evidence).expect("证据总是可以序列化");
-        let raw = unsafe {
-            ffi::mw_graph_add_node(
-                self.graph.as_ptr(),
-                RawBytes::from_slice(node.id.as_bytes()),
-                RawBytes::from_slice(node.title.as_bytes()),
-                RawBytes::from_slice(node.description.as_bytes()),
-                RawBytes::from_slice(&evidence),
-                node.related.len(),
-            )
-        };
-        NonNull::new(raw).ok_or(Error::OutOfMemory)
     }
 
     /// 找出解析结果中的所有问题。
@@ -342,6 +322,20 @@ impl Memory {
     pub fn node_count(&self) -> usize {
         self.index.len()
     }
+}
+
+fn new_node(node: &Node) -> Result<NonNull<RawNode>, Error> {
+    let evidence = serde_json::to_vec(&node.evidence).expect("证据总是可以序列化");
+    let raw = unsafe {
+        ffi::mw_node_new(
+            RawBytes::from_slice(node.id.as_bytes()),
+            RawBytes::from_slice(node.title.as_bytes()),
+            RawBytes::from_slice(node.description.as_bytes()),
+            RawBytes::from_slice(&evidence),
+            node.related.len(),
+        )
+    };
+    NonNull::new(raw).ok_or(Error::OutOfMemory)
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -967,6 +961,28 @@ mod tests {
         let memory = build(&["a"], vec![large.clone()]).unwrap();
 
         assert_eq!(memory.node("a").unwrap().description(), large.description);
+    }
+
+    /// 关联再多，列表也紧跟在节点后面，遍历时不用跳到别处。
+    #[test]
+    fn links_follow_the_node_however_many_there_are() {
+        let ids: Vec<String> = (0..100).map(|index| format!("n{index}")).collect();
+        let mut nodes: Vec<Node> = ids.iter().map(|id| node(id, &[])).collect();
+        let mut hub = node("hub", &[]);
+        hub.related = ids.clone();
+        nodes.push(hub);
+        let memory = build(&["hub"], nodes).unwrap();
+
+        let hub = memory.node("hub").unwrap();
+        let address = hub.raw.as_ptr() as usize;
+
+        assert_eq!(address % 128, 0);
+        assert_eq!(
+            hub.raw().related.load(Ordering::Acquire) as usize,
+            address + 64
+        );
+        let related: Vec<&str> = hub.related().map(NodeRef::id).collect();
+        assert_eq!(related, ids);
     }
 
     #[test]

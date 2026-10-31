@@ -8,7 +8,6 @@ pub mod knowledge;
 pub mod memory;
 pub mod model;
 pub mod parse;
-pub mod pool;
 mod prompt;
 pub mod retrieve;
 pub mod source;
