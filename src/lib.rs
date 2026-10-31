@@ -1,4 +1,3 @@
-pub mod anthropic;
 pub mod error;
 pub mod knowledge;
 pub mod model;

@@ -95,55 +95,87 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 
 ```text
 src/
-├─ knowledge.rs  数据结构：Node、Catalog、KnowledgeTree、TreeNode
-├─ store.rs      Store 接口和文件实现 FsStore
-├─ model.rs      Model 接口：context_limit、count_tokens、choose
-├─ prompt.rs     总表选择和逐层判断的提示词
-├─ retrieve.rs   查询流程：retrieve()
-├─ anthropic.rs  Model 的 Claude API 实现
-├─ error.rs      错误类型
+├─ knowledge.rs       数据结构：Node、Catalog、KnowledgeTree、TreeNode
+├─ store.rs           Store 接口和文件实现 FsStore
+├─ prompt.rs          总表选择和逐层判断的提示词
+├─ retrieve.rs        查询流程：retrieve()
+├─ error.rs           错误类型
 ├─ lib.rs
-└─ main.rs       命令行入口
+├─ main.rs            命令行入口，根据环境变量选择厂商
+└─ model/
+   ├─ mod.rs          Model 接口：context_limit、count_tokens、choose
+   ├─ anthropic.rs    Claude
+   ├─ deepseek.rs     DeepSeek
+   └─ messages.rs     Anthropic Messages 协议的内部客户端
 ```
 
 `retrieve()` 只依赖 `Store` 和 `Model` 两个接口，更换存储或模型不需要改动查询流程。
 
 ## 7. 模型接入
 
-默认使用 Claude API 和 `claude-opus-5-5`，可以用环境变量更换模型或改用 Anthropic 兼容服务：
+每家厂商是 `model/` 下的一个独立模块，实现同一个 `Model` 接口：
 
-- 上下文上限：优先取 `MEMWEAVE_CONTEXT_LIMIT`，否则启动时从 `GET /v1/models/{id}` 的 `max_input_tokens` 读取。
-- token 计数：`POST /v1/messages/count_tokens`。计数请求不包含输出格式定义，这部分很小，可以忽略。
-- 选择结果：`POST /v1/messages`，流式读取，用 JSON Schema 约束输出为 `{"ids": [...]}`，推理强度为 `high`。部分兼容服务会忽略这个约束，所以提示词里也要求只输出 JSON。
-- 拒绝处理：开启服务端回退（`fallbacks: "default"`），模型拒绝时由 API 换模型重试；最终仍被拒绝则报错。
-- 重试：连接错误、408、409、429、5xx、流中断和选择结果无法解析时最多重试 2 次。其余错误直接报错。
-
-### 用 DeepSeek 验证
-
-DeepSeek 的 Anthropic 兼容地址不提供 Models API，需要指定上下文上限：
-
-```bash
-export ANTHROPIC_API_KEY=...
-export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-export MEMWEAVE_MODEL=deepseek-flash
-export MEMWEAVE_CONTEXT_LIMIT=100000
-cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
+```rust
+pub trait Model {
+    fn context_limit(&self) -> usize;
+    fn count_tokens(&self, prompt: &Prompt) -> Result<usize, Error>;
+    fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error>;
+}
 ```
 
-这里的 `100000` 只是验证用的取值，不代表模型的真实上限。
+`messages.rs` 只负责 Anthropic Messages 协议的传输、流式解析和重试，不对外公开。请求内容和能力差异写在各厂商自己的模块里。使用其他协议的厂商不需要依赖它。
 
-它的计数接口可用，但会忽略 `output_config.format` 和 `fallbacks`，也就是没有输出格式保证和服务端回退。
+### 接入新厂商
+
+1. 在 `model/` 下新建模块，实现 `Model`。
+2. 在 `model/mod.rs` 中声明这个模块。
+3. 在 `main.rs` 的 `connect_model()` 中加一个分支。
+
+`choose()` 必须返回 `{"ids": [...]}` 解析后的节点地址。提示词已经要求模型只输出这个 JSON，厂商支持输出格式约束时应该同时开启。
+
+`Model` 实现要自己处理模型拒绝、输出截断等情况，并返回错误，不能把不完整的结果当作选择结果返回。
+
+### 厂商差异
+
+| | Anthropic | DeepSeek |
+| --- | --- | --- |
+| 默认模型 | `claude-opus-5-5` | `deepseek-flash` |
+| 接口 | Claude API | Anthropic 格式接口 `https://api.deepseek.com/anthropic` |
+| 上下文上限 | 优先取 `MEMWEAVE_CONTEXT_LIMIT`，否则查询 `GET /v1/models/{id}` | 必须设置 `MEMWEAVE_CONTEXT_LIMIT` |
+| token 计数 | `POST /v1/messages/count_tokens` | 同左 |
+| 输出格式 | JSON Schema 约束，加上提示词要求 | 只靠提示词要求 |
+| 模型拒绝 | 服务端回退（`fallbacks: "default"`），最终仍被拒绝则报错 | 不发送回退参数（未确认是否支持），被拒绝则报错 |
+| 推理强度 | `high` | 使用默认值 |
+
+两家都使用流式请求。计数请求不包含输出格式定义，这部分很小，可以忽略。
+
+连接错误、408、409、429、5xx、流中断和选择结果无法解析时最多重试 2 次，其余错误直接报错。
 
 ## 8. 命令行
 
 ```bash
+# Claude（默认）
 export ANTHROPIC_API_KEY=...
+cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
+
+# DeepSeek
+export MEMWEAVE_PROVIDER=deepseek
+export DEEPSEEK_API_KEY=...
+export MEMWEAVE_CONTEXT_LIMIT=100000
 cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
 ```
 
+这里的 `100000` 只是验证用的取值，不代表 DeepSeek 模型的真实上限。
+
 结果以 JSON 输出到标准输出，包含 `query`、`roots`（知识树）和 `rejected`（读过但被丢弃的节点）。树上每个节点包含完整内容、`children` 和 `references`。
 
-可选环境变量：`ANTHROPIC_BASE_URL`、`MEMWEAVE_MODEL`、`MEMWEAVE_CONTEXT_LIMIT`。
+| 环境变量 | 说明 |
+| --- | --- |
+| `MEMWEAVE_PROVIDER` | 模型厂商：`anthropic`（默认）或 `deepseek` |
+| `MEMWEAVE_MODEL` | 模型名，默认使用所选厂商的默认模型 |
+| `MEMWEAVE_CONTEXT_LIMIT` | 模型的输入 token 上限 |
+| `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL` | Claude 的密钥和地址 |
+| `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` | DeepSeek 的密钥和地址 |
 
 ## 9. 暂不实现
 

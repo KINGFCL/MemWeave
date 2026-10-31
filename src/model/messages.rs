@@ -1,29 +1,25 @@
+//! Anthropic Messages 协议的客户端，供使用这一协议的厂商共用。
+//! 请求内容由各厂商自己决定，这里只负责传输、流式解析和重试。
+
 use std::io::{BufRead, BufReader, Read};
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::Prompt;
 use crate::error::Error;
 use crate::knowledge::NodeId;
-use crate::model::{Model, Prompt};
-
-pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
-pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 const API_VERSION: &str = "2026-10-21";
-const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
-const MAX_OUTPUT_TOKENS: u32 = 64_000;
 const MAX_RETRIES: u32 = 2;
 
-/// 通过 Claude API 调用的模型。
-pub struct AnthropicModel {
+pub(super) struct MessagesClient {
     agent: ureq::Agent,
     base_url: String,
     api_key: String,
-    model: String,
-    context_limit: usize,
 }
 
 /// 一次请求失败的结果，附带是否值得重试。
@@ -32,41 +28,22 @@ struct Failure {
     retryable: bool,
 }
 
-impl AnthropicModel {
-    /// 创建客户端。未指定 `context_limit` 时向 Models API 查询；
-    /// 不提供该接口的兼容服务需要显式指定。
-    pub fn connect(
-        base_url: &str,
-        api_key: &str,
-        model: &str,
-        context_limit: Option<usize>,
-    ) -> Result<Self, Error> {
+impl MessagesClient {
+    pub(super) fn new(base_url: &str, api_key: &str) -> Self {
         // 状态码自行处理，才能读到错误响应里的说明。
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build()
             .into();
-        let mut this = Self {
+        Self {
             agent,
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
-            model: model.to_owned(),
-            context_limit: 0,
-        };
-        this.context_limit = match context_limit {
-            Some(limit) => limit,
-            None => this.fetch_context_limit()?,
-        };
-        Ok(this)
+        }
     }
 
-    fn fetch_context_limit(&self) -> Result<usize, Error> {
-        #[derive(Deserialize)]
-        struct ModelInfo {
-            max_input_tokens: usize,
-        }
-
-        let url = format!("{}/v1/models/{}", self.base_url, self.model);
+    pub(super) fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+        let url = format!("{}{path}", self.base_url);
         let text = with_retries(|| {
             let response = self
                 .agent
@@ -77,8 +54,47 @@ impl AnthropicModel {
                 .map_err(transport_failure)?;
             read_ok_body(response)
         })?;
-        let info: ModelInfo = parse_json(&text)?;
-        Ok(info.max_input_tokens)
+        parse_json(&text)
+    }
+
+    pub(super) fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<usize, Error> {
+        #[derive(Deserialize)]
+        struct TokenCount {
+            input_tokens: usize,
+        }
+
+        let body = json!({
+            "model": model,
+            "system": prompt.system,
+            "messages": [{ "role": "user", "content": prompt.user }],
+        })
+        .to_string();
+        let text = with_retries(|| {
+            let response = self
+                .post("/v1/messages/count_tokens")
+                .send(&body)
+                .map_err(transport_failure)?;
+            read_ok_body(response)
+        })?;
+        let count: TokenCount = parse_json(&text)?;
+        Ok(count.input_tokens)
+    }
+
+    /// 发送一次流式请求并解析选择结果。`body` 不需要包含 `stream` 字段。
+    pub(super) fn choose(&self, mut body: Value, beta: Option<&str>) -> Result<Vec<NodeId>, Error> {
+        body["stream"] = json!(true);
+        let body = body.to_string();
+        with_retries(|| {
+            let mut request = self.post("/v1/messages");
+            if let Some(beta) = beta {
+                request = request.header("anthropic-beta", beta);
+            }
+            let response = request.send(&body).map_err(transport_failure)?;
+            if !response.status().is_success() {
+                return Err(status_failure(response));
+            }
+            parse_choice(&read_stream(response.into_body().into_reader())?)
+        })
     }
 
     fn post(&self, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
@@ -87,68 +103,6 @@ impl AnthropicModel {
             .header("content-type", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-    }
-}
-
-impl Model for AnthropicModel {
-    fn context_limit(&self) -> usize {
-        self.context_limit
-    }
-
-    fn count_tokens(&self, prompt: &Prompt) -> Result<usize, Error> {
-        #[derive(Deserialize)]
-        struct TokenCount {
-            input_tokens: usize,
-        }
-
-        let body = json!({
-            "model": self.model,
-            "system": prompt.system,
-            "messages": [{ "role": "user", "content": prompt.user }],
-        });
-        let text = with_retries(|| {
-            let response = self
-                .post("/v1/messages/count_tokens")
-                .send(body.to_string())
-                .map_err(transport_failure)?;
-            read_ok_body(response)
-        })?;
-        let count: TokenCount = parse_json(&text)?;
-        Ok(count.input_tokens)
-    }
-
-    fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
-        let body = json!({
-            "model": self.model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "stream": true,
-            "fallbacks": "default",
-            "system": prompt.system,
-            "messages": [{ "role": "user", "content": prompt.user }],
-            "output_config": {
-                "effort": "high",
-                "format": {
-                    "type": "json_schema",
-                    "schema": {
-                        "type": "object",
-                        "properties": { "ids": { "type": "array", "items": { "type": "string" } } },
-                        "required": ["ids"],
-                        "additionalProperties": false,
-                    },
-                },
-            },
-        });
-        with_retries(|| {
-            let response = self
-                .post("/v1/messages")
-                .header("anthropic-beta", FALLBACK_BETA)
-                .send(body.to_string())
-                .map_err(transport_failure)?;
-            if !response.status().is_success() {
-                return Err(status_failure(response));
-            }
-            parse_choice(&read_stream(response.into_body().into_reader())?)
-        })
     }
 }
 
@@ -247,7 +201,7 @@ fn read_stream(reader: impl Read) -> Result<String, Failure> {
             retryable: false,
         }),
         Some("max_tokens") => Err(Failure {
-            message: format!("模型输出达到 {MAX_OUTPUT_TOKENS} token 上限，结果不完整"),
+            message: "模型输出达到 max_tokens 上限，结果不完整".into(),
             retryable: false,
         }),
         Some(other) => Err(Failure {
@@ -261,7 +215,7 @@ fn read_stream(reader: impl Read) -> Result<String, Failure> {
     }
 }
 
-/// 解析模型的选择结果。部分兼容服务会忽略输出格式约束，所以容忍代码块包裹，
+/// 解析模型的选择结果。不是每家厂商都支持输出格式约束，所以容忍代码块包裹，
 /// 其他格式问题交给重试。
 fn parse_choice(text: &str) -> Result<Vec<NodeId>, Failure> {
     #[derive(Deserialize)]
@@ -283,32 +237,93 @@ fn parse_choice(text: &str) -> Result<Vec<NodeId>, Failure> {
         })
 }
 
-fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, Error> {
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
     serde_json::from_str(text).map_err(|e| Error::Model(format!("无法解析模型响应：{e}")))
 }
 
+/// 各厂商测试共用的本地模拟服务器。
 #[cfg(test)]
-mod tests {
+pub(super) mod test_support {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
+    use std::thread;
 
-    use super::*;
+    use serde_json::{Value, json};
 
-    fn sse(events: &[Value]) -> String {
+    pub(crate) fn sse(events: &[Value]) -> String {
         events
             .iter()
             .map(|e| format!("event: x\ndata: {e}\n\n"))
             .collect()
     }
 
-    fn text_delta(text: &str) -> Value {
+    pub(crate) fn text_delta(text: &str) -> Value {
         json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } })
     }
 
-    fn stop(reason: &str) -> Value {
+    pub(crate) fn stop(reason: &str) -> Value {
         json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 1 } })
     }
+
+    pub(crate) struct Recorded {
+        pub(crate) request_line: String,
+        pub(crate) headers: String,
+        pub(crate) body: String,
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Recorded {
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut headers = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            let lower = line.to_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+            headers.push_str(&lower);
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        Recorded {
+            request_line,
+            headers,
+            body: String::from_utf8(body).unwrap(),
+        }
+    }
+
+    /// 依次用预设响应回答请求的本地服务器。
+    pub(crate) fn serve(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<Recorded>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                sender.send(read_request(&mut stream)).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, receiver)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{serve, sse, stop, text_delta};
+    use super::*;
 
     #[test]
     fn stream_concatenates_text_and_skips_thinking() {
@@ -351,126 +366,6 @@ mod tests {
         assert!(!read_stream(stream.as_bytes()).err().unwrap().retryable);
     }
 
-    struct Recorded {
-        request_line: String,
-        headers: String,
-        body: String,
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Recorded {
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        let mut headers = String::new();
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            if line.trim().is_empty() {
-                break;
-            }
-            let lower = line.to_lowercase();
-            if let Some(value) = lower.strip_prefix("content-length:") {
-                length = value.trim().parse().unwrap();
-            }
-            headers.push_str(&lower);
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        Recorded {
-            request_line,
-            headers,
-            body: String::from_utf8(body).unwrap(),
-        }
-    }
-
-    /// 依次用预设响应回答请求的本地服务器。
-    fn serve(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<Recorded>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            for (status, body) in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                sender.send(read_request(&mut stream)).unwrap();
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        (url, receiver)
-    }
-
-    #[test]
-    fn talks_to_the_api() {
-        let stream = sse(&[text_delta(r#"{"ids":["a","b"]}"#), stop("end_turn")]);
-        let (url, requests) = serve(vec![
-            (200, json!({ "max_input_tokens": 1000 }).to_string()),
-            (200, json!({ "input_tokens": 42 }).to_string()),
-            (200, stream),
-        ]);
-        let prompt = Prompt {
-            system: "系统",
-            user: "用户".into(),
-        };
-
-        let model = AnthropicModel::connect(&url, "key", "m", None).unwrap();
-        assert_eq!(model.context_limit(), 1000);
-        assert_eq!(model.count_tokens(&prompt).unwrap(), 42);
-        assert_eq!(model.choose(&prompt).unwrap(), ["a", "b"]);
-
-        let info = requests.recv().unwrap();
-        assert!(info.request_line.starts_with("GET /v1/models/m "));
-        assert!(info.headers.contains("x-api-key: key"));
-        assert!(info.headers.contains("anthropic-version: 2026-10-21"));
-
-        let count = requests.recv().unwrap();
-        assert!(
-            count
-                .request_line
-                .starts_with("POST /v1/messages/count_tokens ")
-        );
-        let body: Value = serde_json::from_str(&count.body).unwrap();
-        assert_eq!(body["system"], "系统");
-        assert_eq!(body["messages"][0]["content"], "用户");
-
-        let choose = requests.recv().unwrap();
-        assert!(choose.request_line.starts_with("POST /v1/messages "));
-        assert!(
-            choose
-                .headers
-                .contains("anthropic-beta: server-side-fallback-2026-07-01")
-        );
-        let body: Value = serde_json::from_str(&choose.body).unwrap();
-        assert_eq!(body["model"], "m");
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["fallbacks"], "default");
-        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
-    }
-
-    #[test]
-    fn retries_overloaded_then_succeeds() {
-        let (url, _requests) = serve(vec![
-            (529, json!({ "error": { "message": "忙" } }).to_string()),
-            (200, json!({ "max_input_tokens": 7 }).to_string()),
-        ]);
-
-        let model = AnthropicModel::connect(&url, "key", "m", None).unwrap();
-
-        assert_eq!(model.context_limit(), 7);
-    }
-
-    #[test]
-    fn explicit_context_limit_skips_the_models_api() {
-        // 没有可连接的服务器：只要发出请求就会失败。
-        let model = AnthropicModel::connect("http://127.0.0.1:1", "key", "m", Some(9)).unwrap();
-
-        assert_eq!(model.context_limit(), 9);
-    }
-
     #[test]
     fn parse_choice_accepts_plain_and_fenced_json() {
         for text in [
@@ -493,13 +388,24 @@ mod tests {
                 sse(&[text_delta(r#"{"ids":["a"]}"#), stop("end_turn")]),
             ),
         ]);
-        let model = AnthropicModel::connect(&url, "key", "m", Some(100)).unwrap();
+        let client = MessagesClient::new(&url, "key");
+
+        assert_eq!(client.choose(json!({}), None).unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn retries_overloaded_then_succeeds() {
+        let (url, _requests) = serve(vec![
+            (529, json!({ "error": { "message": "忙" } }).to_string()),
+            (200, json!({ "input_tokens": 7 }).to_string()),
+        ]);
+        let client = MessagesClient::new(&url, "key");
         let prompt = Prompt {
             system: "系统",
             user: "用户".into(),
         };
 
-        assert_eq!(model.choose(&prompt).unwrap(), ["a"]);
+        assert_eq!(client.count_tokens("m", &prompt).unwrap(), 7);
     }
 
     #[test]
@@ -508,10 +414,9 @@ mod tests {
             401,
             json!({ "error": { "message": "密钥无效" } }).to_string(),
         )]);
+        let client = MessagesClient::new(&url, "key");
 
-        let err = AnthropicModel::connect(&url, "key", "m", None)
-            .err()
-            .unwrap();
+        let err = client.get_json::<Value>("/v1/models/m").unwrap_err();
 
         let message = err.to_string();
         assert!(

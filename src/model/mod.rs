@@ -1,3 +1,7 @@
+pub mod anthropic;
+pub mod deepseek;
+mod messages;
+
 use crate::error::Error;
 use crate::knowledge::NodeId;
 
@@ -8,7 +12,7 @@ pub struct Prompt {
     pub user: String,
 }
 
-/// 查询流程需要模型提供的能力。
+/// 查询流程需要模型提供的能力。每家厂商在各自的子模块中实现。
 pub trait Model {
     /// 单次请求可容纳的输入 token 数。
     fn context_limit(&self) -> usize;

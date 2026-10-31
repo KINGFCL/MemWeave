@@ -24,7 +24,7 @@ struct Kept {
 /// 每个节点在一次查询中只读取、判断一次，被丢弃的节点同样算已访问。
 pub fn retrieve(
     store: &impl Store,
-    model: &impl Model,
+    model: &dyn Model,
     query: &str,
 ) -> Result<KnowledgeTree, Error> {
     let entries = select_entries(store, model, query)?;
@@ -102,7 +102,7 @@ pub fn retrieve(
 
 fn select_entries(
     store: &impl Store,
-    model: &impl Model,
+    model: &dyn Model,
     query: &str,
 ) -> Result<Vec<NodeId>, Error> {
     let catalog = store.catalog()?;
@@ -145,7 +145,7 @@ fn load_layer(store: &impl Store, pending: &[Pending]) -> Result<Vec<Node>, Erro
 }
 
 fn judge_layer(
-    model: &impl Model,
+    model: &dyn Model,
     query: &str,
     stage: Stage,
     pending: &[Pending],
@@ -178,7 +178,7 @@ fn judge_layer(
 }
 
 /// 先核对上下文上限再调用模型，超限时直接报错，不做截断。
-fn ask(model: &impl Model, stage: Stage, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
+fn ask(model: &dyn Model, stage: Stage, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
     let tokens = model.count_tokens(prompt)?;
     let limit = model.context_limit();
     if tokens > limit {
