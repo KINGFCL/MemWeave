@@ -14,27 +14,38 @@ use crate::source::{LoadedEvidence, SourceStore};
 /// `show` 里每个列表最多显示多少条。
 const SHOW_LIST_LIMIT: usize = 50;
 
-/// 依次执行语句。第 `Err` 的 usize 是已经执行完的语句数，只有内存不足这类意外才会走到那里。
+/// 执行结果。
+pub struct Report {
+    pub text: String,
+    /// 读取失败的语句数。读取失败不影响后面的语句，这样实际效果才和重放日志一致。
+    pub read_failures: usize,
+}
+
+/// 依次执行语句。`Err` 里的 usize 是已经执行完的语句数，只有内存不足这类意外才会走到那里。
 pub fn execute(
     statements: &[Located],
     memory: &mut Memory,
     sources: &dyn SourceStore,
-) -> Result<String, (usize, String, Error)> {
-    let mut output = String::new();
+) -> Result<Report, (usize, String, Error)> {
+    let mut report = Report {
+        text: String::new(),
+        read_failures: 0,
+    };
     for (done, located) in statements.iter().enumerate() {
-        if let Err(error) = statement(&located.statement, memory, sources, &mut output) {
-            return Err((done, output, error));
+        if let Err(error) = statement(&located.statement, memory, sources, &mut report) {
+            return Err((done, report.text, error));
         }
     }
-    Ok(output)
+    Ok(report)
 }
 
 fn statement(
     statement: &Statement,
     memory: &mut Memory,
     sources: &dyn SourceStore,
-    output: &mut String,
+    report: &mut Report,
 ) -> Result<(), Error> {
+    let output = &mut report.text;
     match statement {
         Statement::Catalog => render_catalog(memory, output),
         Statement::Check => render_check(memory, output),
@@ -42,10 +53,13 @@ fn statement(
         Statement::Links { id, depth, limit } => {
             render_links(existing(memory, &id.text)?, *depth, *limit, output);
         }
-        Statement::Evidence(id) => {
-            let evidence = memory.evidence(&id.text, sources);
-            render_evidence(&id.text, evidence?, output);
-        }
+        Statement::Evidence(id) => match memory.evidence(&id.text, sources) {
+            Ok(evidence) => render_evidence(&id.text, evidence, output),
+            Err(error) => {
+                report.read_failures += 1;
+                let _ = writeln!(output, "error[E901] evidence {} 读取失败：{error}", id.text);
+            }
+        },
         Statement::Add(add) => {
             let (node, placement) = build_node(add);
             memory.add_node(node, placement, sources)?;

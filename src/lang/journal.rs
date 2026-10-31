@@ -71,7 +71,7 @@ impl Journal {
                     )));
                 }
             };
-            let output = Session::new(memory, sources, Mode::ReadWrite).run(&entry.script);
+            let output = Session::new(memory, sources, Mode::ReadWrite).replay(&entry.script);
             if !output.ok {
                 return Err(Error::Save(format!(
                     "{} 第 {} 行重放失败：\n{}",

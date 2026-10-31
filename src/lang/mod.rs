@@ -136,17 +136,55 @@ impl<'a> Session<'a> {
         }
 
         match exec::execute(&statements, self.memory, self.sources) {
-            Ok(text) => Output {
+            Ok(report) if report.read_failures == 0 => Output {
                 ok: true,
-                text: limit_output(text),
+                text: limit_output(report.text),
             },
-            // 检查已经通过，只有内存不足或来源损坏才会走到这里。
+            Ok(report) => Output {
+                ok: false,
+                text: limit_output(format!(
+                    "{}有 {} 条读取失败，其余语句都已执行。",
+                    report.text, report.read_failures
+                )),
+            },
+            // 检查已经通过，只有内存不足才会走到这里。
             Err((done, text, error)) => Output {
                 ok: false,
                 text: limit_output(format!(
                     "{text}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
                     done + 1
                 )),
+            },
+        }
+    }
+}
+
+impl Session<'_> {
+    /// 重放日志里的一段脚本，只执行其中的写语句。
+    ///
+    /// 读语句对恢复记忆没有作用，还可能因为来源损坏而失败，不能让它们妨碍知识库加载。
+    pub fn replay(&mut self, script: &str) -> Output {
+        let (tokens, mut errors) = lexer::tokenize(script);
+        let (mut statements, parse_errors) = parser::parse(tokens);
+        errors.extend(parse_errors);
+        statements.retain(|located| located.statement.writes());
+        errors.extend(check::check(
+            &statements,
+            self.memory,
+            self.sources,
+            Mode::ReadWrite,
+        ));
+        if !errors.is_empty() {
+            return failure(&errors, script);
+        }
+        match exec::execute(&statements, self.memory, self.sources) {
+            Ok(report) => Output {
+                ok: true,
+                text: report.text,
+            },
+            Err((_, _, error)) => Output {
+                ok: false,
+                text: error.to_string(),
             },
         }
     }

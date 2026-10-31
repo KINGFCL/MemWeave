@@ -689,3 +689,161 @@ fn a_torn_last_line_is_ignored_but_other_damage_is_an_error() {
         .to_string();
     assert!(error.contains("重放失败"), "{error}");
 }
+
+#[test]
+fn duplicates_are_merged_when_adding() {
+    let mut memory = memory();
+
+    let text = ok(
+        &mut memory,
+        "add new\n title \"t\"\n desc \"d\"\n based_on ownership, ownership\n related borrowing, borrowing\n section \"s\"\nend\nshow new",
+    );
+
+    assert!(text.contains("related: borrowing\n"), "{text}");
+    assert!(text.contains("based_on: ownership\n"), "{text}");
+    fails(&mut memory, "unbase new on ownership", "E207");
+}
+
+#[test]
+fn removing_all_copies_of_a_lost_basis_is_caught_by_the_check() {
+    // 这是之前的 bug：同名依据有多份时，检查以为还剩证据，执行时才报错。
+    let mut conclusion = node("conclusion", &[]);
+    conclusion.evidence = vec![
+        Evidence::Node { id: "a".into() },
+        Evidence::Node { id: "a".into() },
+    ];
+    let catalog = Catalog {
+        sections: vec![Section {
+            name: "s".into(),
+            nodes: vec![
+                CatalogEntry {
+                    id: "a".into(),
+                    title: "t".into(),
+                },
+                CatalogEntry {
+                    id: "conclusion".into(),
+                    title: "t".into(),
+                },
+            ],
+        }],
+    };
+    let mut memory = Memory::from_parsed(
+        ParsedKnowledge {
+            catalog,
+            nodes: vec![node("a", &[]), conclusion],
+        },
+        &sources(),
+    )
+    .unwrap();
+
+    ok(&mut memory, "remove a");
+    fails(&mut memory, "unbase conclusion on a", "E207");
+}
+
+#[test]
+fn a_damaged_source_cannot_lock_the_knowledge_base() {
+    use crate::source::file::FileSources;
+
+    let dir = TempDir::new().unwrap();
+    let store = FileSources::new(dir.path());
+    let id = store.put(TEXT.as_bytes()).unwrap();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+
+    // 脚本中途读证据失败。
+    fs::write(
+        dir.path()
+            .join("sources")
+            .join(id.strip_prefix("sha256:").unwrap()),
+        "内容被改动了",
+    )
+    .unwrap();
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run("set entry title \"前\"\nevidence entry\nset entry desc \"后\"");
+
+    assert!(!output.ok);
+    assert!(output.text.contains("error[E901]"), "{}", output.text);
+    assert!(output.text.contains("其余语句都已执行"), "{}", output.text);
+    // 后面的写语句也生效了，和重放的结果一致。
+    assert_eq!(live.node("entry").unwrap().description(), "后");
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+}
+
+/// 通过检查的脚本，执行时不能报语义错误，重放后的状态也必须和实际执行完全一致。
+#[test]
+fn whatever_passes_the_check_executes_and_replays_exactly() {
+    const IDS: [&str; 8] = [
+        "entry",
+        "ownership",
+        "borrowing",
+        "conclusion",
+        "p",
+        "q",
+        "r",
+        "ghost",
+    ];
+    let store = sources();
+    let source = source();
+    let mut random = Random(0x1234_5678_9abc_def1);
+    let mut accepted = 0;
+    let mut rejected = 0;
+
+    for _ in 0..300 {
+        let mut live = memory();
+        let mut scripts = Vec::new();
+        for _ in 0..40 {
+            let mut script = String::new();
+            for _ in 0..1 + random.next() % 5 {
+                let a = IDS[random.next() % IDS.len()];
+                let b = IDS[random.next() % IDS.len()];
+                let c = IDS[random.next() % IDS.len()];
+                let statement = match random.next() % 12 {
+                    0 => format!("show {a}"),
+                    1 => format!("evidence {a}"),
+                    2 => "check".to_owned(),
+                    3 => format!(
+                        "add {a}\n title \"t\"\n desc \"d\"\n source {source} 0..3\n related {b}, {b}\n section \"s\"\nend"
+                    ),
+                    4 => format!(
+                        "add {a}\n title \"t\"\n desc \"d\"\n based_on {b}, {b}\n related_by {c}\nend"
+                    ),
+                    5 => format!("remove {a}"),
+                    6 => format!("set {a} desc \"新\""),
+                    7 => format!("set {a} title \"新\""),
+                    8 => format!("link {a} -> {b}"),
+                    9 => format!("unlink {a} -> {b}"),
+                    10 => format!("base {a} on {b}"),
+                    _ => format!("unbase {a} on {b}"),
+                };
+                script.push_str(&statement);
+                script.push('\n');
+            }
+
+            let output = Session::new(&mut live, &store, Mode::ReadWrite).run(&script);
+
+            assert!(!output.text.contains("E900"), "{script}\n{}", output.text);
+            if output.ok {
+                accepted += 1;
+                scripts.push(script);
+            } else {
+                rejected += 1;
+            }
+            assert_consistent(&live);
+        }
+
+        let mut restarted = memory();
+        for script in &scripts {
+            let output = Session::new(&mut restarted, &store, Mode::ReadWrite).replay(script);
+            assert!(output.ok, "{script}\n{}", output.text);
+        }
+        assert_eq!(snapshot(&restarted), snapshot(&live));
+    }
+
+    // 确认这个测试真的走到了两种情况。
+    assert!(accepted > 500, "只接受了 {accepted} 段");
+    assert!(rejected > 500, "只拒绝了 {rejected} 段");
+}

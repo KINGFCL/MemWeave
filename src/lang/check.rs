@@ -28,6 +28,7 @@ pub fn check(
         related: HashMap::new(),
         based_on: HashMap::new(),
         source_counts: HashMap::new(),
+        removed_ever: HashSet::new(),
         errors: Vec::new(),
     };
     for located in statements {
@@ -52,6 +53,8 @@ struct Checker<'a> {
     related: HashMap<String, Vec<String>>,
     based_on: HashMap<String, Vec<String>>,
     source_counts: HashMap<String, usize>,
+    /// 本脚本删除过的节点，内存里指向它们的关联在执行时已经不在了。
+    removed_ever: HashSet<String>,
     errors: Vec<Diagnostic>,
 }
 
@@ -70,6 +73,14 @@ impl Checker<'_> {
                 if self.require(id) {
                     self.removed.insert(id.text.clone());
                     self.added.remove(&id.text);
+                    // 和执行时一样：别的节点指向它的关联没了，证据里的 id 还留着。
+                    self.removed_ever.insert(id.text.clone());
+                    for list in self.related.values_mut() {
+                        list.retain(|other| *other != id.text);
+                    }
+                    self.related.remove(&id.text);
+                    self.based_on.remove(&id.text);
+                    self.source_counts.remove(&id.text);
                 }
             }
             Statement::Link { from, to } => self.link(from, to),
@@ -162,11 +173,11 @@ impl Checker<'_> {
         self.added.insert(id.text.clone());
         self.related.insert(
             id.text.clone(),
-            add.related.iter().map(|n| n.text.clone()).collect(),
+            unique(add.related.iter().map(|n| n.text.clone())),
         );
         self.based_on.insert(
             id.text.clone(),
-            add.based_on.iter().map(|n| n.text.clone()).collect(),
+            unique(add.based_on.iter().map(|n| n.text.clone())),
         );
         self.source_counts
             .insert(id.text.clone(), add.sources.len());
@@ -256,7 +267,7 @@ impl Checker<'_> {
             );
             return;
         }
-        if list.len() == 1 && sources == 0 {
+        if sources == 0 && list.iter().all(|other| *other == on.text) {
             self.errors.push(
                 Diagnostic::new(
                     "E207",
@@ -320,9 +331,13 @@ impl Checker<'_> {
 
     fn related_of(&mut self, id: &str) -> &mut Vec<String> {
         let memory = self.memory;
+        let removed_ever = &self.removed_ever;
         self.related.entry(id.to_owned()).or_insert_with(|| {
             memory.node(id).map_or_else(Vec::new, |node| {
-                node.related().map(|n| n.id().to_owned()).collect()
+                node.related()
+                    .map(|n| n.id().to_owned())
+                    .filter(|other| !removed_ever.contains(other))
+                    .collect()
             })
         })
     }
@@ -353,6 +368,11 @@ impl Checker<'_> {
             })
         })
     }
+}
+
+fn unique(items: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items.filter(|item| seen.insert(item.clone())).collect()
 }
 
 /// 脚本过长时的报错。

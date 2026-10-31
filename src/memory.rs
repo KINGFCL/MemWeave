@@ -289,7 +289,8 @@ impl Memory {
         if !problems.is_empty() {
             return Err(Error::InvalidMemory(problems));
         }
-        let ParsedKnowledge { catalog, nodes } = parsed;
+        let ParsedKnowledge { catalog, mut nodes } = parsed;
+        nodes.iter_mut().for_each(remove_duplicates);
 
         // 反向关系从证据和关联反推，创建节点时就要知道数量。
         let backlinks = ReverseLinks::new(&nodes);
@@ -409,7 +410,7 @@ impl Memory {
     /// 有问题时一次报告所有问题，图保持不变。
     pub fn add_node(
         &mut self,
-        node: Node,
+        mut node: Node,
         placement: Placement,
         sources: &dyn SourceStore,
     ) -> Result<NodeRef<'_>, Error> {
@@ -417,6 +418,7 @@ impl Memory {
         if !problems.is_empty() {
             return Err(Error::InvalidMemory(problems));
         }
+        remove_duplicates(&mut node);
 
         let mut seen = HashSet::new();
         let related_targets: Vec<NonNull<RawNode>> = node
@@ -773,6 +775,19 @@ impl Memory {
             Err(Error::OutOfMemory)
         }
     }
+}
+
+/// 去掉重复的关联和证据，保留第一次出现的。重复的条目没有含义，还会让证据的数量算错。
+fn remove_duplicates(node: &mut Node) {
+    let mut seen = HashSet::new();
+    node.related.retain(|id| seen.insert(id.clone()));
+    let mut kept: Vec<Evidence> = Vec::with_capacity(node.evidence.len());
+    for evidence in node.evidence.drain(..) {
+        if !kept.contains(&evidence) {
+            kept.push(evidence);
+        }
+    }
+    node.evidence = kept;
 }
 
 /// 从证据和关联反推的反向关系：节点地址到指向它的节点。
