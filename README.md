@@ -19,6 +19,8 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点之间的�
 
 ## 安装
 
+记忆层用 C++ 实现，编译需要支持 C++20 的编译器。
+
 ```bash
 cargo install memweave --version 0.1.0-alpha.1
 ```

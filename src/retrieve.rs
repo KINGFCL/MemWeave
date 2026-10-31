@@ -4,98 +4,79 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Stage};
-use crate::knowledge::{KnowledgeTree, Node, NodeId, TreeNode};
+use crate::knowledge::{KnowledgeTree, NodeId, TreeNode};
+use crate::memory::{Memory, NodeRef};
 use crate::model::{Model, Prompt, generate_json};
 use crate::prompt;
-use crate::store::Store;
 
 /// 下一层的一个候选。`sources` 是把它引入这一层的已保留节点，入口节点为空。
-struct Pending {
-    id: NodeId,
-    sources: Vec<NodeId>,
+struct Pending<'m> {
+    node: NodeRef<'m>,
+    sources: Vec<NodeRef<'m>>,
 }
 
-/// 已保留的节点及其在树上的位置。
-struct Kept {
-    node: Node,
-    children: Vec<NodeId>,
-    references: Vec<NodeId>,
+/// 已保留的节点在树上的位置。
+#[derive(Default)]
+struct Kept<'m> {
+    children: Vec<NodeRef<'m>>,
+    references: Vec<NodeRef<'m>>,
 }
 
 /// 从总表出发逐层检索，返回知识树。
 ///
+/// 遍历时节点之间直接用地址相连。只有模型的回答是文本地址，要在总表和这一层的候选里对应回节点。
 /// 每个节点在一次查询中只读取、判断一次，被丢弃的节点同样算已访问。
-pub fn retrieve(
-    store: &impl Store,
-    model: &dyn Model,
-    query: &str,
-) -> Result<KnowledgeTree, Error> {
-    let entries = select_entries(store, model, query)?;
+pub fn retrieve(memory: &Memory, model: &dyn Model, query: &str) -> Result<KnowledgeTree, Error> {
+    let entries = select_entries(memory, model, query)?;
 
-    let mut visited: HashSet<NodeId> = entries.iter().cloned().collect();
-    let mut pending: Vec<Pending> = entries
+    let mut visited: HashSet<NodeRef<'_>> = entries.iter().copied().collect();
+    let mut pending: Vec<Pending<'_>> = entries
         .into_iter()
-        .map(|id| Pending {
-            id,
+        .map(|node| Pending {
+            node,
             sources: Vec::new(),
         })
         .collect();
-    let mut kept: HashMap<NodeId, Kept> = HashMap::new();
-    let mut kept_order: Vec<NodeId> = Vec::new();
-    let mut roots: Vec<NodeId> = Vec::new();
+    let mut kept: HashMap<NodeRef<'_>, Kept<'_>> = HashMap::new();
+    let mut kept_order: Vec<NodeRef<'_>> = Vec::new();
+    let mut roots: Vec<NodeRef<'_>> = Vec::new();
     let mut rejected: Vec<NodeId> = Vec::new();
     let mut layer = 0;
 
     while !pending.is_empty() {
         layer += 1;
-        let nodes = load_layer(store, &pending)?;
-        let chosen = judge_layer(
-            model,
-            query,
-            Stage::Layer(layer),
-            &pending,
-            &nodes,
-            &kept_order,
-            &kept,
-        )?;
+        let chosen = judge_layer(model, query, Stage::Layer(layer), &pending, &kept_order)?;
 
         let first_kept = kept_order.len();
-        for (candidate, node) in pending.into_iter().zip(nodes) {
-            let id = candidate.id;
-            if !chosen.contains(&id) {
-                rejected.push(id);
+        for candidate in pending {
+            let node = candidate.node;
+            if !chosen.contains(node.id()) {
+                rejected.push(node.id().to_owned());
                 continue;
             }
             match candidate.sources.split_first() {
-                None => roots.push(id.clone()),
+                None => roots.push(node),
                 Some((parent, others)) => {
                     kept.get_mut(parent)
                         .expect("来源必已保留")
                         .children
-                        .push(id.clone());
+                        .push(node);
                     for other in others {
                         kept.get_mut(other)
                             .expect("来源必已保留")
                             .references
-                            .push(id.clone());
+                            .push(node);
                     }
                 }
             }
-            kept.insert(
-                id.clone(),
-                Kept {
-                    node,
-                    children: Vec::new(),
-                    references: Vec::new(),
-                },
-            );
-            kept_order.push(id);
+            kept.insert(node, Kept::default());
+            kept_order.push(node);
         }
 
         pending = expand(&kept_order[first_kept..], &mut kept, &mut visited);
     }
 
-    let roots = roots.iter().map(|id| build_tree(id, &kept)).collect();
+    let roots = roots.iter().map(|node| build_tree(*node, &kept)).collect();
     Ok(KnowledgeTree {
         query: query.to_owned(),
         roots,
@@ -103,12 +84,12 @@ pub fn retrieve(
     })
 }
 
-fn select_entries(
-    store: &impl Store,
+fn select_entries<'m>(
+    memory: &'m Memory,
     model: &dyn Model,
     query: &str,
-) -> Result<Vec<NodeId>, Error> {
-    let catalog = store.catalog()?;
+) -> Result<Vec<NodeRef<'m>>, Error> {
+    let catalog = memory.catalog();
     let known: HashSet<&str> = catalog
         .sections
         .iter()
@@ -121,56 +102,39 @@ fn select_entries(
     let stage = Stage::Catalog;
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
-    for id in ask(model, stage, &prompt::select_entries(query, &catalog))? {
+    for id in ask(model, stage, &prompt::select_entries(query, catalog))? {
         if !known.contains(id.as_str()) {
             return Err(Error::InvalidChoice { stage, id });
         }
         if seen.insert(id.clone()) {
-            entries.push(id);
+            // 校验过的知识库里，总表的代表节点一定存在。
+            entries.push(memory.node(&id).expect("总表的代表节点必定存在"));
         }
     }
     Ok(entries)
-}
-
-fn load_layer(store: &impl Store, pending: &[Pending]) -> Result<Vec<Node>, Error> {
-    pending
-        .iter()
-        .map(|p| {
-            store.node(&p.id)?.ok_or_else(|| match p.sources.first() {
-                Some(referrer) => Error::BrokenLink {
-                    id: p.id.clone(),
-                    referrer: referrer.clone(),
-                },
-                None => Error::MissingEntry(p.id.clone()),
-            })
-        })
-        .collect()
 }
 
 fn judge_layer(
     model: &dyn Model,
     query: &str,
     stage: Stage,
-    pending: &[Pending],
-    nodes: &[Node],
-    kept_order: &[NodeId],
-    kept: &HashMap<NodeId, Kept>,
+    pending: &[Pending<'_>],
+    kept_order: &[NodeRef<'_>],
 ) -> Result<HashSet<NodeId>, Error> {
-    let kept_nodes: Vec<&Node> = kept_order.iter().map(|id| &kept[id].node).collect();
     let candidates: Vec<prompt::Candidate<'_>> = pending
         .iter()
-        .zip(nodes)
-        .map(|(p, node)| prompt::Candidate {
-            node,
+        .map(|p| prompt::Candidate {
+            node: p.node,
             sources: &p.sources,
         })
         .collect();
-    let prompt = prompt::judge_layer(query, &kept_nodes, &candidates);
+    let prompt = prompt::judge_layer(query, kept_order, &candidates);
 
     let chosen: HashSet<NodeId> = ask(model, stage, &prompt)?.into_iter().collect();
+    let candidate_ids: HashSet<&str> = pending.iter().map(|p| p.node.id()).collect();
     match chosen
         .iter()
-        .find(|id| !pending.iter().any(|p| &p.id == *id))
+        .find(|id| !candidate_ids.contains(id.as_str()))
     {
         Some(id) => Err(Error::InvalidChoice {
             stage,
@@ -202,32 +166,32 @@ fn choice_schema() -> Value {
 
 /// 收集这一层保留节点的关联，得到下一层候选。
 /// 遇到已保留的节点只记引用，遇到已丢弃的节点直接忽略。
-fn expand(
-    layer_kept: &[NodeId],
-    kept: &mut HashMap<NodeId, Kept>,
-    visited: &mut HashSet<NodeId>,
-) -> Vec<Pending> {
-    let mut next: Vec<Pending> = Vec::new();
-    let mut next_index: HashMap<NodeId, usize> = HashMap::new();
+fn expand<'m>(
+    layer_kept: &[NodeRef<'m>],
+    kept: &mut HashMap<NodeRef<'m>, Kept<'m>>,
+    visited: &mut HashSet<NodeRef<'m>>,
+) -> Vec<Pending<'m>> {
+    let mut next: Vec<Pending<'m>> = Vec::new();
+    let mut next_index: HashMap<NodeRef<'m>, usize> = HashMap::new();
 
-    for id in layer_kept {
-        for related in kept[id].node.related.clone() {
-            if &related == id {
+    for &node in layer_kept {
+        for related in node.related() {
+            if related == node {
                 continue;
             }
             if let Some(&i) = next_index.get(&related) {
                 let sources = &mut next[i].sources;
-                if !sources.contains(id) {
-                    sources.push(id.clone());
+                if !sources.contains(&node) {
+                    sources.push(node);
                 }
-            } else if visited.insert(related.clone()) {
-                next_index.insert(related.clone(), next.len());
+            } else if visited.insert(related) {
+                next_index.insert(related, next.len());
                 next.push(Pending {
-                    id: related,
-                    sources: vec![id.clone()],
+                    node: related,
+                    sources: vec![node],
                 });
             } else if kept.contains_key(&related) {
-                let references = &mut kept.get_mut(id).expect("来自已保留节点").references;
+                let references = &mut kept.get_mut(&node).expect("来自已保留节点").references;
                 if !references.contains(&related) {
                     references.push(related);
                 }
@@ -237,19 +201,23 @@ fn expand(
     next
 }
 
-fn build_tree(id: &str, kept: &HashMap<NodeId, Kept>) -> TreeNode {
-    let entry = &kept[id];
+fn build_tree(node: NodeRef<'_>, kept: &HashMap<NodeRef<'_>, Kept<'_>>) -> TreeNode {
+    let entry = &kept[&node];
     TreeNode {
-        id: entry.node.id.clone(),
-        title: entry.node.title.clone(),
-        description: entry.node.description.clone(),
-        evidence: entry.node.evidence.clone(),
+        id: node.id().to_owned(),
+        title: node.title().to_owned(),
+        description: node.description().to_owned(),
+        evidence: node.evidence(),
         children: entry
             .children
             .iter()
-            .map(|child| build_tree(child, kept))
+            .map(|child| build_tree(*child, kept))
             .collect(),
-        references: entry.references.clone(),
+        references: entry
+            .references
+            .iter()
+            .map(|reference| reference.id().to_owned())
+            .collect(),
     }
 }
 
@@ -259,57 +227,53 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::knowledge::{Catalog, CatalogEntry, Section};
+    use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, Section};
+    use crate::parse::ParsedKnowledge;
+    use crate::source::in_memory::InMemorySources;
 
-    struct MemStore {
-        entries: Vec<&'static str>,
-        nodes: HashMap<String, Node>,
+    /// `graph` 的每一项是（节点，相关节点），`entries` 是总表的代表节点。
+    fn memory(entries: &[&str], graph: &[(&str, &[&str])]) -> Memory {
+        memory_with(entries, graph, |_| {})
     }
 
-    impl MemStore {
-        /// `graph` 的每一项是（节点，相关节点）。
-        fn new(entries: &[&'static str], graph: &[(&str, &[&str])]) -> Self {
-            let nodes = graph
-                .iter()
-                .map(|(id, related)| {
-                    let node = Node {
-                        id: id.to_string(),
-                        title: format!("标题{id}"),
-                        description: format!("描述{id}"),
-                        evidence: Vec::new(),
-                        related: related.iter().map(|r| r.to_string()).collect(),
-                    };
-                    (id.to_string(), node)
-                })
-                .collect();
-            Self {
-                entries: entries.to_vec(),
-                nodes,
-            }
-        }
-    }
-
-    impl Store for MemStore {
-        fn catalog(&self) -> Result<Catalog, Error> {
-            let nodes = self
-                .entries
-                .iter()
-                .map(|id| CatalogEntry {
+    fn memory_with(
+        entries: &[&str],
+        graph: &[(&str, &[&str])],
+        change: impl Fn(&mut Node),
+    ) -> Memory {
+        let mut sources = InMemorySources::new();
+        let source = sources.insert(b"text".to_vec());
+        let nodes = graph
+            .iter()
+            .map(|(id, related)| {
+                let mut node = Node {
                     id: id.to_string(),
                     title: format!("标题{id}"),
-                })
-                .collect();
-            Ok(Catalog {
-                sections: vec![Section {
-                    name: "板块".into(),
-                    nodes,
-                }],
+                    description: format!("描述{id}"),
+                    evidence: vec![Evidence::Source {
+                        source: source.clone(),
+                        locator: Locator::TextRange { start: 0, end: 4 },
+                    }],
+                    related: related.iter().map(|r| r.to_string()).collect(),
+                };
+                change(&mut node);
+                node
             })
-        }
-
-        fn node(&self, id: &str) -> Result<Option<Node>, Error> {
-            Ok(self.nodes.get(id).cloned())
-        }
+            .collect();
+        let entries = entries
+            .iter()
+            .map(|id| CatalogEntry {
+                id: id.to_string(),
+                title: format!("标题{id}"),
+            })
+            .collect();
+        let catalog = Catalog {
+            sections: vec![Section {
+                name: "板块".into(),
+                nodes: entries,
+            }],
+        };
+        Memory::from_parsed(ParsedKnowledge { catalog, nodes }, &sources).unwrap()
     }
 
     /// 依次返回预设答案，并记录收到的每个请求。
@@ -373,7 +337,7 @@ mod tests {
 
     #[test]
     fn crawls_layer_by_layer_and_builds_tree() {
-        let store = MemStore::new(
+        let memory = memory(
             &["a", "b"],
             &[
                 ("a", &["c", "d"]),
@@ -386,7 +350,7 @@ mod tests {
         );
         let model = ScriptedModel::new(&[&["a", "b"], &["a"], &["c"], &["e"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         // 总表一次，三层各一次：每层只调用一次模型。
         assert_eq!(model.calls(), 4);
@@ -398,6 +362,7 @@ mod tests {
         let a = &tree.roots[0];
         assert_eq!(a.id, "a");
         assert_eq!(a.description, "描述a");
+        assert_eq!(a.evidence.len(), 1);
         assert_eq!(child_ids(a), ["c"]);
         assert_eq!(child_ids(&a.children[0]), ["e"]);
         // d 被丢弃后不再往下爬，f 从未被读取。
@@ -406,10 +371,10 @@ mod tests {
 
     #[test]
     fn candidates_are_sent_in_full() {
-        let store = MemStore::new(&["a"], &[("a", &["b"]), ("b", &[])]);
+        let memory = memory(&["a"], &[("a", &["b"]), ("b", &[])]);
         let model = ScriptedModel::new(&[&["a"], &["a"], &[]]);
 
-        retrieve(&store, &model, "问题").unwrap();
+        retrieve(&memory, &model, "问题").unwrap();
 
         let request = model.request(2);
         assert_eq!(request["query"], "问题");
@@ -417,14 +382,15 @@ mod tests {
         let candidate = &request["candidates"][0];
         assert_eq!(candidate["description"], "描述b");
         assert_eq!(candidate["sources"][0], "a");
+        assert_eq!(model.request(1)["candidates"][0]["related"], json!(["b"]));
     }
 
     #[test]
     fn cycle_terminates_with_reference() {
-        let store = MemStore::new(&["a"], &[("a", &["b"]), ("b", &["c"]), ("c", &["a"])]);
+        let memory = memory(&["a"], &[("a", &["b"]), ("b", &["c"]), ("c", &["a"])]);
         let model = ScriptedModel::new(&[&["a"], &["a"], &["b"], &["c"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         assert_eq!(model.calls(), 4);
         let a = &tree.roots[0];
@@ -437,10 +403,10 @@ mod tests {
     #[test]
     fn rejected_node_is_not_judged_again() {
         // b 在第一层被丢弃；第二层的 c 又指向 b。
-        let store = MemStore::new(&["a", "b"], &[("a", &["c"]), ("b", &[]), ("c", &["b"])]);
+        let memory = memory(&["a", "b"], &[("a", &["c"]), ("b", &[]), ("c", &["b"])]);
         let model = ScriptedModel::new(&[&["a", "b"], &["a"], &["c"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         assert_eq!(model.calls(), 3);
         assert_eq!(tree.rejected, ["b"]);
@@ -450,15 +416,15 @@ mod tests {
 
     #[test]
     fn shared_candidate_hangs_on_first_source_only() {
-        let store = MemStore::new(&["a", "b"], &[("a", &["c"]), ("b", &["c"]), ("c", &[])]);
+        let memory = memory(&["a", "b"], &[("a", &["c"]), ("b", &["c"]), ("c", &[])]);
         let model = ScriptedModel::new(&[&["a", "b"], &["a", "b"], &["c"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         assert_eq!(model.candidate_ids(2), ["c"]);
         assert_eq!(
             model.request(2)["candidates"][0]["sources"],
-            serde_json::json!(["a", "b"])
+            json!(["a", "b"])
         );
         assert_eq!(child_ids(&tree.roots[0]), ["c"]);
         assert!(tree.roots[1].children.is_empty());
@@ -467,10 +433,10 @@ mod tests {
 
     #[test]
     fn same_layer_nodes_reference_each_other() {
-        let store = MemStore::new(&["a", "b"], &[("a", &["b"]), ("b", &["a"])]);
+        let memory = memory(&["a", "b"], &[("a", &["b"]), ("b", &["a"])]);
         let model = ScriptedModel::new(&[&["a", "b"], &["a", "b"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         assert_eq!(model.calls(), 2);
         assert_eq!(tree.roots[0].references, ["b"]);
@@ -479,35 +445,32 @@ mod tests {
 
     #[test]
     fn self_and_duplicate_links_are_ignored() {
-        let store = MemStore::new(&["a"], &[("a", &["a", "b", "b"]), ("b", &[])]);
+        let memory = memory(&["a"], &[("a", &["a", "b", "b"]), ("b", &[])]);
         let model = ScriptedModel::new(&[&["a"], &["a"], &["b"]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
-        assert_eq!(
-            model.request(2)["candidates"][0]["sources"],
-            serde_json::json!(["a"])
-        );
+        assert_eq!(model.request(2)["candidates"][0]["sources"], json!(["a"]));
         assert_eq!(child_ids(&tree.roots[0]), ["b"]);
         assert!(tree.roots[0].references.is_empty());
     }
 
     #[test]
     fn duplicate_entries_are_deduplicated() {
-        let store = MemStore::new(&["a"], &[("a", &[])]);
+        let memory = memory(&["a"], &[("a", &[])]);
         let model = ScriptedModel::new(&[&["a", "a"], &["a"]]);
 
-        retrieve(&store, &model, "问题").unwrap();
+        retrieve(&memory, &model, "问题").unwrap();
 
         assert_eq!(model.candidate_ids(1), ["a"]);
     }
 
     #[test]
     fn no_entries_gives_empty_tree() {
-        let store = MemStore::new(&["a"], &[("a", &[])]);
+        let memory = memory(&["a"], &[("a", &[])]);
         let model = ScriptedModel::new(&[&[]]);
 
-        let tree = retrieve(&store, &model, "问题").unwrap();
+        let tree = retrieve(&memory, &model, "问题").unwrap();
 
         assert!(tree.roots.is_empty());
         assert_eq!(model.calls(), 1);
@@ -515,22 +478,25 @@ mod tests {
 
     #[test]
     fn empty_catalog_skips_the_model() {
-        let store = MemStore::new(&[], &[]);
+        let memory = memory(&[], &[]);
         let model = ScriptedModel::new(&[]);
 
-        assert!(retrieve(&store, &model, "问题").unwrap().roots.is_empty());
+        assert!(retrieve(&memory, &model, "问题").unwrap().roots.is_empty());
         assert_eq!(model.calls(), 0);
     }
 
     #[test]
     fn overflow_names_the_layer_and_excess() {
         let big = "很长".repeat(1000);
-        let mut store = MemStore::new(&["a"], &[("a", &["b"]), ("b", &[])]);
-        store.nodes.get_mut("b").unwrap().description = big;
+        let memory = memory_with(&["a"], &[("a", &["b"]), ("b", &[])], |node| {
+            if node.id == "b" {
+                node.description = big.clone();
+            }
+        });
         let mut model = ScriptedModel::new(&[&["a"], &["a"]]);
         model.limit = 1000;
 
-        let err = retrieve(&store, &model, "问题").unwrap_err();
+        let err = retrieve(&memory, &model, "问题").unwrap_err();
 
         let Error::ContextOverflow {
             stage,
@@ -557,11 +523,11 @@ mod tests {
 
     #[test]
     fn overflow_on_catalog() {
-        let store = MemStore::new(&["a"], &[("a", &[])]);
+        let memory = memory(&["a"], &[("a", &[])]);
         let mut model = ScriptedModel::new(&[]);
         model.limit = 1;
 
-        let err = retrieve(&store, &model, "问题").unwrap_err();
+        let err = retrieve(&memory, &model, "问题").unwrap_err();
 
         assert!(matches!(
             err,
@@ -572,45 +538,30 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn broken_link_names_the_referrer() {
-        let store = MemStore::new(&["a"], &[("a", &["ghost"])]);
-        let model = ScriptedModel::new(&[&["a"], &["a"]]);
-
-        let err = retrieve(&store, &model, "问题").unwrap_err();
-
-        assert!(
-            matches!(&err, Error::BrokenLink { id, referrer } if id == "ghost" && referrer == "a")
-        );
-    }
-
-    #[test]
-    fn catalog_entry_without_node_is_an_error() {
-        let store = MemStore::new(&["a"], &[]);
-        let model = ScriptedModel::new(&[&["a"]]);
-
-        let err = retrieve(&store, &model, "问题").unwrap_err();
-
-        assert!(matches!(err, Error::MissingEntry(id) if id == "a"));
-    }
-
+    /// b 存在，但不在总表里：入口只能从总表选。
     #[test]
     fn choosing_outside_catalog_is_an_error() {
-        let store = MemStore::new(&["a"], &[("a", &[]), ("b", &[])]);
+        let memory = memory(&["a"], &[("a", &["b"]), ("b", &[])]);
         let model = ScriptedModel::new(&[&["b"]]);
 
-        let err = retrieve(&store, &model, "问题").unwrap_err();
+        let err = retrieve(&memory, &model, "问题").unwrap_err();
 
-        assert!(matches!(err, Error::InvalidChoice { stage: Stage::Catalog, id } if id == "b"));
+        assert!(matches!(
+            err,
+            Error::InvalidChoice { stage: Stage::Catalog, id } if id == "b"
+        ));
     }
 
     #[test]
     fn choosing_outside_candidates_is_an_error() {
-        let store = MemStore::new(&["a"], &[("a", &[])]);
+        let memory = memory(&["a"], &[("a", &[])]);
         let model = ScriptedModel::new(&[&["a"], &["z"]]);
 
-        let err = retrieve(&store, &model, "问题").unwrap_err();
+        let err = retrieve(&memory, &model, "问题").unwrap_err();
 
-        assert!(matches!(err, Error::InvalidChoice { stage: Stage::Layer(1), id } if id == "z"));
+        assert!(matches!(
+            err,
+            Error::InvalidChoice { stage: Stage::Layer(1), id } if id == "z"
+        ));
     }
 }

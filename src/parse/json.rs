@@ -11,7 +11,6 @@ use crate::knowledge::{Catalog, Node};
 use crate::memory::Memory;
 use crate::source::file::FileSources;
 use crate::source::in_memory::InMemorySources;
-use crate::store::Store;
 
 /// JSON 目录格式：`catalog.json` 加 `nodes/<节点地址>.json`。来源不会被读取，它们留在固态硬盘上。
 ///
@@ -66,9 +65,12 @@ pub fn save(memory: &Memory, sources: &InMemorySources, dir: &Path) -> Result<()
         .map_err(|e| Error::Save(format!("{}：{e}", nodes_dir.display())))?;
 
     for node in memory.nodes() {
-        write_json(&nodes_dir.join(format!("{}.json", node.id)), node)?;
+        write_json(
+            &nodes_dir.join(format!("{}.json", node.id())),
+            &node.to_node(),
+        )?;
     }
-    write_json(&dir.join("catalog.json"), &memory.catalog()?)
+    write_json(&dir.join("catalog.json"), memory.catalog())
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
@@ -195,8 +197,8 @@ mod tests {
         let sources = FileSources::new(demo_path());
 
         for node in memory.nodes() {
-            let evidence = memory.evidence(&node.id, &sources).unwrap();
-            assert!(!evidence.is_empty(), "{}", node.id);
+            let evidence = memory.evidence(node.id(), &sources).unwrap();
+            assert!(!evidence.is_empty(), "{}", node.id());
         }
         let LoadedEvidence::Source { text, .. } = &memory.evidence("drop", &sources).unwrap()[0]
         else {
@@ -265,14 +267,14 @@ mod tests {
 
         let target_sources = FileSources::new(&target);
         let loaded = Memory::load(&JsonParser, &target_sources, &target).unwrap();
-        assert_eq!(loaded.catalog().unwrap(), original.catalog().unwrap());
+        assert_eq!(loaded.catalog(), original.catalog());
         assert_eq!(loaded.node_count(), original.node_count());
         let demo = FileSources::new(demo_path());
         for node in original.nodes() {
-            assert_eq!(loaded.node(&node.id).unwrap().as_ref(), Some(node));
+            assert_eq!(loaded.node(node.id()).unwrap().to_node(), node.to_node());
             assert_eq!(
-                loaded.evidence(&node.id, &target_sources).unwrap(),
-                original.evidence(&node.id, &demo).unwrap()
+                loaded.evidence(node.id(), &target_sources).unwrap(),
+                original.evidence(node.id(), &demo).unwrap()
             );
         }
     }

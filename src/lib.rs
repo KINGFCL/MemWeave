@@ -3,12 +3,13 @@
 //! **这是不稳定的实验版本，接口和数据格式随时可能发生不兼容的变化。**
 
 pub mod error;
+mod ffi;
 pub mod knowledge;
 pub mod memory;
 pub mod model;
 pub mod parse;
+pub mod pool;
 mod prompt;
 pub mod retrieve;
 pub mod source;
-pub mod store;
 pub mod weave;

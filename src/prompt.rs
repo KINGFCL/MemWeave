@@ -1,6 +1,7 @@
 use serde_json::json;
 
-use crate::knowledge::{Catalog, Node, NodeId};
+use crate::knowledge::Catalog;
+use crate::memory::NodeRef;
 use crate::model::Prompt;
 
 const SELECT_ENTRIES: &str = "\
@@ -35,24 +36,26 @@ pub fn select_entries(query: &str, catalog: &Catalog) -> Prompt {
 
 /// 一个待判断的候选节点及其来源。
 pub struct Candidate<'a> {
-    pub node: &'a Node,
-    pub sources: &'a [NodeId],
+    pub node: NodeRef<'a>,
+    pub sources: &'a [NodeRef<'a>],
 }
 
-pub fn judge_layer(query: &str, kept: &[&Node], candidates: &[Candidate<'_>]) -> Prompt {
+pub fn judge_layer(query: &str, kept: &[NodeRef<'_>], candidates: &[Candidate<'_>]) -> Prompt {
     let kept: Vec<_> = kept
         .iter()
-        .map(|n| json!({ "id": n.id, "title": n.title }))
+        .map(|n| json!({ "id": n.id(), "title": n.title() }))
         .collect();
     let candidates: Vec<_> = candidates
         .iter()
         .map(|c| {
+            let related: Vec<&str> = c.node.related().map(NodeRef::id).collect();
+            let sources: Vec<&str> = c.sources.iter().map(|s| s.id()).collect();
             json!({
-                "id": c.node.id,
-                "title": c.node.title,
-                "description": c.node.description,
-                "related": c.node.related,
-                "sources": c.sources,
+                "id": c.node.id(),
+                "title": c.node.title(),
+                "description": c.node.description(),
+                "related": related,
+                "sources": sources,
             })
         })
         .collect();

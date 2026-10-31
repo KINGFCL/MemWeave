@@ -32,17 +32,8 @@ pub enum Error {
         limit: usize,
     },
 
-    #[error("节点 {referrer} 关联的节点 {id} 不存在")]
-    BrokenLink { id: NodeId, referrer: NodeId },
-
-    #[error("总表中的节点 {0} 不存在")]
-    MissingEntry(NodeId),
-
     #[error("{stage}：模型选择了候选之外的节点 {id}")]
     InvalidChoice { stage: Stage, id: NodeId },
-
-    #[error("知识库读取失败：{0}")]
-    Store(String),
 
     #[error("知识库解析失败，共 {} 个问题：\n{}", .0.len(), bullet_list(.0))]
     Parse(Vec<String>),
@@ -61,6 +52,9 @@ pub enum Error {
 
     #[error("节点 {0} 不存在")]
     UnknownNode(NodeId),
+
+    #[error("内存不足")]
+    OutOfMemory,
 
     #[error("模型调用失败：{0}")]
     Model(String),

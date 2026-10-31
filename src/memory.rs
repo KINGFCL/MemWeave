@@ -1,22 +1,138 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::path::Path;
+use std::ptr::{self, NonNull};
+use std::slice;
+use std::str;
+use std::sync::atomic::Ordering;
 
 use thiserror::Error;
 
 use crate::error::Error;
+use crate::ffi::{self, RawBytes, RawNode};
 use crate::knowledge::{Catalog, Evidence, Locator, Node, NodeId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
-use crate::store::Store;
 
 /// 节点地址的长度上限。地址可能被用作文件名，大多数文件系统限制为 255 字节。
 const MAX_ID_BYTES: usize = 200;
 
 /// 内存中的知识图。只能通过校验后的解析结果创建，所以关联和总表都是一致的。
-#[derive(Debug)]
+///
+/// 节点放在 C++ 内存池里，节点之间直接用地址相连。文本地址的索引只用在边界上：
+/// 把模型的回答和命令行参数对应回节点，遍历时不经过它。
 pub struct Memory {
     catalog: Catalog,
-    nodes: HashMap<NodeId, Node>,
+    graph: NonNull<ffi::RawGraph>,
+    index: HashMap<NodeId, NonNull<RawNode>>,
+}
+
+// 创建完成后图是只读的，节点的内容和关联都不会再变化，可以跨线程共享。
+unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
+
+impl fmt::Debug for Memory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Memory")
+            .field("nodes", &self.index.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        unsafe { ffi::mw_graph_free(self.graph.as_ptr()) }
+    }
+}
+
+/// 一个节点的地址。读取字段是直接解引用，复制和比较都是比较地址。
+#[derive(Clone, Copy)]
+pub struct NodeRef<'m> {
+    raw: NonNull<RawNode>,
+    memory: PhantomData<&'m Memory>,
+}
+
+impl<'m> NodeRef<'m> {
+    fn new(raw: NonNull<RawNode>) -> Self {
+        Self {
+            raw,
+            memory: PhantomData,
+        }
+    }
+
+    fn raw(self) -> &'m RawNode {
+        // 节点来自 Memory，在 `'m` 期间一直有效。
+        unsafe { self.raw.as_ref() }
+    }
+
+    pub fn id(self) -> &'m str {
+        text(self.raw().id)
+    }
+
+    pub fn title(self) -> &'m str {
+        text(self.raw().title)
+    }
+
+    pub fn description(self) -> &'m str {
+        text(self.raw().description)
+    }
+
+    /// 相关节点。遍历时只解引用地址，不做任何查找。
+    pub fn related(self) -> impl ExactSizeIterator<Item = NodeRef<'m>> + Clone + use<'m> {
+        let list = self.raw().related.load(Ordering::Acquire);
+        let related: &'m [NonNull<RawNode>] = if list.is_null() {
+            &[]
+        } else {
+            // 列表由 C++ 分配，头部之后紧跟 count 个节点地址。
+            unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count) }
+        };
+        related.iter().map(|raw| NodeRef::new(*raw))
+    }
+
+    /// 解析节点的证据。证据只有在需要时才解析。
+    pub fn evidence(self) -> Vec<Evidence> {
+        let bytes = self.raw().evidence;
+        serde_json::from_slice(unsafe { slice::from_raw_parts(bytes.data, bytes.len) })
+            .expect("证据是创建节点时序列化的")
+    }
+
+    /// 复制出完整的节点。
+    pub fn to_node(self) -> Node {
+        Node {
+            id: self.id().to_owned(),
+            title: self.title().to_owned(),
+            description: self.description().to_owned(),
+            evidence: self.evidence(),
+            related: self.related().map(|node| node.id().to_owned()).collect(),
+        }
+    }
+}
+
+impl fmt::Debug for NodeRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("NodeRef").field(&self.id()).finish()
+    }
+}
+
+impl PartialEq for NodeRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        ptr::eq(self.raw.as_ptr(), other.raw.as_ptr())
+    }
+}
+
+impl Eq for NodeRef<'_> {}
+
+impl Hash for NodeRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw.as_ptr().hash(state);
+    }
+}
+
+fn text<'m>(bytes: RawBytes) -> &'m str {
+    // 内容是创建节点时从 &str 复制的，在 Memory 存活期间不变。
+    unsafe { str::from_utf8_unchecked(slice::from_raw_parts(bytes.data, bytes.len)) }
 }
 
 /// 校验时发现的问题。
@@ -82,11 +198,50 @@ impl Memory {
             return Err(Error::InvalidMemory(problems));
         }
         let ParsedKnowledge { catalog, nodes } = parsed;
-        let nodes = nodes
-            .into_iter()
-            .map(|node| (node.id.clone(), node))
-            .collect();
-        Ok(Self { catalog, nodes })
+
+        let graph = NonNull::new(unsafe { ffi::mw_graph_new() }).ok_or(Error::OutOfMemory)?;
+        // 先放进结构体：中途失败时由 Drop 释放整个图。
+        let mut memory = Self {
+            catalog,
+            graph,
+            index: HashMap::with_capacity(nodes.len()),
+        };
+        // 先分配所有节点，再连接关联，这样关联可以直接存地址。
+        for node in &nodes {
+            let raw = memory.add_node(node)?;
+            memory.index.insert(node.id.clone(), raw);
+        }
+        let mut related = Vec::new();
+        for node in &nodes {
+            related.clear();
+            related.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
+            let connected = unsafe {
+                ffi::mw_graph_set_related(
+                    graph.as_ptr(),
+                    memory.index[&node.id].as_ptr(),
+                    related.as_ptr(),
+                    related.len(),
+                )
+            };
+            if !connected {
+                return Err(Error::OutOfMemory);
+            }
+        }
+        Ok(memory)
+    }
+
+    fn add_node(&mut self, node: &Node) -> Result<NonNull<RawNode>, Error> {
+        let evidence = serde_json::to_vec(&node.evidence).expect("证据总是可以序列化");
+        let raw = unsafe {
+            ffi::mw_graph_add_node(
+                self.graph.as_ptr(),
+                RawBytes::from_slice(node.id.as_bytes()),
+                RawBytes::from_slice(node.title.as_bytes()),
+                RawBytes::from_slice(node.description.as_bytes()),
+                RawBytes::from_slice(&evidence),
+            )
+        };
+        NonNull::new(raw).ok_or(Error::OutOfMemory)
     }
 
     /// 找出解析结果中的所有问题。
@@ -152,10 +307,9 @@ impl Memory {
         sources: &dyn SourceStore,
     ) -> Result<Vec<LoadedEvidence>, Error> {
         let node = self
-            .nodes
-            .get(id)
+            .node(id)
             .ok_or_else(|| Error::UnknownNode(id.to_owned()))?;
-        node.evidence
+        node.evidence()
             .iter()
             .map(|evidence| match evidence {
                 Evidence::Source { source, locator } => Ok(LoadedEvidence::Source {
@@ -168,13 +322,22 @@ impl Memory {
             .collect()
     }
 
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// 按文本地址找节点。这是边界上的入口，遍历时用 [`NodeRef::related`]。
+    pub fn node(&self, id: &str) -> Option<NodeRef<'_>> {
+        self.index.get(id).map(|raw| NodeRef::new(*raw))
+    }
+
     /// 所有节点，顺序不固定。
-    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.values()
+    pub fn nodes(&self) -> impl Iterator<Item = NodeRef<'_>> {
+        self.index.values().map(|raw| NodeRef::new(*raw))
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.index.len()
     }
 }
 
@@ -338,16 +501,6 @@ fn nodes_in_evidence_cycles(parsed: &ParsedKnowledge, nodes: &HashMap<&str, &Nod
         .collect()
 }
 
-impl Store for Memory {
-    fn catalog(&self) -> Result<Catalog, Error> {
-        Ok(self.catalog.clone())
-    }
-
-    fn node(&self, id: &str) -> Result<Option<Node>, Error> {
-        Ok(self.nodes.get(id).cloned())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -441,9 +594,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(memory.node_count(), 3);
-        assert_eq!(memory.catalog().unwrap(), catalog(&["a"]));
-        assert_eq!(memory.node("c").unwrap(), Some(node("c", &["a"])));
-        assert_eq!(memory.node("不存在").unwrap(), None);
+        assert_eq!(memory.catalog(), &catalog(&["a"]));
+        assert_eq!(memory.node("c").unwrap().to_node(), node("c", &["a"]));
+        assert!(memory.node("不存在").is_none());
     }
 
     #[test]
@@ -551,7 +704,7 @@ mod tests {
 
         let memory = Memory::load(&OneNodeParser, &sources(), Path::new("x")).unwrap();
 
-        assert_eq!(memory.node("x").unwrap(), Some(node("x", &[])));
+        assert_eq!(memory.node("x").unwrap().to_node(), node("x", &[]));
     }
 
     #[test]
@@ -766,5 +919,67 @@ mod tests {
             memory.evidence("不存在", &sources()),
             Err(Error::UnknownNode(_))
         ));
+    }
+
+    #[test]
+    fn nodes_are_connected_by_address() {
+        let memory = build(
+            &["a"],
+            vec![node("a", &["b", "c"]), node("b", &["a"]), node("c", &[])],
+        )
+        .unwrap();
+
+        let a = memory.node("a").unwrap();
+        let related: Vec<NodeRef<'_>> = a.related().collect();
+
+        assert_eq!(
+            related,
+            [memory.node("b").unwrap(), memory.node("c").unwrap()]
+        );
+        // 沿着地址走回来，得到的是同一个节点。
+        assert!(related[0].related().next().unwrap() == a);
+        assert_eq!(related[1].related().len(), 0);
+        assert_eq!(a.id(), "a");
+        assert_eq!(a.title(), "标题a");
+        assert_eq!(a.description(), "描述a");
+    }
+
+    #[test]
+    fn empty_strings_are_stored() {
+        let mut empty = node("a", &[]);
+        empty.title = String::new();
+        empty.description = String::new();
+
+        let memory = build(&["a"], vec![empty.clone()]).unwrap();
+
+        assert_eq!(memory.node("a").unwrap().to_node(), empty);
+    }
+
+    #[test]
+    fn long_text_survives_the_pool() {
+        // 超过 chunk 大小的内容走单独的分配。
+        let mut large = node("a", &[]);
+        large.description = "长".repeat(2 * 1024 * 1024);
+
+        let memory = build(&["a"], vec![large.clone()]).unwrap();
+
+        assert_eq!(memory.node("a").unwrap().description(), large.description);
+    }
+
+    #[test]
+    fn reads_are_shared_across_threads() {
+        let memory = build(&["a"], vec![node("a", &["b"]), node("b", &["a"])]).unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut current = memory.node("a").unwrap();
+                    for _ in 0..1000 {
+                        current = current.related().next().unwrap();
+                    }
+                    assert_eq!(current.id(), "a");
+                });
+            }
+        });
     }
 }
