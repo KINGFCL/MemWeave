@@ -8,6 +8,9 @@ use crate::knowledge::{Catalog, Node, NodeId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::store::Store;
 
+/// 节点地址的长度上限。地址可能被用作文件名，大多数文件系统限制为 255 字节。
+const MAX_ID_BYTES: usize = 200;
+
 /// 内存中的知识图。只能通过校验后的解析结果创建，所以关联和总表都是一致的。
 #[derive(Debug)]
 pub struct Memory {
@@ -18,6 +21,9 @@ pub struct Memory {
 /// 校验时发现的问题。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Problem {
+    #[error("节点地址 {id:?} 不合法：只能包含字母、数字、- 和 _，且不超过 {MAX_ID_BYTES} 字节")]
+    InvalidId { id: NodeId },
+
     #[error("节点 {id} 重复")]
     DuplicateNode { id: NodeId },
 
@@ -39,23 +45,39 @@ impl Memory {
 
     /// 校验解析结果并建图。有问题时一次报告所有问题。
     pub fn from_parsed(parsed: ParsedKnowledge) -> Result<Self, Error> {
+        let problems = Self::validate(&parsed);
+        if !problems.is_empty() {
+            return Err(Error::InvalidMemory(problems));
+        }
         let ParsedKnowledge { catalog, nodes } = parsed;
+        let nodes = nodes
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        Ok(Self { catalog, nodes })
+    }
+
+    /// 找出解析结果中的所有问题。
+    pub fn validate(parsed: &ParsedKnowledge) -> Vec<Problem> {
         let mut problems = Vec::new();
 
-        let mut order = Vec::with_capacity(nodes.len());
-        let mut by_id = HashMap::with_capacity(nodes.len());
-        for node in nodes {
-            if by_id.contains_key(&node.id) {
-                problems.push(Problem::DuplicateNode { id: node.id });
-            } else {
-                order.push(node.id.clone());
-                by_id.insert(node.id.clone(), node);
+        let mut by_id = HashMap::with_capacity(parsed.nodes.len());
+        for node in &parsed.nodes {
+            if !is_valid_id(&node.id) {
+                problems.push(Problem::InvalidId {
+                    id: node.id.clone(),
+                });
+            }
+            if by_id.insert(node.id.as_str(), node).is_some() {
+                problems.push(Problem::DuplicateNode {
+                    id: node.id.clone(),
+                });
             }
         }
 
-        for section in &catalog.sections {
+        for section in &parsed.catalog.sections {
             for entry in &section.nodes {
-                if !by_id.contains_key(&entry.id) {
+                if !by_id.contains_key(entry.id.as_str()) {
                     problems.push(Problem::MissingEntry {
                         section: section.name.clone(),
                         id: entry.id.clone(),
@@ -64,32 +86,32 @@ impl Memory {
             }
         }
 
-        for id in &order {
-            for related in &by_id[id].related {
-                if !by_id.contains_key(related) {
+        for node in &parsed.nodes {
+            for related in &node.related {
+                if !by_id.contains_key(related.as_str()) {
                     problems.push(Problem::BrokenLink {
                         id: related.clone(),
-                        referrer: id.clone(),
+                        referrer: node.id.clone(),
                     });
                 }
             }
         }
 
-        let reachable = reachable_from_catalog(&catalog, &by_id);
-        problems.extend(
-            order
-                .iter()
-                .filter(|id| !reachable.contains(id.as_str()))
-                .map(|id| Problem::Unreachable { id: id.clone() }),
-        );
-
-        if !problems.is_empty() {
-            return Err(Error::InvalidMemory(problems));
+        let reachable = reachable_from_catalog(&parsed.catalog, &by_id);
+        let mut reported = HashSet::new();
+        for node in &parsed.nodes {
+            if !reachable.contains(node.id.as_str()) && reported.insert(node.id.as_str()) {
+                problems.push(Problem::Unreachable {
+                    id: node.id.clone(),
+                });
+            }
         }
-        Ok(Self {
-            catalog,
-            nodes: by_id,
-        })
+        problems
+    }
+
+    /// 所有节点，顺序不固定。
+    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.values()
     }
 
     pub fn node_count(&self) -> usize {
@@ -97,10 +119,18 @@ impl Memory {
     }
 }
 
+fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
 /// 从所有代表节点出发，沿关联的方向找出能到达的节点。总表之外的节点只能这样被查到。
 fn reachable_from_catalog<'a>(
     catalog: &'a Catalog,
-    nodes: &'a HashMap<NodeId, Node>,
+    nodes: &HashMap<&'a str, &'a Node>,
 ) -> HashSet<&'a str> {
     let mut reachable = HashSet::new();
     let mut pending: Vec<&str> = catalog
@@ -241,6 +271,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rejects_ids_that_are_unsafe_as_addresses() {
+        let long = "长".repeat(100);
+        for id in [
+            "",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a b",
+            ".",
+            "..",
+            "a.json",
+            long.as_str(),
+        ] {
+            let problems = problems(build(&[id], vec![node(id, &[])]));
+            assert_eq!(problems, [Problem::InvalidId { id: id.into() }], "{id:?}");
+        }
+        assert!(build(&["中文-Id_1"], vec![node("中文-Id_1", &[])]).is_ok());
     }
 
     #[test]

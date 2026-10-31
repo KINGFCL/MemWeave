@@ -1,11 +1,15 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::{ParsedKnowledge, Parser};
 use crate::error::Error;
 use crate::knowledge::{Catalog, Node};
+use crate::memory::Memory;
+use crate::store::Store;
 
 /// JSON 目录格式：`catalog.json` 加 `nodes/<节点地址>.json`。
 ///
@@ -29,6 +33,42 @@ impl Parser for JsonParser {
             _ => Err(Error::Parse(problems)),
         }
     }
+}
+
+/// 确认可以写入 `dir`：它不存在，或者是空目录。不会覆盖已有内容。
+pub fn check_target(dir: &Path) -> Result<(), Error> {
+    let is_empty = match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(e) => return Err(Error::Save(format!("{}：{e}", dir.display()))),
+    };
+    if is_empty {
+        Ok(())
+    } else {
+        Err(Error::Save(format!("{} 已有内容，不会覆盖", dir.display())))
+    }
+}
+
+/// 把 `memory` 以 JSON 目录格式写入 `dir`。
+///
+/// 最后才写总表：中途失败时缺少 `catalog.json`，解析会报错，不会被当成完整的知识库。
+pub fn save(memory: &Memory, dir: &Path) -> Result<(), Error> {
+    check_target(dir)?;
+    let nodes_dir = dir.join("nodes");
+    fs::create_dir_all(&nodes_dir)
+        .map_err(|e| Error::Save(format!("{}：{e}", nodes_dir.display())))?;
+
+    for node in memory.nodes() {
+        write_json(&nodes_dir.join(format!("{}.json", node.id)), node)?;
+    }
+    write_json(&dir.join("catalog.json"), &memory.catalog()?)
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    let mut text = serde_json::to_string_pretty(value)
+        .map_err(|e| Error::Save(format!("{}：{e}", path.display())))?;
+    text.push('\n');
+    fs::write(path, text).map_err(|e| Error::Save(format!("{}：{e}", path.display())))
 }
 
 fn read_nodes(dir: &Path, problems: &mut Vec<String>) -> Vec<Node> {
@@ -90,7 +130,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::memory::Memory;
 
     const CATALOG: &str = r#"{"sections":[{"name":"板块","nodes":[{"id":"a","title":"A"}]}]}"#;
 
@@ -174,5 +213,45 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[0].contains("catalog.json"));
         assert!(problems[1].contains("nodes"));
+    }
+
+    #[test]
+    fn saved_memory_loads_back_unchanged() {
+        let source = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"));
+        let original = Memory::load(&JsonParser, source).unwrap();
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("新目录/知识库");
+
+        save(&original, &target).unwrap();
+
+        let loaded = Memory::load(&JsonParser, &target).unwrap();
+        assert_eq!(loaded.catalog().unwrap(), original.catalog().unwrap());
+        assert_eq!(loaded.node_count(), original.node_count());
+        for node in original.nodes() {
+            assert_eq!(loaded.node(&node.id).unwrap().as_ref(), Some(node));
+        }
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite() {
+        let source = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"));
+        let memory = Memory::load(&JsonParser, source).unwrap();
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("已有文件"), "内容").unwrap();
+
+        assert!(matches!(check_target(dir.path()), Err(Error::Save(_))));
+        assert!(matches!(save(&memory, dir.path()), Err(Error::Save(_))));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("已有文件")).unwrap(),
+            "内容"
+        );
+        assert!(!dir.path().join("nodes").exists());
+    }
+
+    #[test]
+    fn save_accepts_an_empty_directory() {
+        let dir = TempDir::new().unwrap();
+
+        assert!(check_target(dir.path()).is_ok());
     }
 }

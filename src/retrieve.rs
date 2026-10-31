@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::Deserialize;
+use serde_json::{Value, json};
+
 use crate::error::{Error, Stage};
 use crate::knowledge::{KnowledgeTree, Node, NodeId, TreeNode};
-use crate::model::{Model, Prompt};
+use crate::model::{Model, Prompt, generate_json};
 use crate::prompt;
 use crate::store::Store;
 
@@ -177,18 +180,24 @@ fn judge_layer(
     }
 }
 
-/// 先核对上下文上限再调用模型，超限时直接报错，不做截断。
+/// 让模型选择节点。
 fn ask(model: &dyn Model, stage: Stage, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
-    let tokens = model.count_tokens(prompt)?;
-    let limit = model.context_limit();
-    if tokens > limit {
-        return Err(Error::ContextOverflow {
-            stage,
-            tokens,
-            limit,
-        });
+    #[derive(Deserialize)]
+    struct Choice {
+        ids: Vec<NodeId>,
     }
-    model.choose(prompt)
+
+    let choice: Choice = generate_json(model, stage, prompt, &choice_schema())?;
+    Ok(choice.ids)
+}
+
+fn choice_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "ids": { "type": "array", "items": { "type": "string" } } },
+        "required": ["ids"],
+        "additionalProperties": false,
+    })
 }
 
 /// 收集这一层保留节点的关联，得到下一层候选。
@@ -248,8 +257,6 @@ fn build_tree(id: &str, kept: &HashMap<NodeId, Kept>) -> TreeNode {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
-
-    use serde_json::Value;
 
     use super::*;
     use crate::knowledge::{Catalog, CatalogEntry, Section};
@@ -349,14 +356,14 @@ mod tests {
             Ok(prompt.user.chars().count())
         }
 
-        fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
+        fn generate(&self, prompt: &Prompt, _schema: &Value) -> Result<String, Error> {
             self.prompts.borrow_mut().push(prompt.clone());
             let answer = self
                 .answers
                 .borrow_mut()
                 .pop_front()
                 .expect("模型调用次数超出预期");
-            Ok(answer.into_iter().map(String::from).collect())
+            Ok(json!({ "ids": answer }).to_string())
         }
     }
 

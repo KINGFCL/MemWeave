@@ -1,9 +1,8 @@
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::messages::MessagesClient;
 use super::{Model, Prompt};
 use crate::error::Error;
-use crate::knowledge::NodeId;
 
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/anthropic";
@@ -40,21 +39,19 @@ impl Model for DeepSeekModel {
         self.client.count_tokens(&self.model, prompt)
     }
 
-    fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
+    fn generate(&self, prompt: &Prompt, _schema: &Value) -> Result<String, Error> {
         let body = json!({
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
             "system": prompt.system,
             "messages": [{ "role": "user", "content": prompt.user }],
         });
-        self.client.choose(body, None)
+        self.client.generate(body, None)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use super::super::messages::test_support::{serve, sse, stop, text_delta};
     use super::*;
 
@@ -73,7 +70,10 @@ mod tests {
         let model = DeepSeekModel::new(&url, "key", "m", 1000);
         assert_eq!(model.context_limit(), 1000);
         assert_eq!(model.count_tokens(&prompt).unwrap(), 42);
-        assert_eq!(model.choose(&prompt).unwrap(), ["a"]);
+        assert_eq!(
+            model.generate(&prompt, &json!({})).unwrap(),
+            r#"{"ids":["a"]}"#
+        );
 
         // 第一个请求就是计数：创建模型时不查询 Models API。
         let count = requests.recv().unwrap();

@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 
 use super::Prompt;
 use crate::error::Error;
-use crate::knowledge::NodeId;
 
 const API_VERSION: &str = "2026-10-21";
 const MAX_RETRIES: u32 = 2;
@@ -80,8 +79,8 @@ impl MessagesClient {
         Ok(count.input_tokens)
     }
 
-    /// 发送一次流式请求并解析选择结果。`body` 不需要包含 `stream` 字段。
-    pub(super) fn choose(&self, mut body: Value, beta: Option<&str>) -> Result<Vec<NodeId>, Error> {
+    /// 发送一次流式请求，返回模型输出的文本。`body` 不需要包含 `stream` 字段。
+    pub(super) fn generate(&self, mut body: Value, beta: Option<&str>) -> Result<String, Error> {
         body["stream"] = json!(true);
         let body = body.to_string();
         with_retries(|| {
@@ -93,7 +92,7 @@ impl MessagesClient {
             if !response.status().is_success() {
                 return Err(status_failure(response));
             }
-            parse_choice(&read_stream(response.into_body().into_reader())?)
+            read_stream(response.into_body().into_reader())
         })
     }
 
@@ -213,28 +212,6 @@ fn read_stream(reader: impl Read) -> Result<String, Failure> {
             retryable: true,
         }),
     }
-}
-
-/// 解析模型的选择结果。不是每家厂商都支持输出格式约束，所以容忍代码块包裹，
-/// 其他格式问题交给重试。
-fn parse_choice(text: &str) -> Result<Vec<NodeId>, Failure> {
-    #[derive(Deserialize)]
-    struct Choice {
-        ids: Vec<NodeId>,
-    }
-
-    let text = text.trim();
-    let body = text
-        .strip_prefix("```json")
-        .or_else(|| text.strip_prefix("```"))
-        .and_then(|rest| rest.strip_suffix("```"))
-        .unwrap_or(text);
-    serde_json::from_str::<Choice>(body)
-        .map(|choice| choice.ids)
-        .map_err(|e| Failure {
-            message: format!("无法解析模型的选择结果：{e}"),
-            retryable: true,
-        })
 }
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
@@ -364,33 +341,6 @@ mod tests {
             json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "错" } }),
         ]);
         assert!(!read_stream(stream.as_bytes()).err().unwrap().retryable);
-    }
-
-    #[test]
-    fn parse_choice_accepts_plain_and_fenced_json() {
-        for text in [
-            r#"{"ids":["a"]}"#,
-            "  {\"ids\":[\"a\"]}\n",
-            "```json\n{\"ids\":[\"a\"]}\n```",
-            "```\n{\"ids\":[\"a\"]}\n```",
-        ] {
-            assert_eq!(parse_choice(text).ok().unwrap(), ["a"], "{text}");
-        }
-        assert!(parse_choice("a").err().unwrap().retryable);
-    }
-
-    #[test]
-    fn retries_when_the_model_ignores_the_output_format() {
-        let (url, _requests) = serve(vec![
-            (200, sse(&[text_delta("a"), stop("end_turn")])),
-            (
-                200,
-                sse(&[text_delta(r#"{"ids":["a"]}"#), stop("end_turn")]),
-            ),
-        ]);
-        let client = MessagesClient::new(&url, "key");
-
-        assert_eq!(client.choose(json!({}), None).unwrap(), ["a"]);
     }
 
     #[test]

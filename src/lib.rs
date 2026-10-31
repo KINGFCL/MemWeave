@@ -10,3 +10,4 @@ pub mod parse;
 mod prompt;
 pub mod retrieve;
 pub mod store;
+pub mod weave;

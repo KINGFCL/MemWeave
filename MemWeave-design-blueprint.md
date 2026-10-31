@@ -51,6 +51,7 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 
 | 问题 | 含义 |
 | --- | --- |
+| `InvalidId` | 节点地址不合法：只能包含字母、数字、`-` 和 `_`，且不超过 200 字节 |
 | `DuplicateNode` | 节点地址重复 |
 | `MissingEntry` | 总表的代表节点不存在 |
 | `BrokenLink` | 关联指向不存在的节点 |
@@ -58,9 +59,36 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 
 目前是全量加载，整个知识库都进入 RAM。
 
+### 记忆生成（Weaver）
+
+Weaver（织者）是生成记忆的 Agent：调用模型把原始数据组织成知识。
+
+```text
+原始数据 ──Weaver + 模型──> ParsedKnowledge ──校验──> Memory ──写入──> 固态硬盘上的知识库
+```
+
+`weave` 模块定义 `Weaver` 接口，每种数据类型是一个子模块。结果和解析器一样是 `ParsedKnowledge`，同样由 `Memory` 校验。接入 PDF、图片等新数据类型，只需要新建一个 `Weaver` 实现。实现必须保证节点的 `raw` 忠于原始数据。
+
+第一版只有 `TextWeaver`，处理文本文件：
+
+1. 把文本按行切分并编号，空行不占编号。
+2. 把编号后的原文发给模型。模型输出节点（地址、标题、原文编号、理解、关联）和板块（名称、代表节点）。
+3. 程序按编号提取 `raw`，并从节点取总表条目的标题。
+4. 检查输出，有问题就把问题反馈给模型重试，最多尝试 3 次。仍有问题则报错，不写入任何内容。
+
+设计要点：
+
+- **模型不能改动原文**：模型只返回行号，不抄写原文，所以 `raw` 一定是原文的整行。代价是一个节点的原文最小只能是一行。
+- **不丢内容**：每一行都必须至少属于一个节点，一行可以属于多个节点。
+- **总表不是索引**：每个板块 1 到 5 个代表节点，超过就算错误。
+
+除了 `Memory` 的校验，还会检查：标题和理解不为空、原文编号存在、每一行都被覆盖、板块名称不为空、代表节点数量。
+
+第一版的限制：每次只处理一个文件，生成一个全新的知识库。文本和输出必须在一次模型调用内完成，超出上下文或输出上限都会报错，不会截断。
+
 ### JSON 目录格式
 
-目前唯一的格式，由 `JsonParser` 解析：
+目前唯一的格式，由 `JsonParser` 解析，由 `json::save` 写入：
 
 ```text
 <知识库目录>/
@@ -70,6 +98,8 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 ```
 
 `examples/demo-kb` 是一个可以直接运行的示例。文件名（不含 `.json`）就是节点地址，必须与文件里的 `id` 一致。`nodes` 目录只读取第一层的 `.json` 文件，其他文件会被忽略。
+
+写入时目标目录必须不存在或为空，不会覆盖已有内容。总表最后写入：中途失败时缺少 `catalog.json`，解析会报错，不会被当成完整的知识库。
 
 ## 4. 查询流程
 
@@ -109,7 +139,7 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 
 | 错误 | 含义 |
 | --- | --- |
-| `ContextOverflow` | 总表或某一层超出模型上下文，报告阶段、token 数、上限和超出量 |
+| `ContextOverflow` | 总表、某一层或 Weaver 的输入超出模型上下文，报告阶段、token 数、上限和超出量 |
 | `Parse` | 知识库读取失败或格式不对，列出所有问题 |
 | `InvalidMemory` | 知识库校验失败，列出所有问题 |
 | `BrokenLink` | 查询时发现关联指向不存在的节点，报告关联来源。`Memory` 已提前校验，只有其他 `Store` 实现才会遇到 |
@@ -117,6 +147,8 @@ MemWeave 把知识拆成节点，由模型从目录出发，沿节点间的关�
 | `InvalidChoice` | 模型选择了候选之外的节点 |
 | `Store` | `Store` 实现读取失败。`Memory` 不会产生这个错误 |
 | `Model` | 模型调用失败、被拒绝、输出被截断或响应无法解析 |
+| `Weave` | 输入文件无法读取或没有内容，或模型多次尝试后输出仍有问题，列出所有问题 |
+| `Save` | 知识库写入失败，或目标目录已有内容 |
 
 上下文检查在每次调用模型前进行。知识库在连接模型之前解析，有问题不会产生模型费用。
 
@@ -134,9 +166,12 @@ src/
 ├─ main.rs            命令行入口，根据环境变量选择厂商
 ├─ parse/
 │  ├─ mod.rs          Parser 接口和 ParsedKnowledge
-│  └─ json.rs         JSON 目录格式
+│  └─ json.rs         JSON 目录格式的读取和写入
+├─ weave/
+│  ├─ mod.rs          Weaver 接口
+│  └─ text.rs         文本文件的记忆生成
 └─ model/
-   ├─ mod.rs          Model 接口：context_limit、count_tokens、choose
+   ├─ mod.rs          Model 接口和 generate_json
    ├─ anthropic.rs    Claude
    ├─ deepseek.rs     DeepSeek
    └─ messages.rs     Anthropic Messages 协议的内部客户端
@@ -152,9 +187,11 @@ src/
 pub trait Model {
     fn context_limit(&self) -> usize;
     fn count_tokens(&self, prompt: &Prompt) -> Result<usize, Error>;
-    fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error>;
+    fn generate(&self, prompt: &Prompt, schema: &Value) -> Result<String, Error>;
 }
 ```
+
+查询和 Weaver 都通过 `generate_json()` 调用模型。它负责和厂商无关的部分：调用前核对上下文上限，把输出解析成需要的结构，无法解析时最多尝试 3 次。
 
 `messages.rs` 只负责 Anthropic Messages 协议的传输、流式解析和重试，不对外公开。请求内容和能力差异写在各厂商自己的模块里。使用其他协议的厂商不需要依赖它。
 
@@ -164,9 +201,9 @@ pub trait Model {
 2. 在 `model/mod.rs` 中声明这个模块。
 3. 在 `main.rs` 的 `connect_model()` 中加一个分支。
 
-`choose()` 必须返回 `{"ids": [...]}` 解析后的节点地址。提示词已经要求模型只输出这个 JSON，厂商支持输出格式约束时应该同时开启。
+`generate()` 接收期望输出的 JSON Schema。提示词已经写明输出格式，厂商支持输出格式约束时应该同时开启，不支持时可以忽略。
 
-`Model` 实现要自己处理模型拒绝、输出截断等情况，并返回错误，不能把不完整的结果当作选择结果返回。
+`Model` 实现要自己处理模型拒绝、输出截断等情况，并返回错误，不能把不完整的文本当作结果返回。
 
 ### 厂商差异
 
@@ -192,6 +229,8 @@ pub trait Model {
 # DeepSeek（默认）
 export DEEPSEEK_API_KEY=...
 export MEMWEAVE_CONTEXT_LIMIT=100000
+cargo run -- weave notes.txt my-kb    # 把文本组织成新的知识库
+cargo run -- query my-kb "你的问题"   # 从知识库检索
 cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据竞争？"
 
 # Claude
@@ -214,7 +253,10 @@ cargo run -- query examples/demo-kb "为什么 Rust 能在编译期避免数据�
 
 ## 9. 暂不实现
 
-- **写入流程**：新节点如何建立关联、如何同步总表。目前知识库靠手工编辑 JSON 维护。
+- **增量写入**：把新数据织进已有的知识库，包括新节点如何和旧节点建立关联、如何更新总表。目前 Weaver 只能生成全新的知识库。
+- **长文本**：文本超出单次模型调用的能力时，分段处理再合并。目前直接报错。
+- **更多数据类型**：PDF、图片等，实现 `Weaver` 即可。
+- **更细的原文粒度**：目前一个节点的原文最小只能是一行，一整段写在一行的文本无法再拆开。
 - **常驻进程**：目前命令行每次查询都是一个新进程，都要重新解析整个知识库。`Memory` 要配合常驻进程才能发挥价值。
 - **按需加载**：知识库大到 RAM 放不下时，只把图结构和总表放在 RAM，正文按需读取。
 - **分段压缩**：某一层超出上下文时，由模型分段压缩后继续。目前直接报错。

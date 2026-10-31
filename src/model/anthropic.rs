@@ -1,10 +1,9 @@
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::messages::MessagesClient;
 use super::{Model, Prompt};
 use crate::error::Error;
-use crate::knowledge::NodeId;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -57,7 +56,7 @@ impl Model for AnthropicModel {
         self.client.count_tokens(&self.model, prompt)
     }
 
-    fn choose(&self, prompt: &Prompt) -> Result<Vec<NodeId>, Error> {
+    fn generate(&self, prompt: &Prompt, schema: &Value) -> Result<String, Error> {
         let body = json!({
             "model": self.model,
             "max_tokens": MAX_OUTPUT_TOKENS,
@@ -66,25 +65,15 @@ impl Model for AnthropicModel {
             "messages": [{ "role": "user", "content": prompt.user }],
             "output_config": {
                 "effort": "high",
-                "format": {
-                    "type": "json_schema",
-                    "schema": {
-                        "type": "object",
-                        "properties": { "ids": { "type": "array", "items": { "type": "string" } } },
-                        "required": ["ids"],
-                        "additionalProperties": false,
-                    },
-                },
+                "format": { "type": "json_schema", "schema": schema },
             },
         });
-        self.client.choose(body, Some(FALLBACK_BETA))
+        self.client.generate(body, Some(FALLBACK_BETA))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use super::super::messages::test_support::{serve, sse, stop, text_delta};
     use super::*;
 
@@ -104,7 +93,11 @@ mod tests {
         let model = AnthropicModel::connect(&url, "key", "m", None).unwrap();
         assert_eq!(model.context_limit(), 1000);
         assert_eq!(model.count_tokens(&prompt).unwrap(), 42);
-        assert_eq!(model.choose(&prompt).unwrap(), ["a", "b"]);
+        let schema = json!({ "type": "object" });
+        assert_eq!(
+            model.generate(&prompt, &schema).unwrap(),
+            r#"{"ids":["a","b"]}"#
+        );
 
         let info = requests.recv().unwrap();
         assert!(info.request_line.starts_with("GET /v1/models/m "));
@@ -134,6 +127,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["fallbacks"], "default");
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
     }
 
     #[test]

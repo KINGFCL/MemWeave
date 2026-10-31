@@ -10,6 +10,7 @@ use crate::memory::Problem;
 pub enum Stage {
     Catalog,
     Layer(usize),
+    Weave,
 }
 
 impl fmt::Display for Stage {
@@ -17,6 +18,7 @@ impl fmt::Display for Stage {
         match self {
             Stage::Catalog => write!(f, "总表"),
             Stage::Layer(layer) => write!(f, "第 {layer} 层"),
+            Stage::Weave => write!(f, "输入内容"),
         }
     }
 }
@@ -47,6 +49,12 @@ pub enum Error {
 
     #[error("知识库校验失败，共 {} 个问题：\n{}", .0.len(), bullet_list(.0))]
     InvalidMemory(Vec<Problem>),
+
+    #[error("记忆生成失败，共 {} 个问题：\n{}", .0.len(), bullet_list(.0))]
+    Weave(Vec<String>),
+
+    #[error("知识库写入失败：{0}")]
+    Save(String),
 
     #[error("模型调用失败：{0}")]
     Model(String),
