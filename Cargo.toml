@@ -1,6 +1,6 @@
 [package]
 name = "memweave"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2024"
 description = "Experimental and unstable: long-term memory for AI agents, a knowledge graph the model traverses itself, with an MCP server"
 license = "MIT OR Apache-2.0"

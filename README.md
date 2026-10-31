@@ -22,7 +22,7 @@ MemWeave 是给 AI agent 用的长期记忆基础设施。它把知识拆成节�
 记忆层用 C++ 实现，编译需要支持 C++20 的编译器。
 
 ```bash
-cargo install memweave --version 0.1.0-alpha.2
+cargo install memweave --version 0.1.0-alpha.3
 ```
 
 ## 使用
