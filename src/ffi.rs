@@ -17,11 +17,17 @@ impl RawBytes {
     }
 }
 
-/// 和 C++ 的 `NodeList` 布局相同，后面紧跟 `count` 个 `*const RawNode`。
+/// 和 C++ 的 `NodeList` 布局相同，后面紧跟 `capacity` 个 `*mut RawNode` 的位置。
 #[repr(C)]
 pub(crate) struct RawNodeList {
-    pub(crate) count: usize,
+    pub(crate) count: u32,
+    pub(crate) capacity: u32,
 }
+
+/// 和 C++ 的 `LinkKind` 取值相同。
+pub(crate) const LINK_RELATED: u32 = 0;
+pub(crate) const LINK_DEPENDENTS: u32 = 1;
+pub(crate) const LINK_RELATED_BY: u32 = 2;
 
 /// 和 C++ 的 `EvidenceKind` 取值相同。
 pub(crate) const EVIDENCE_TEXT_RANGE: u32 = 0;
@@ -63,6 +69,7 @@ pub(crate) struct RawNode {
     pub(crate) id_len: u32,
     pub(crate) title_len: u32,
     pub(crate) description_len: u32,
+    pub(crate) flags: u32,
 }
 
 #[cfg(test)]
@@ -80,7 +87,10 @@ pub(crate) struct RawLayout {
     pub(crate) node_id_len: usize,
     pub(crate) node_title_len: usize,
     pub(crate) node_description_len: usize,
+    pub(crate) node_flags: usize,
     pub(crate) node_list_header: usize,
+    pub(crate) node_list_count: usize,
+    pub(crate) node_list_capacity: usize,
     pub(crate) evidence_list_header: usize,
     pub(crate) evidence_size: usize,
     pub(crate) evidence_kind: usize,
@@ -108,26 +118,20 @@ unsafe extern "C" {
         dependents_capacity: usize,
         related_by_capacity: usize,
     ) -> *mut RawNode;
-    pub(crate) fn mw_node_set_related(
-        node: *mut RawNode,
-        related: *const *mut RawNode,
-        count: usize,
-    );
     pub(crate) fn mw_node_set_evidence_target(
         node: *mut RawNode,
         index: usize,
         target: *mut RawNode,
     );
-    pub(crate) fn mw_node_set_dependents(
+    pub(crate) fn mw_node_set_links(
         node: *mut RawNode,
-        dependents: *const *mut RawNode,
+        kind: u32,
+        nodes: *const *mut RawNode,
         count: usize,
     );
-    pub(crate) fn mw_node_set_related_by(
-        node: *mut RawNode,
-        related_by: *const *mut RawNode,
-        count: usize,
-    );
+    pub(crate) fn mw_node_reserve_links(node: *mut RawNode, kind: u32, extra: usize) -> bool;
+    pub(crate) fn mw_node_append_link(node: *mut RawNode, kind: u32, target: *mut RawNode);
+    pub(crate) fn mw_node_detach(node: *mut RawNode);
     pub(crate) fn mw_node_free(node: *mut RawNode);
 }
 
@@ -152,7 +156,10 @@ mod tests {
             node_id_len: offset_of!(RawNode, id_len),
             node_title_len: offset_of!(RawNode, title_len),
             node_description_len: offset_of!(RawNode, description_len),
+            node_flags: offset_of!(RawNode, flags),
             node_list_header: size_of::<RawNodeList>(),
+            node_list_count: offset_of!(RawNodeList, count),
+            node_list_capacity: offset_of!(RawNodeList, capacity),
             evidence_list_header: size_of::<RawEvidenceList>(),
             evidence_size: size_of::<RawEvidence>(),
             evidence_kind: offset_of!(RawEvidence, kind),

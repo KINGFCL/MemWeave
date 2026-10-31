@@ -538,6 +538,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn removed_nodes_are_not_visited() {
+        let mut memory = memory(&["a"], &[("a", &["b", "c"]), ("b", &[]), ("c", &[])]);
+        memory.remove_node("b").unwrap();
+        let model = ScriptedModel::new(&[&["a"], &["a"], &["c"]]);
+
+        let tree = retrieve(&memory, &model, "问题").unwrap();
+
+        assert_eq!(model.candidate_ids(2), ["c"]);
+        assert_eq!(child_ids(&tree.roots[0]), ["c"]);
+    }
+
     /// b 存在，但不在总表里：入口只能从总表选。
     #[test]
     fn choosing_outside_catalog_is_an_error() {

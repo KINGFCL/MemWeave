@@ -7,6 +7,7 @@ using memweave::Backlinks;
 using memweave::Bytes;
 using memweave::Evidence;
 using memweave::EvidenceList;
+using memweave::LinkKind;
 using memweave::Node;
 using memweave::NodeList;
 
@@ -24,7 +25,10 @@ struct MwLayout {
   std::size_t node_id_len;
   std::size_t node_title_len;
   std::size_t node_description_len;
+  std::size_t node_flags;
   std::size_t node_list_header;
+  std::size_t node_list_count;
+  std::size_t node_list_capacity;
   std::size_t evidence_list_header;
   std::size_t evidence_size;
   std::size_t evidence_kind;
@@ -51,7 +55,10 @@ MwLayout mw_layout() noexcept {
       offsetof(Node, id_len),
       offsetof(Node, title_len),
       offsetof(Node, description_len),
+      offsetof(Node, flags),
       sizeof(NodeList),
+      offsetof(NodeList, count),
+      offsetof(NodeList, capacity),
       sizeof(EvidenceList),
       sizeof(Evidence),
       offsetof(Evidence, kind),
@@ -73,21 +80,23 @@ Node* mw_node_new(Bytes id, Bytes title, Bytes description, const Evidence* evid
                             dependents_capacity, related_by_capacity);
 }
 
-void mw_node_set_related(Node* node, Node* const* related, std::size_t count) noexcept {
-  memweave::set_related(node, related, count);
-}
-
 void mw_node_set_evidence_target(Node* node, std::size_t index, Node* target) noexcept {
   memweave::set_evidence_target(node, index, target);
 }
 
-void mw_node_set_dependents(Node* node, Node* const* dependents, std::size_t count) noexcept {
-  memweave::set_dependents(node, dependents, count);
+void mw_node_set_links(Node* node, LinkKind kind, Node* const* nodes, std::size_t count) noexcept {
+  memweave::set_links(node, kind, nodes, count);
 }
 
-void mw_node_set_related_by(Node* node, Node* const* related_by, std::size_t count) noexcept {
-  memweave::set_related_by(node, related_by, count);
+bool mw_node_reserve_links(Node* node, LinkKind kind, std::size_t extra) noexcept {
+  return memweave::reserve_links(node, kind, extra);
 }
+
+void mw_node_append_link(Node* node, LinkKind kind, Node* target) noexcept {
+  memweave::append_link(node, kind, target);
+}
+
+void mw_node_detach(Node* node) noexcept { memweave::detach_node(node); }
 
 void mw_node_free(Node* node) noexcept { memweave::delete_node(node); }
 

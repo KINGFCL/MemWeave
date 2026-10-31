@@ -7,18 +7,19 @@ use std::ptr::{self, NonNull};
 use std::slice;
 use std::str;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::error::Error;
 use crate::ffi::{self, RawBytes, RawEvidence, RawNode, RawNodeList};
-use crate::knowledge::{Catalog, Evidence, Locator, Node, NodeId};
+use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, NodeId, Section};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
 
 /// 节点地址的长度上限。地址可能被用作文件名，大多数文件系统限制为 255 字节。
 const MAX_ID_BYTES: usize = 200;
 
-/// 内存中的知识图。只能通过校验后的解析结果创建，所以关联和总表都是一致的。
+/// 内存中的知识图。创建和 [`add_node`](Memory::add_node) 时都会校验，所以节点之间的地址总是有效的。
 ///
 /// 节点由 C++ 分配，节点之间直接用地址相连。文本地址的索引只用在边界上：
 /// 把模型的回答和命令行参数对应回节点，遍历时不经过它。
@@ -100,14 +101,21 @@ impl<'m> NodeRef<'m> {
         node_list(unsafe { (*self.raw().backlinks).related_by })
     }
 
-    /// 这条知识依据的节点，直接沿地址到达。
+    /// 这条知识依据的节点，直接沿地址到达。依据已被删除的证据不在其中。
     pub fn based_on(self) -> impl Iterator<Item = NodeRef<'m>> + use<'m> {
         self.raw_evidence()
             .iter()
             .filter(|evidence| evidence.kind == ffi::EVIDENCE_NODE)
-            .map(|evidence| {
-                NodeRef::new(NonNull::new(evidence.node).expect("建图时已填写依据节点"))
-            })
+            .filter_map(|evidence| NonNull::new(evidence.node).map(NodeRef::new))
+    }
+
+    /// 依据已被删除的节点证据的 id。这些结论失去了依据，要由模型决定怎么处理。
+    pub fn broken_evidence(self) -> Vec<&'m str> {
+        self.raw_evidence()
+            .iter()
+            .filter(|evidence| evidence.kind == ffi::EVIDENCE_NODE && evidence.node.is_null())
+            .map(|evidence| text(evidence.id, evidence.id_len))
+            .collect()
     }
 
     /// 节点的证据。
@@ -176,7 +184,7 @@ fn node_list<'m>(
         &[]
     } else {
         // 列表由 C++ 分配，头部之后紧跟 count 个节点地址。
-        unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count) }
+        unsafe { slice::from_raw_parts(list.add(1).cast(), (*list).count as usize) }
     };
     nodes.iter().map(|raw| NodeRef::new(*raw))
 }
@@ -230,6 +238,33 @@ pub enum Problem {
 
     #[error("来源无法检查：{message}")]
     SourceUnreadable { message: String },
+
+    #[error("要关联到节点 {target} 的节点 {id} 不存在")]
+    MissingIncoming { id: NodeId, target: NodeId },
+}
+
+/// 新节点放在图的什么位置。至少要有一项，否则从总表到达不了它，它就永远查不到。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// 这些已有节点的 `related` 里会加上新节点。
+    pub related_by: Vec<NodeId>,
+    /// 新节点成为这个板块的代表节点，板块不存在时会创建。
+    pub section: Option<String>,
+}
+
+/// 删除一个节点的结果。
+///
+/// 内存已经安全了，但知识关系的影响要由模型判断，所以把受影响的节点都列出来。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemovedNode {
+    /// 被删除节点的完整内容。
+    pub node: Node,
+    /// 依赖它的节点。它们的结论失去了这条依据，证据里保留 id，见 [`NodeRef::broken_evidence`]。
+    pub dependents: Vec<NodeId>,
+    /// 关联它的节点。它们少了一条路径，有些节点可能因此查不到了，见 [`Memory::unreachable`]。
+    pub related_by: Vec<NodeId>,
+    /// 它原来是哪些板块的代表节点。这些板块可能已经空了。
+    pub sections: Vec<String>,
 }
 
 impl Memory {
@@ -274,7 +309,7 @@ impl Memory {
 
             addresses.clear();
             addresses.extend(node.related.iter().map(|id| memory.index[id].as_ptr()));
-            unsafe { ffi::mw_node_set_related(raw, addresses.as_ptr(), addresses.len()) };
+            set_links(raw, ffi::LINK_RELATED, &addresses);
 
             for (index, evidence) in node.evidence.iter().enumerate() {
                 if let Evidence::Node { id } = evidence {
@@ -286,12 +321,12 @@ impl Memory {
             addresses.clear();
             let dependents = reverse_ids(&backlinks.dependents, &node.id);
             addresses.extend(dependents.iter().map(|id| memory.index[*id].as_ptr()));
-            unsafe { ffi::mw_node_set_dependents(raw, addresses.as_ptr(), addresses.len()) };
+            set_links(raw, ffi::LINK_DEPENDENTS, &addresses);
 
             addresses.clear();
             let related_by = reverse_ids(&backlinks.related_by, &node.id);
             addresses.extend(related_by.iter().map(|id| memory.index[*id].as_ptr()));
-            unsafe { ffi::mw_node_set_related_by(raw, addresses.as_ptr(), addresses.len()) };
+            set_links(raw, ffi::LINK_RELATED_BY, &addresses);
         }
         Ok(memory)
     }
@@ -348,8 +383,240 @@ impl Memory {
             }
         }
 
-        check_evidence(parsed, &by_id, sources, &mut problems);
+        check_evidence(
+            &parsed.nodes,
+            &|id| by_id.contains_key(id),
+            sources,
+            &mut problems,
+        );
+        let cyclic = nodes_in_evidence_cycles(parsed, &by_id);
+        if !cyclic.is_empty() {
+            problems.push(Problem::EvidenceCycle { ids: cyclic });
+        }
         problems
+    }
+
+    /// 添加一个节点，并接入图。
+    ///
+    /// 证据只能依据已有的节点，所以不会形成循环。来源必须已经在 `sources` 里。
+    /// 有问题时一次报告所有问题，图保持不变。
+    pub fn add_node(
+        &mut self,
+        node: Node,
+        placement: Placement,
+        sources: &dyn SourceStore,
+    ) -> Result<NodeRef<'_>, Error> {
+        let problems = self.check_new_node(&node, &placement, sources);
+        if !problems.is_empty() {
+            return Err(Error::InvalidMemory(problems));
+        }
+
+        let mut seen = HashSet::new();
+        let related_targets: Vec<NonNull<RawNode>> = node
+            .related
+            .iter()
+            .filter(|id| **id != node.id && seen.insert(id.as_str()))
+            .map(|id| self.index[id])
+            .collect();
+        let mut seen = HashSet::new();
+        let evidence_targets: Vec<NonNull<RawNode>> = node
+            .evidence
+            .iter()
+            .filter_map(|evidence| match evidence {
+                Evidence::Node { id } if seen.insert(id.as_str()) => Some(self.index[id]),
+                _ => None,
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        let incoming: Vec<NonNull<RawNode>> = placement
+            .related_by
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .map(|id| self.index[id])
+            .collect();
+
+        let links_to_itself = node.related.contains(&node.id);
+        let raw = new_node(&node, 0, incoming.len() + usize::from(links_to_itself))?;
+
+        // 先把所有位置都预留好，后面的连接就不会失败，图不会停在只连了一半的状态。
+        let reserved = related_targets
+            .iter()
+            .all(|target| reserve_link(*target, ffi::LINK_RELATED_BY))
+            && evidence_targets
+                .iter()
+                .all(|target| reserve_link(*target, ffi::LINK_DEPENDENTS))
+            && incoming
+                .iter()
+                .all(|from| reserve_link(*from, ffi::LINK_RELATED));
+        if !reserved {
+            unsafe { ffi::mw_node_free(raw.as_ptr()) };
+            return Err(Error::OutOfMemory);
+        }
+
+        let related: Vec<*mut RawNode> = node
+            .related
+            .iter()
+            .map(|id| {
+                if *id == node.id {
+                    raw.as_ptr()
+                } else {
+                    self.index[id].as_ptr()
+                }
+            })
+            .collect();
+        set_links(raw.as_ptr(), ffi::LINK_RELATED, &related);
+
+        for (index, evidence) in node.evidence.iter().enumerate() {
+            if let Evidence::Node { id } = evidence {
+                let target = self.index[id].as_ptr();
+                unsafe { ffi::mw_node_set_evidence_target(raw.as_ptr(), index, target) };
+            }
+        }
+
+        let mut related_by: Vec<*mut RawNode> = incoming.iter().map(|n| n.as_ptr()).collect();
+        if links_to_itself {
+            related_by.push(raw.as_ptr());
+        }
+        set_links(raw.as_ptr(), ffi::LINK_RELATED_BY, &related_by);
+
+        for target in &related_targets {
+            append_link(*target, ffi::LINK_RELATED_BY, raw);
+        }
+        for target in &evidence_targets {
+            append_link(*target, ffi::LINK_DEPENDENTS, raw);
+        }
+        for from in &incoming {
+            append_link(*from, ffi::LINK_RELATED, raw);
+        }
+
+        if let Some(name) = placement.section {
+            let entry = CatalogEntry {
+                id: node.id.clone(),
+                title: node.title.clone(),
+            };
+            match self.catalog.sections.iter_mut().find(|s| s.name == name) {
+                Some(section) => section.nodes.push(entry),
+                None => self.catalog.sections.push(Section {
+                    name,
+                    nodes: vec![entry],
+                }),
+            }
+        }
+        self.index.insert(node.id, raw);
+        Ok(NodeRef::new(raw))
+    }
+
+    fn check_new_node(
+        &self,
+        node: &Node,
+        placement: &Placement,
+        sources: &dyn SourceStore,
+    ) -> Vec<Problem> {
+        let mut problems = Vec::new();
+        if !is_valid_id(&node.id) {
+            problems.push(Problem::InvalidId {
+                id: node.id.clone(),
+            });
+        }
+        if self.index.contains_key(&node.id) {
+            problems.push(Problem::DuplicateNode {
+                id: node.id.clone(),
+            });
+        }
+        for related in &node.related {
+            if *related != node.id && !self.index.contains_key(related) {
+                problems.push(Problem::BrokenLink {
+                    id: related.clone(),
+                    referrer: node.id.clone(),
+                });
+            }
+        }
+        for id in &placement.related_by {
+            if !self.index.contains_key(id) {
+                problems.push(Problem::MissingIncoming {
+                    id: id.clone(),
+                    target: node.id.clone(),
+                });
+            }
+        }
+        if placement.related_by.is_empty() && placement.section.is_none() {
+            problems.push(Problem::Unreachable {
+                id: node.id.clone(),
+            });
+        }
+        check_evidence(
+            slice::from_ref(node),
+            &|id| self.index.contains_key(id),
+            sources,
+            &mut problems,
+        );
+        problems
+    }
+
+    /// 删除一个节点，并清除图里所有指向它的地址，不会留下悬空指针。
+    ///
+    /// 这里只保证内存安全，不判断知识关系：依赖它的节点不会被改写或删除，结果里列出受影响的
+    /// 节点，由模型决定怎么处理。删除后如果还要写回磁盘，模型要先处理好失去依据的节点和
+    /// 查不到的节点，否则下次加载时校验会报错。
+    pub fn remove_node(&mut self, id: &str) -> Result<RemovedNode, Error> {
+        let raw = *self
+            .index
+            .get(id)
+            .ok_or_else(|| Error::UnknownNode(id.to_owned()))?;
+        let node = NodeRef::new(raw);
+        let other_ids = |nodes: Vec<NodeRef<'_>>| -> Vec<NodeId> {
+            nodes
+                .into_iter()
+                .filter(|other| other.raw != raw)
+                .map(|other| other.id().to_owned())
+                .collect()
+        };
+        let removed = RemovedNode {
+            node: node.to_node(),
+            dependents: other_ids(node.dependents().collect()),
+            related_by: other_ids(node.related_by().collect()),
+            sections: self
+                .catalog
+                .sections
+                .iter()
+                .filter(|section| section.nodes.iter().any(|entry| entry.id == id))
+                .map(|section| section.name.clone())
+                .collect(),
+        };
+
+        for section in &mut self.catalog.sections {
+            section.nodes.retain(|entry| entry.id != id);
+        }
+        self.index.remove(id);
+        unsafe {
+            ffi::mw_node_detach(raw.as_ptr());
+            ffi::mw_node_free(raw.as_ptr());
+        }
+        Ok(removed)
+    }
+
+    /// 从总表出发沿关联走不到的节点，按 id 排序。要走遍全图，适合一批修改结束后调用一次。
+    pub fn unreachable(&self) -> Vec<NodeId> {
+        let mut reachable = HashSet::new();
+        let mut pending: Vec<NodeRef<'_>> = self
+            .catalog
+            .sections
+            .iter()
+            .flat_map(|section| &section.nodes)
+            .filter_map(|entry| self.node(&entry.id))
+            .collect();
+        while let Some(node) = pending.pop() {
+            if reachable.insert(node) {
+                pending.extend(node.related());
+            }
+        }
+        let mut lost: Vec<NodeId> = self
+            .nodes()
+            .filter(|node| !reachable.contains(node))
+            .map(|node| node.id().to_owned())
+            .collect();
+        lost.sort_unstable();
+        lost
     }
 
     /// 读取节点的证据。来源的内容这时才从固态硬盘加载。
@@ -477,6 +744,18 @@ fn new_node(
     NonNull::new(raw).ok_or(Error::OutOfMemory)
 }
 
+fn set_links(raw: *mut RawNode, kind: u32, nodes: &[*mut RawNode]) {
+    unsafe { ffi::mw_node_set_links(raw, kind, nodes.as_ptr(), nodes.len()) };
+}
+
+fn reserve_link(raw: NonNull<RawNode>, kind: u32) -> bool {
+    unsafe { ffi::mw_node_reserve_links(raw.as_ptr(), kind, 1) }
+}
+
+fn append_link(raw: NonNull<RawNode>, kind: u32, target: NonNull<RawNode>) {
+    unsafe { ffi::mw_node_append_link(raw.as_ptr(), kind, target.as_ptr()) };
+}
+
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ID_BYTES
@@ -508,15 +787,15 @@ fn reachable_from_catalog<'a>(
 }
 
 fn check_evidence(
-    parsed: &ParsedKnowledge,
-    nodes: &HashMap<&str, &Node>,
+    nodes: &[Node],
+    node_exists: &dyn Fn(&str) -> bool,
     sources: &dyn SourceStore,
     problems: &mut Vec<Problem>,
 ) {
     // 一个来源可能被大量证据引用，每个只查询一次大小。
     let mut sizes: HashMap<&str, Result<Option<u64>, ()>> = HashMap::new();
 
-    for node in &parsed.nodes {
+    for node in nodes {
         if node.evidence.is_empty() {
             problems.push(Problem::MissingEvidence {
                 id: node.id.clone(),
@@ -525,7 +804,7 @@ fn check_evidence(
         for evidence in &node.evidence {
             match evidence {
                 Evidence::Node { id } => {
-                    if !nodes.contains_key(id.as_str()) {
+                    if !node_exists(id) {
                         problems.push(Problem::BrokenEvidence {
                             id: id.clone(),
                             referrer: node.id.clone(),
@@ -558,11 +837,6 @@ fn check_evidence(
                 }
             }
         }
-    }
-
-    let cyclic = nodes_in_evidence_cycles(parsed, nodes);
-    if !cyclic.is_empty() {
-        problems.push(Problem::EvidenceCycle { ids: cyclic });
     }
 }
 
@@ -1261,5 +1535,312 @@ mod tests {
 
         assert_eq!(memory.node("结论").unwrap().to_node(), original);
         assert_eq!(memory.node("依据").unwrap().to_node(), node("依据", &[]));
+    }
+
+    fn memory_of(entries: &[&str], nodes: Vec<Node>) -> Memory {
+        build(entries, nodes).unwrap()
+    }
+
+    fn section(name: &str) -> Placement {
+        Placement {
+            section: Some(name.into()),
+            ..Placement::default()
+        }
+    }
+
+    fn linked_from(ids: &[&str]) -> Placement {
+        Placement {
+            related_by: ids.iter().map(|id| id.to_string()).collect(),
+            ..Placement::default()
+        }
+    }
+
+    fn ids<'m>(nodes: impl Iterator<Item = NodeRef<'m>>) -> Vec<&'m str> {
+        nodes.map(NodeRef::id).collect()
+    }
+
+    #[test]
+    fn add_connects_every_direction() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        memory
+            .add_node(node("基础", &[]), linked_from(&["a"]), &sources())
+            .unwrap();
+        let mut new = based_on("新", &["基础"]);
+        new.related = vec!["a".into()];
+
+        let added = memory
+            .add_node(new.clone(), linked_from(&["基础"]), &sources())
+            .unwrap();
+        assert_eq!(added.to_node(), new);
+        assert_eq!(ids(added.related()), ["a"]);
+        assert_eq!(ids(added.related_by()), ["基础"]);
+        assert_eq!(ids(added.based_on()), ["基础"]);
+
+        let foundation = memory.node("基础").unwrap();
+        assert_eq!(ids(foundation.related()), ["新"]);
+        assert_eq!(ids(foundation.dependents()), ["新"]);
+        assert_eq!(ids(memory.node("a").unwrap().related_by()), ["新"]);
+        assert!(memory.unreachable().is_empty());
+        assert_eq!(memory.node_count(), 3);
+    }
+
+    #[test]
+    fn add_to_a_section_updates_the_catalog() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+
+        memory
+            .add_node(node("b", &[]), section("板块"), &sources())
+            .unwrap();
+        memory
+            .add_node(node("c", &[]), section("新板块"), &sources())
+            .unwrap();
+
+        let sections = &memory.catalog().sections;
+        assert_eq!(sections[0].nodes[1].id, "b");
+        assert_eq!(sections[0].nodes[1].title, "标题b");
+        assert_eq!(sections[1].name, "新板块");
+        assert_eq!(sections[1].nodes[0].id, "c");
+    }
+
+    #[test]
+    fn lists_grow_past_their_reserved_capacity() {
+        let mut memory = memory_of(&["hub"], vec![node("hub", &[])]);
+
+        for index in 0..100 {
+            let mut new = node(&format!("n{index}"), &["hub"]);
+            new.evidence.push(Evidence::Node { id: "hub".into() });
+            memory
+                .add_node(new, linked_from(&["hub"]), &sources())
+                .unwrap();
+        }
+
+        let hub = memory.node("hub").unwrap();
+        assert_eq!(hub.related().len(), 100);
+        assert_eq!(hub.related_by().len(), 100);
+        assert_eq!(hub.dependents().len(), 100);
+        assert_eq!(hub.related().last().unwrap().id(), "n99");
+    }
+
+    #[test]
+    fn a_new_node_may_link_to_itself() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+
+        memory
+            .add_node(node("自己", &["自己", "a"]), section("板块"), &sources())
+            .unwrap();
+
+        let itself = memory.node("自己").unwrap();
+        assert_eq!(ids(itself.related()), ["自己", "a"]);
+        assert_eq!(ids(itself.related_by()), ["自己"]);
+    }
+
+    #[test]
+    fn rejected_nodes_leave_the_graph_unchanged() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        let missing_source = source_id(b"not stored");
+
+        let cases = [
+            (node("a", &[]), section("板块"), "重复"),
+            (node("../x", &[]), section("板块"), "不合法"),
+            (
+                node("b", &["幽灵"]),
+                section("板块"),
+                "关联的节点 幽灵 不存在",
+            ),
+            (
+                based_on("b", &["幽灵"]),
+                section("板块"),
+                "证据节点 幽灵 不存在",
+            ),
+            (based_on("b", &["b"]), section("板块"), "证据节点 b 不存在"),
+            (
+                node_with_evidence("b", vec![]),
+                section("板块"),
+                "没有任何证据",
+            ),
+            (node("b", &[]), Placement::default(), "无法从总表到达"),
+            (node("b", &[]), linked_from(&["幽灵"]), "节点 幽灵 不存在"),
+            (
+                node_with_evidence(
+                    "b",
+                    vec![Evidence::Source {
+                        source: missing_source,
+                        locator: Locator::TextRange { start: 0, end: 1 },
+                    }],
+                ),
+                section("板块"),
+                "来源",
+            ),
+        ];
+        for (new, placement, expected) in cases {
+            let message = memory
+                .add_node(new, placement, &sources())
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(expected), "{expected}：{message}");
+        }
+
+        assert_eq!(memory.node_count(), 1);
+        assert_eq!(memory.catalog(), &catalog(&["a"]));
+        assert_eq!(memory.node("a").unwrap().related().len(), 0);
+    }
+
+    #[test]
+    fn remove_clears_every_address_and_reports_the_impact() {
+        let mut x = based_on("x", &["依据"]);
+        x.related = vec!["后继".into(), "x".into()];
+        let mut memory = memory_of(
+            &["入口", "x"],
+            vec![
+                node("入口", &["x", "依据", "后继", "结论"]),
+                node("依据", &[]),
+                node("后继", &[]),
+                x,
+                based_on("结论", &["x", "依据"]),
+            ],
+        );
+
+        let removed = memory.remove_node("x").unwrap();
+
+        assert_eq!(removed.node.id, "x");
+        assert_eq!(removed.dependents, ["结论"]);
+        assert_eq!(removed.related_by, ["入口"]);
+        assert_eq!(removed.sections, ["板块"]);
+
+        assert!(memory.node("x").is_none());
+        assert_eq!(memory.node_count(), 4);
+        assert_eq!(
+            ids(memory.node("入口").unwrap().related()),
+            ["依据", "后继", "结论"]
+        );
+        assert_eq!(memory.node("后继").unwrap().related_by().len(), 1);
+        assert_eq!(ids(memory.node("依据").unwrap().dependents()), ["结论"]);
+        assert_eq!(memory.catalog(), &catalog(&["入口"]));
+
+        // 知识关系不自动处理：结论还在，证据保留 id，地址已经清掉。
+        let conclusion = memory.node("结论").unwrap();
+        assert_eq!(conclusion.broken_evidence(), ["x"]);
+        assert_eq!(ids(conclusion.based_on()), ["依据"]);
+        assert_eq!(conclusion.to_node(), based_on("结论", &["x", "依据"]));
+    }
+
+    #[test]
+    fn remove_reports_nodes_that_became_unreachable() {
+        let mut memory = memory_of(
+            &["a"],
+            vec![
+                node("a", &["桥"]),
+                node("桥", &["c"]),
+                node("c", &["d"]),
+                node("d", &["c"]),
+            ],
+        );
+
+        memory.remove_node("桥").unwrap();
+
+        assert_eq!(memory.unreachable(), ["c", "d"]);
+        // 模型可以把它们重新接回来。
+        memory
+            .add_node(node("新桥", &["c"]), linked_from(&["a"]), &sources())
+            .unwrap();
+        assert!(memory.unreachable().is_empty());
+    }
+
+    #[test]
+    fn removing_an_unknown_node_is_an_error() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+
+        assert!(matches!(
+            memory.remove_node("不存在"),
+            Err(Error::UnknownNode(_))
+        ));
+    }
+
+    #[test]
+    fn nodes_with_grown_lists_can_be_removed() {
+        let mut memory = memory_of(&["hub"], vec![node("hub", &[])]);
+        for index in 0..20 {
+            let id = format!("n{index}");
+            memory
+                .add_node(node(&id, &["hub"]), linked_from(&["hub"]), &sources())
+                .unwrap();
+        }
+
+        let removed = memory.remove_node("hub").unwrap();
+
+        assert_eq!(removed.related_by.len(), 20);
+        for index in 0..20 {
+            let node = memory.node(&format!("n{index}")).unwrap();
+            assert_eq!(node.related().len(), 0);
+            assert_eq!(node.related_by().len(), 0);
+        }
+    }
+
+    /// 随机增删，每一步都核对所有关系都是对称的，并且没有地址指向已删除的节点。
+    #[test]
+    fn random_changes_keep_the_graph_consistent() {
+        let mut memory = memory_of(&["根"], vec![node("根", &[])]);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        let mut next_id = 0;
+
+        for _ in 0..3000 {
+            let live: Vec<String> = memory.nodes().map(|n| n.id().to_owned()).collect();
+            if next() % 100 < 55 || live.is_empty() {
+                let pick = |roll: usize| -> Vec<String> {
+                    if live.is_empty() {
+                        return Vec::new();
+                    }
+                    (0..roll % 4)
+                        .map(|i| live[(roll >> 3).wrapping_add(i * 7) % live.len()].clone())
+                        .collect()
+                };
+                let id = format!("n{next_id}");
+                next_id += 1;
+                let mut new = node(&id, &[]);
+                new.related = pick(next());
+                new.evidence
+                    .extend(pick(next()).into_iter().map(|id| Evidence::Node { id }));
+                let placement = Placement {
+                    related_by: pick(next()),
+                    section: Some("板块".into()),
+                };
+                memory.add_node(new, placement, &sources()).unwrap();
+            } else {
+                memory.remove_node(&live[next() % live.len()]).unwrap();
+            }
+            assert_consistent(&memory);
+        }
+    }
+
+    fn assert_consistent(memory: &Memory) {
+        let live: HashSet<NodeRef<'_>> = memory.nodes().collect();
+        for node in memory.nodes() {
+            assert_eq!(memory.node(node.id()), Some(node));
+            for target in node.related() {
+                assert!(live.contains(&target));
+                assert!(target.related_by().any(|other| other == node));
+            }
+            for from in node.related_by() {
+                assert!(live.contains(&from));
+                assert!(from.related().any(|other| other == node));
+            }
+            for target in node.based_on() {
+                assert!(live.contains(&target));
+                assert!(target.dependents().any(|other| other == node));
+            }
+            for dependent in node.dependents() {
+                assert!(live.contains(&dependent));
+                assert!(dependent.based_on().any(|other| other == node));
+            }
+        }
+        for entry in memory.catalog().sections.iter().flat_map(|s| &s.nodes) {
+            assert!(memory.node(&entry.id).is_some());
+        }
     }
 }
