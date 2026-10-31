@@ -26,6 +26,7 @@ use crate::knowledge::Catalog;
 use crate::lang::exec::render_overview;
 use crate::lang::journal::{Journal, WriteLock, load_current};
 use crate::lang::{Mode, Output, Session};
+use crate::maintain;
 use crate::memory::Memory;
 use crate::parse::ParsedKnowledge;
 use crate::parse::json::JsonParser;
@@ -44,10 +45,16 @@ const ATTACHED_HEADER: &str = "--- 当前工作板和总表（每次调用自动
 ///
 /// 服务运行期间一直持有写入权，否则内存里的图会和磁盘不一致。
 pub fn serve(knowledge_base: &Path, max_output_bytes: usize) -> Result<(), Error> {
+    maintain::recover_interrupted_swap(knowledge_base)?;
     create_if_empty(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
     let sources = FileSources::new(knowledge_base);
-    let memory = load_current(&JsonParser, &sources, knowledge_base)?;
+    let memory = load_current(&JsonParser, &sources, knowledge_base).inspect_err(|_| {
+        eprintln!(
+            "运行 memweave doctor {0} 查看详情，doctor --fix 可以尽量恢复",
+            knowledge_base.display()
+        );
+    })?;
     let journal = Journal::new(knowledge_base);
 
     let (jobs, queue) = mpsc::channel();

@@ -41,7 +41,7 @@ pub enum Locator {
 }
 
 /// 总表：知识库的目录。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Catalog {
     pub sections: Vec<Section>,
     /// 工作板上进行中的目标。结束的目标离开这里，留在时间线上。

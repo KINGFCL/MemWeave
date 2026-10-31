@@ -28,9 +28,41 @@ pub trait SourceStore {
     /// 读取来源的完整内容。实现必须确认内容与地址里的哈希一致。
     fn read_all(&self, id: &str) -> Result<Vec<u8>, Error>;
 
-    /// 写入一份新来源，返回它的地址。内容相同的来源只保存一份，已有的不会被覆盖。
+    /// 读取来源里 `start..end` 的字节，`end` 超出时只读到末尾。实现必须确认内容和地址里的哈希一致。
+    fn read_bytes(&self, id: &str, start: u64, end: u64) -> Result<Vec<u8>, Error> {
+        let bytes = self.read_all(id)?;
+        let total = bytes.len() as u64;
+        let (start, end) = (start.min(total) as usize, end.min(total) as usize);
+        Ok(bytes[start..end.max(start)].to_vec())
+    }
+
+    /// 写入一份新来源，返回它的地址。内容相同的来源只保存一份。地址由内容算出，所以文件内容不对时，
+    /// 比如断电后留下的空文件，写入就是修复。
     fn put(&self, _bytes: &[u8]) -> Result<SourceId, Error> {
         Err(Error::Source("这里不能写入新来源".to_owned()))
+    }
+}
+
+/// 不检查原文的来源：`size` 总是说够大，`read` 不读文件。
+///
+/// 加载和重放时用它。这些内容当时已经检查过了，原文后来丢了，不能让整份记忆都打不开。
+pub(crate) struct Trusted<'a>(pub(crate) &'a dyn SourceStore);
+
+impl SourceStore for Trusted<'_> {
+    fn size(&self, _id: &str) -> Result<Option<u64>, Error> {
+        Ok(Some(u64::MAX))
+    }
+
+    fn read(&self, _id: &str, _locator: &Locator) -> Result<String, Error> {
+        Ok(String::new())
+    }
+
+    fn read_all(&self, id: &str) -> Result<Vec<u8>, Error> {
+        self.0.read_all(id)
+    }
+
+    fn put(&self, bytes: &[u8]) -> Result<SourceId, Error> {
+        self.0.put(bytes)
     }
 }
 
@@ -71,24 +103,27 @@ pub fn is_valid_source_id(id: &str) -> bool {
     hash_part(id).is_some()
 }
 
+/// 确认范围有效，返回起始和结束。
+fn check_range(total: u64, id: &str, locator: &Locator) -> Result<(usize, usize), Error> {
+    let Locator::TextRange { start, end } = *locator;
+    if start < end && end as u64 <= total {
+        Ok((start, end))
+    } else {
+        Err(Error::Source(format!(
+            "来源 {id} 的范围 {start}..{end} 无效（共 {total} 字节）"
+        )))
+    }
+}
+
+fn decode(bytes: Vec<u8>, id: &str, start: usize, end: usize) -> Result<String, Error> {
+    String::from_utf8(bytes)
+        .map_err(|_| Error::Source(format!("来源 {id} 的范围 {start}..{end} 不是有效的文本")))
+}
+
 /// 从来源的完整内容中取出 `locator` 指向的部分。
 fn extract(bytes: &[u8], id: &str, locator: &Locator) -> Result<String, Error> {
-    match locator {
-        Locator::TextRange { start, end } => {
-            let slice = (*start < *end)
-                .then(|| bytes.get(*start..*end))
-                .flatten()
-                .ok_or_else(|| {
-                    Error::Source(format!(
-                        "来源 {id} 的范围 {start}..{end} 无效（共 {} 字节）",
-                        bytes.len()
-                    ))
-                })?;
-            String::from_utf8(slice.to_vec()).map_err(|_| {
-                Error::Source(format!("来源 {id} 的范围 {start}..{end} 不是有效的文本"))
-            })
-        }
-    }
+    let (start, end) = check_range(bytes.len() as u64, id, locator)?;
+    decode(bytes[start..end].to_vec(), id, start, end)
 }
 
 #[cfg(test)]

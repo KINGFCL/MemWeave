@@ -55,8 +55,8 @@ const SEARCH_WORDS: [&str; 7] = ["search", "find", "grep", "list", "ls", "query"
 const CATALOG_COMMANDS: [&str; 7] = [
     "show", "create", "describe", "rename", "delete", "add", "remove",
 ];
-/// `full_source` 每个文件默认和最多显示多少字节。最大值小于输出上限，所以总能看到下一段的位置。
-const DEFAULT_SOURCE_LIMIT: usize = 64 * 1024;
+/// `full_source` 每个文件默认和最多显示多少字节。默认值小于 MCP 的输出上限，所以总能看到下一段的位置。
+const DEFAULT_SOURCE_LIMIT: usize = 16 * 1024;
 const MAX_SOURCE_LIMIT: usize = 128 * 1024;
 const DEFAULT_LINK_LIMIT: usize = 50;
 const MAX_LINK_LIMIT: usize = 1000;

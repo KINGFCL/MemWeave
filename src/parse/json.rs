@@ -7,6 +7,11 @@ use super::{ParsedKnowledge, Parser};
 use crate::error::Error;
 use crate::knowledge::{Catalog, Node};
 
+/// 记录格式版本的文件。没有这个文件的是第 1 版。
+pub const FORMAT_FILE: &str = "format.json";
+/// 知识库目录的格式版本。不兼容地改格式时要加一。
+pub const FORMAT_VERSION: u32 = 1;
+
 /// JSON 目录格式：`catalog.json` 加 `nodes/<节点地址>.json`。来源不会被读取，它们留在固态硬盘上。
 ///
 /// `nodes` 目录只读取第一层的 `.json` 文件，其他文件会被忽略。
@@ -14,6 +19,7 @@ pub struct JsonParser;
 
 impl Parser for JsonParser {
     fn parse(&self, source: &Path) -> Result<ParsedKnowledge, Error> {
+        check_format(source)?;
         let mut problems = Vec::new();
         let catalog = match read_json::<Catalog>(&source.join("catalog.json")) {
             Ok(catalog) => Some(catalog),
@@ -29,6 +35,38 @@ impl Parser for JsonParser {
             _ => Err(Error::Parse(problems)),
         }
     }
+}
+
+/// 尽量读出来：坏掉的文件跳过，并报告问题。修复时用。总表读不出来时返回 `None`。
+pub(crate) fn parse_tolerant(source: &Path) -> (Option<Catalog>, Vec<Node>, Vec<String>) {
+    let mut problems = Vec::new();
+    let catalog = match read_json::<Catalog>(&source.join("catalog.json")) {
+        Ok(catalog) => Some(catalog),
+        Err(problem) => {
+            problems.push(problem);
+            None
+        }
+    };
+    let nodes = read_nodes(&source.join("nodes"), &mut problems);
+    (catalog, nodes, problems)
+}
+
+/// 比这个版本新的知识库不能读：读错了可能损坏数据。
+fn check_format(source: &Path) -> Result<(), Error> {
+    let path = source.join(FORMAT_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        read_json(&path).map_err(|problem| Error::Parse(vec![problem]))?;
+    let format = value["format"].as_u64().unwrap_or(u64::MAX);
+    if format > u64::from(FORMAT_VERSION) {
+        return Err(Error::Parse(vec![format!(
+            "{} 是第 {format} 版格式，当前版本只支持到第 {FORMAT_VERSION} 版，请升级 memweave",
+            source.display()
+        )]));
+    }
+    Ok(())
 }
 
 fn read_nodes(dir: &Path, problems: &mut Vec<String>) -> Vec<Node> {
@@ -191,6 +229,19 @@ mod tests {
 
         assert_eq!(old.catalog.sections[0].description, "");
         assert_eq!(new.catalog.sections[0].description, "描述");
+    }
+
+    #[test]
+    fn newer_formats_are_refused() {
+        let dir = knowledge_base(r#"{"sections":[]}"#, &[]);
+        fs::write(dir.path().join(FORMAT_FILE), r#"{"format":999}"#).unwrap();
+
+        let problems = problems(JsonParser.parse(dir.path()));
+
+        assert!(problems[0].contains("请升级"), "{problems:?}");
+
+        fs::write(dir.path().join(FORMAT_FILE), r#"{"format":1}"#).unwrap();
+        assert!(JsonParser.parse(dir.path()).is_ok());
     }
 
     #[test]

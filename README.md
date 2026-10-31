@@ -95,12 +95,24 @@ memweave mcp <知识库目录>
 
 用 DeepSeek 跑过真实的 MCP 试验，也用 Claude Code 实际连接过。一个知识库同一时间只属于一个服务进程。别的 agent 要用，就用 `export` 导出一份。
 
+## 维护
+
+```bash
+memweave doctor <知识库目录>          # 检查，校验所有原文，不改任何东西
+memweave doctor <知识库目录> --fix    # 尽量恢复，原来的目录改名保留
+memweave compact <知识库目录>         # 把日志合并进快照，删除没有节点引用的原文
+memweave purge <知识库目录> <文字>    # 彻底清除一段文字，包括日志和时间线
+```
+
+这些命令要独占知识库，服务运行时不能做。升级 memweave 前建议先 `compact`。
+
 ## 知识库格式
 
 ```text
 <知识库目录>/
 ├─ catalog.json        总表：板块的名字、描述和代表节点的地址，以及工作板
 ├─ timeline.jsonl      时间线，导出时才有，平时在 journal.jsonl 里
+├─ format.json         目录格式的版本
 ├─ nodes/
 │  └─ <节点地址>.json   节点：标题、描述、证据、相关节点
 └─ sources/

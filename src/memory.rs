@@ -706,6 +706,21 @@ impl Memory {
         self.node_times.get(id).copied().unwrap_or_default()
     }
 
+    /// 从时间线上抹掉含 `secret` 的记录，返回抹掉了几条。
+    pub(crate) fn scrub_timeline(&mut self, secret: &str) -> usize {
+        let mut count = 0;
+        for event in &mut self.timeline {
+            let in_text = event.text.contains(secret);
+            let in_nodes = event.nodes.iter().any(|id| id.contains(secret));
+            if in_text || in_nodes {
+                event.text = "（已清除）".to_owned();
+                event.nodes.retain(|id| !id.contains(secret));
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// 记下一件发生过的事，并更新相关节点的时间。
     pub fn record(&mut self, event: Event) {
         for (index, id) in event.nodes.iter().enumerate() {

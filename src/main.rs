@@ -7,6 +7,7 @@ use memweave::export::json::JsonExporter;
 use memweave::export::{self, Exporter};
 use memweave::lang::journal::{self, Journal, WriteLock};
 use memweave::lang::{self, Mode, Session};
+use memweave::maintain;
 use memweave::memory::Memory;
 use memweave::model::Model;
 use memweave::model::anthropic::{self, AnthropicModel};
@@ -25,6 +26,9 @@ const USAGE: &str = "\
   memweave run [--write] <知识库目录> <脚本|->
                                           执行记忆指令，- 表示从标准输入读。默认只读，不调用模型
   memweave spec                           输出记忆指令的说明，用来放进模型的提示词
+  memweave doctor <知识库目录> [--fix]     检查知识库，校验所有原文。--fix 尽量恢复，原来的目录会保留
+  memweave compact <知识库目录>           把日志合并进快照，删除没有节点引用的原文
+  memweave purge <知识库目录> <文字>      彻底清除一段文字，包括日志和时间线。记忆里还在用时会拒绝
   memweave mcp <知识库目录> [--max-output-bytes N]
                                           启动 MCP 服务，通过标准输入输出通信。目录不存在或为空时
                                           新建空知识库。不调用模型，调用方就是模型
@@ -56,6 +60,18 @@ fn main() -> ExitCode {
         [command, kb, query] if command == "query" => run_query(kb, query),
         [command, kb, node] if command == "evidence" => run_evidence(kb, node),
         [command] if command == "spec" => Ok(lang::SPEC.to_owned()),
+        [command, kb] if command == "doctor" => {
+            maintain::doctor(Path::new(kb)).map_err(|e| e.to_string())
+        }
+        [command, kb, flag] if command == "doctor" && flag == "--fix" => {
+            maintain::doctor_fix(Path::new(kb)).map_err(|e| e.to_string())
+        }
+        [command, kb] if command == "compact" => {
+            maintain::compact(Path::new(kb)).map_err(|e| e.to_string())
+        }
+        [command, kb, secret] if command == "purge" => {
+            maintain::purge(Path::new(kb), secret).map_err(|e| e.to_string())
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -147,6 +163,7 @@ fn run_script(mode: Mode, kb: &str, script: &str) -> Result<lang::Output, String
     };
     let path = Path::new(kb);
     // 写脚本是基于加载时的状态检查的，加载到写完日志之间不能有别的进程写入，否则日志重放会失败。
+    maintain::recover_interrupted_swap(path).map_err(|e| e.to_string())?;
     let _lock = (mode == Mode::ReadWrite)
         .then(|| WriteLock::acquire(path))
         .transpose()
@@ -189,7 +206,9 @@ fn run_mcp(args: &[String]) -> ExitCode {
 /// 加载知识库，并重放写入日志，恢复上次的修改。
 fn load_memory(kb: &str) -> Result<Memory, String> {
     let path = Path::new(kb);
-    journal::load_current(&JsonParser, &FileSources::new(path), path).map_err(|e| e.to_string())
+    maintain::recover_interrupted_swap(path).map_err(|e| e.to_string())?;
+    journal::load_current(&JsonParser, &FileSources::new(path), path)
+        .map_err(|e| format!("{e}\n运行 memweave doctor {kb} 查看详情，doctor --fix 可以尽量恢复"))
 }
 
 /// 根据环境变量创建模型。接入新厂商时，在这里加一个分支。

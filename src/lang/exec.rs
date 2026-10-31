@@ -2,7 +2,7 @@
 //!
 //! 记忆里的内容一律用 JSON 字符串输出：有明确的边界，内容里就算写着指令，也只是数据。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -11,7 +11,7 @@ use crate::board::{Goal, StepStatus};
 use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
-use crate::knowledge::{Evidence, Locator, Node};
+use crate::knowledge::{Evidence, Locator, Node, SourceId};
 use crate::memory::{Memory, NodeRef, RemovedNode};
 use crate::source::{SourceStore, source_id};
 use crate::timeline::{Action, Event, NodeTimes, format_time};
@@ -161,7 +161,7 @@ fn statement(
             );
             let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
         }
-        Statement::Check => render_check(memory, output),
+        Statement::Check => render_check(memory, sources, output),
         Statement::Show(id) => {
             let node = existing(memory, &id.text)?;
             let times = memory.node_times(&id.text);
@@ -352,7 +352,7 @@ pub fn render_overview(memory: &Memory) -> String {
                 output,
                 "  {} {}{more}",
                 format_time(event.at),
-                text.replace('\n', " ")
+                one_line(&text)
             );
         }
     }
@@ -384,6 +384,13 @@ fn render_goal(goal: &Goal, output: &mut String) {
     }
 }
 
+/// 时间线一条占一行。内容里的换行要转义，否则多行内容能伪造出一条带时间的记录。
+fn one_line(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 /// 从新到旧。`node` 给定时只看和这个节点有关的事。
 fn render_timeline(
     memory: &Memory,
@@ -405,7 +412,12 @@ fn render_timeline(
     }
     let shown: Vec<&&Event> = matching.iter().skip(offset).take(limit).collect();
     for event in &shown {
-        let _ = writeln!(output, "{} {}", format_time(event.at), event.text);
+        let _ = writeln!(
+            output,
+            "{} {}",
+            format_time(event.at),
+            one_line(&event.text)
+        );
     }
     if offset >= total {
         let _ = writeln!(output, "（共 {total} 条，offset {offset} 已经超过末尾）");
@@ -599,6 +611,57 @@ fn render_node(
 }
 
 /// 输出节点指向的每个来源文件的完整内容，一个文件在多条证据里出现时只输出一次。
+/// 一个字符最多占的字节数。
+const MAX_CHAR_BYTES: usize = 4;
+
+/// 读原文的一段，不用把整个文件读进内存。范围两端切在字符中间时，退回到字符开头。
+/// 返回总字节数、实际的起始和结束，以及这段文字。
+fn read_text_window(
+    sources: &dyn SourceStore,
+    id: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<(usize, usize, usize, String), String> {
+    let describe = |error: Error| format!("原文读取失败：{error}");
+    let total = sources
+        .size(id)
+        .map_err(describe)?
+        .ok_or_else(|| format!("原文读取失败：来源 {id} 不存在"))?;
+    let total = usize::try_from(total).unwrap_or(usize::MAX);
+    let wanted_start = offset.min(total);
+    let wanted_end = wanted_start.saturating_add(limit).min(total);
+    // 多读几个字节，才能看出两端是不是切在字符中间。
+    let first = wanted_start.saturating_sub(MAX_CHAR_BYTES);
+    let last = wanted_end.saturating_add(MAX_CHAR_BYTES).min(total);
+    let bytes = sources
+        .read_bytes(id, first as u64, last as u64)
+        .map_err(describe)?;
+    let is_boundary = |position: usize| {
+        position == total
+            || bytes
+                .get(position - first)
+                .is_some_and(|byte| (*byte & 0xC0) != 0x80)
+    };
+    let mut start = wanted_start;
+    while start > first && !is_boundary(start) {
+        start -= 1;
+    }
+    let mut end = wanted_end;
+    while end > start && !is_boundary(end) {
+        end -= 1;
+    }
+    // limit 小于一个字符时也要往前走，否则永远读不完。
+    if end == start && start < total {
+        end = start + 1;
+        while end < last && !is_boundary(end) {
+            end += 1;
+        }
+    }
+    let text = std::str::from_utf8(&bytes[start - first..end - first])
+        .map_err(|_| "这份原文不是文本，无法显示".to_owned())?;
+    Ok((total, start, end, text.to_owned()))
+}
+
 fn render_full_source(
     node: NodeRef<'_>,
     offset: usize,
@@ -616,37 +679,20 @@ fn render_full_source(
         if !seen.insert(source.clone()) {
             continue;
         }
-        let bytes = match sources.read_all(&source) {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let window = read_text_window(sources, &source, offset, limit);
+        let (total, start, end, text) = match window {
+            Ok(window) => window,
+            Err(message) => {
                 *failures += 1;
                 let _ = writeln!(output, "  source: {source}");
-                let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
+                let _ = writeln!(output, "error[E901] {message}");
                 continue;
             }
         };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            *failures += 1;
-            let _ = writeln!(output, "  source: {source}");
-            let _ = writeln!(output, "error[E901] 这份原文不是文本，无法显示");
-            continue;
-        };
-        let start = floor_char_boundary(text, offset);
-        let end = floor_char_boundary(text, start.saturating_add(limit));
-        // limit 小于一个字符时也要往前走，否则永远读不完。
-        let end = if end == start {
-            text[start..]
-                .chars()
-                .next()
-                .map_or(start, |c| start + c.len_utf8())
-        } else {
-            end
-        };
-        let total = text.len();
         let _ = writeln!(
             output,
             "  source: {source} 共 {total} 字节，显示 {start}..{end}: {}",
-            quote(&text[start..end])
+            quote(&text)
         );
         if end < total {
             let _ = writeln!(
@@ -662,15 +708,6 @@ fn render_full_source(
             "  这个节点没有直接指向原文，用 show 查看 based_on 里的节点"
         );
     }
-}
-
-/// 不超过 `index` 的最近的字符边界。
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn render_list<'m>(name: &str, nodes: impl Iterator<Item = NodeRef<'m>>, output: &mut String) {
@@ -815,7 +852,31 @@ fn render_review(node: NodeRef<'_>, changed: &str, output: &mut String) {
     }
 }
 
-fn render_check(memory: &Memory, output: &mut String) {
+/// 原文的问题：缺失或者比引用的范围短。不校验哈希，否则每次 `check` 都要读完所有原文。
+fn damaged_sources(memory: &Memory, sources: &dyn SourceStore) -> BTreeMap<SourceId, Vec<String>> {
+    let mut sizes: HashMap<SourceId, Option<u64>> = HashMap::new();
+    let mut damaged: BTreeMap<SourceId, Vec<String>> = BTreeMap::new();
+    for node in memory.nodes() {
+        for evidence in node.evidence() {
+            let Evidence::Source { source, locator } = evidence else {
+                continue;
+            };
+            let size = *sizes
+                .entry(source.clone())
+                .or_insert_with(|| sources.size(&source).ok().flatten());
+            let Locator::TextRange { end, .. } = locator;
+            if size.is_none_or(|size| end as u64 > size) {
+                damaged
+                    .entry(source)
+                    .or_default()
+                    .push(node.id().to_owned());
+            }
+        }
+    }
+    damaged
+}
+
+fn render_check(memory: &Memory, sources: &dyn SourceStore, output: &mut String) {
     let unreachable = memory.unreachable();
     let empty: Vec<&str> = memory
         .catalog()
@@ -824,7 +885,8 @@ fn render_check(memory: &Memory, output: &mut String) {
         .filter(|section| section.nodes.is_empty())
         .map(|section| section.name.as_str())
         .collect();
-    if unreachable.is_empty() && empty.is_empty() {
+    let damaged = damaged_sources(memory, sources);
+    if unreachable.is_empty() && empty.is_empty() && damaged.is_empty() {
         output.push_str("check: 没有问题\n");
         return;
     }
@@ -834,12 +896,24 @@ fn render_check(memory: &Memory, output: &mut String) {
     for name in &empty {
         let _ = writeln!(output, "problem: 板块 {} 没有代表节点", quote(name));
     }
-    let _ = writeln!(
+    for (source, nodes) in &damaged {
+        let _ = writeln!(
+            output,
+            "problem: 原文 {source} 丢失或不完整，引用它的节点：{}",
+            nodes.join(", ")
+        );
+    }
+    let _ = write!(
         output,
         "check: {} 个节点查不到，{} 个板块没有代表节点",
         unreachable.len(),
         empty.len()
     );
+    if damaged.is_empty() {
+        output.push('\n');
+    } else {
+        let _ = writeln!(output, "，{} 份原文有问题", damaged.len());
+    }
 }
 
 /// 输出停在这条语句中间时，怎么看到剩下的内容。

@@ -13,7 +13,7 @@ pub mod lexer;
 pub mod parser;
 
 use crate::memory::Memory;
-use crate::source::SourceStore;
+use crate::source::{SourceStore, Trusted};
 use crate::timeline;
 use diagnostic::{Diagnostic, render};
 use journal::Journal;
@@ -34,7 +34,7 @@ evidence 节点, 节点                       沿依据一路追到原文：依�
 based_by 节点, 节点                       只列出基于这个节点推导的节点，删除节点前用它查依赖
 related_by 节点, 节点                     只列出关联了这个节点的节点，可以用来反向探索
 full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
-check                                    列出从总表走不到的节点和没有代表的板块
+check                                    列出从总表走不到的节点、没有代表的板块和丢失的原文
 timeline [limit N] [offset N] [node 节点] 时间线，从新到旧。node 只看这个节点的历史
 
 修改：
@@ -247,10 +247,12 @@ impl Session<'_> {
         let (mut statements, parse_errors) = parser::parse(tokens);
         errors.extend(parse_errors);
         statements.retain(|located| located.statement.writes());
+        // 这些脚本当时已经检查过了。原文后来丢了，不能让整份记忆都打不开。
+        let trusted = Trusted(self.sources);
         errors.extend(check::check(
             &statements,
             self.memory,
-            self.sources,
+            &trusted,
             Mode::ReadWrite,
         ));
         if !errors.is_empty() {
@@ -263,7 +265,7 @@ impl Session<'_> {
                 text: error.to_string(),
             };
         }
-        match exec::execute(&statements, self.memory, self.sources, at) {
+        match exec::execute(&statements, self.memory, &trusted, at) {
             Ok(report) => Output {
                 ok: true,
                 text: report.text,

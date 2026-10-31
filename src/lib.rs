@@ -3,11 +3,13 @@
 //! **这是不稳定的实验版本，接口和数据格式随时可能发生不兼容的变化。**
 
 pub mod board;
+mod durable;
 pub mod error;
 pub mod export;
 mod ffi;
 pub mod knowledge;
 pub mod lang;
+pub mod maintain;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;

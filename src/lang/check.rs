@@ -299,13 +299,7 @@ impl Checker<'_> {
                     end: source.end,
                 },
             }];
-            for problem in check_sources(&id.text, &evidence, self.sources) {
-                self.errors.push(Diagnostic::new(
-                    "E209",
-                    source.source.span,
-                    problem.to_string(),
-                ));
-            }
+            self.check_citation(&id.text, source, &evidence);
         }
         for reference in add.based_on.iter().chain(&add.related_by) {
             self.require(reference);
@@ -446,6 +440,29 @@ impl Checker<'_> {
         }
     }
 
+    /// 来源和范围都有效，并且范围里是完整的文字。切在字符中间的范围现在拦不住，以后每次读都会失败。
+    fn check_citation(&mut self, id: &str, source: &SourceRef, evidence: &[Evidence; 1]) -> bool {
+        let problems = check_sources(id, evidence, self.sources);
+        let span = source.source.span;
+        if !problems.is_empty() {
+            for problem in problems {
+                self.errors
+                    .push(Diagnostic::new("E209", span, problem.to_string()));
+            }
+            return false;
+        }
+        let locator = Locator::TextRange {
+            start: source.start,
+            end: source.end,
+        };
+        if let Err(error) = self.sources.read(&source.source.text, &locator) {
+            self.errors
+                .push(Diagnostic::new("E209", span, error.to_string()));
+            return false;
+        }
+        true
+    }
+
     fn cite(&mut self, id: &Name, citation: &Citation) {
         let known = self.require(id);
         let (cited, span) = match citation {
@@ -464,15 +481,7 @@ impl Checker<'_> {
                         end: source.end,
                     },
                 }];
-                let problems = check_sources(&id.text, &evidence, self.sources);
-                if !problems.is_empty() {
-                    for problem in problems {
-                        self.errors.push(Diagnostic::new(
-                            "E209",
-                            source.source.span,
-                            problem.to_string(),
-                        ));
-                    }
+                if !self.check_citation(&id.text, source, &evidence) {
                     return;
                 }
                 (cited_range(source), source.source.span)

@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::{Exported, Exporter, check_target};
+use crate::durable;
 use crate::error::Error;
 use crate::knowledge::Evidence;
 use crate::memory::{Memory, Problem};
 use crate::parse::Parser;
-use crate::parse::json::JsonParser;
+use crate::parse::json::{FORMAT_FILE, FORMAT_VERSION, JsonParser};
 use crate::source::SourceStore;
 use crate::source::file::FileSources;
 use crate::timeline;
@@ -37,10 +38,10 @@ impl Exporter for JsonExporter {
 
         let temporary = temporary_dir(target)?;
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| failed(parent, &e))?;
+            durable::create_private_dir(parent).map_err(|e| failed(parent, &e))?;
         }
         // 临时目录已经存在时这里会报错，不会动别人的东西。
-        fs::create_dir(&temporary).map_err(|e| failed(&temporary, &e))?;
+        create_new_private_dir(&temporary).map_err(|e| failed(&temporary, &e))?;
 
         let result = write_knowledge_base(memory, sources, &temporary)
             .and_then(|exported| move_into_place(&temporary, target).map(|()| exported));
@@ -49,6 +50,14 @@ impl Exporter for JsonExporter {
         }
         result
     }
+}
+
+/// 新建目录，已经存在时报错。
+fn create_new_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.exists() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    durable::create_private_dir(dir)
 }
 
 fn temporary_dir(target: &Path) -> Result<PathBuf, Error> {
@@ -66,7 +75,7 @@ fn write_knowledge_base(
     dir: &Path,
 ) -> Result<Exported, Error> {
     let nodes_dir = dir.join("nodes");
-    fs::create_dir(&nodes_dir).map_err(|e| failed(&nodes_dir, &e))?;
+    durable::create_private_dir(&nodes_dir).map_err(|e| failed(&nodes_dir, &e))?;
 
     let mut cited = BTreeSet::new();
     for node in memory.nodes() {
@@ -81,16 +90,22 @@ fn write_knowledge_base(
 
     let exported_sources = FileSources::new(dir);
     for id in &cited {
-        exported_sources.put(&sources.read_all(id)?)?;
+        exported_sources.put_without_sync(&sources.read_all(id)?)?;
     }
     write_json(&dir.join("catalog.json"), memory.catalog())?;
     timeline::write(memory.timeline(), dir)?;
+    write_json(
+        &dir.join(FORMAT_FILE),
+        &serde_json::json!({ "format": FORMAT_VERSION }),
+    )?;
 
     let parsed = JsonParser.parse(dir)?;
     let problems = Memory::validate(&parsed, &exported_sources);
     if !problems.is_empty() {
         return Err(Error::InvalidMemory(problems));
     }
+    // 改名之前全部落盘：目标目录一出现，就是完整的知识库。
+    durable::sync_tree(dir).map_err(|e| failed(dir, &e))?;
     Ok(Exported {
         nodes: parsed.nodes.len(),
         sections: parsed.catalog.sections.len(),
@@ -103,14 +118,15 @@ fn move_into_place(temporary: &Path, target: &Path) -> Result<(), Error> {
     if target.exists() {
         fs::remove_dir(target).map_err(|e| failed(target, &e))?;
     }
-    fs::rename(temporary, target).map_err(|e| failed(target, &e))
+    fs::rename(temporary, target).map_err(|e| failed(target, &e))?;
+    durable::sync_dir(target.parent().unwrap_or(Path::new(""))).map_err(|e| failed(target, &e))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     let mut text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::Save(format!("{}：{e}", path.display())))?;
     text.push('\n');
-    fs::write(path, text).map_err(|e| failed(path, &e))
+    durable::write_private(path, text.as_bytes()).map_err(|e| failed(path, &e))
 }
 
 fn failed(path: &Path, error: &std::io::Error) -> Error {

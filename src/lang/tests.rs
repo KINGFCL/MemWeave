@@ -2978,3 +2978,231 @@ fn referring_to_a_node_created_later_says_so() {
         output.text
     );
 }
+
+/// 崩溃可能发生在写日志的任何一个字节，包括切在汉字中间。无论切在哪，都要能加载、能接着写、再次能加载。
+#[test]
+fn a_journal_cut_at_any_byte_still_works() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let path = dir.path().join("journal.jsonl");
+    let mut live = memory();
+    for script in [
+        "log \"第一段脚本，含汉字\"",
+        "set entry title \"新标题\"",
+        "log \"第三段\"",
+    ] {
+        let output = Session::new(&mut live, &store, Mode::ReadWrite)
+            .with_journal(&journal)
+            .run(script);
+        assert!(output.ok, "{}", output.text);
+    }
+    let whole = fs::read(&path).unwrap();
+    let line_ends: Vec<usize> = whole
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .map(|(index, _)| index + 1)
+        .collect();
+
+    for cut in 0..whole.len() {
+        fs::write(&path, &whole[..cut]).unwrap();
+        let complete = line_ends.iter().filter(|end| **end <= cut).count();
+
+        let mut restarted = memory();
+        journal
+            .replay(&mut restarted, &store)
+            .unwrap_or_else(|e| panic!("切在 {cut}：{e}"));
+        assert_eq!(restarted.timeline().len(), complete, "切在 {cut}");
+
+        let output = Session::new(&mut restarted, &store, Mode::ReadWrite)
+            .with_journal(&journal)
+            .run("log \"恢复后写入\"");
+        assert!(output.ok, "{}", output.text);
+
+        let mut again = memory();
+        journal
+            .replay(&mut again, &store)
+            .unwrap_or_else(|e| panic!("切在 {cut} 再次加载：{e}"));
+        assert_eq!(snapshot(&again), snapshot(&restarted), "切在 {cut}");
+        assert_eq!(again.timeline().last().unwrap().text, "log 恢复后写入");
+    }
+}
+
+#[test]
+fn a_journal_from_a_newer_version_is_refused() {
+    let (dir, store) = file_store();
+    fs::write(
+        dir.path().join("journal.jsonl"),
+        "{\"script\":\"log \\\"x\\\"\",\"v\":999}\n",
+    )
+    .unwrap();
+
+    let error = Journal::new(dir.path())
+        .replay(&mut memory(), &store)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("更新的版本"), "{error}");
+}
+
+#[test]
+fn replaying_restores_text_the_disk_lost() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let text = "断电前写入的原文";
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&format!(
+            "source a\n title \"t\"\n desc \"d\"\n text \"\"\"{text}\"\"\"\n related_by entry\nend"
+        ));
+    assert!(output.ok, "{}", output.text);
+    let id = source_id(text.as_bytes());
+    let path = dir.path().join("sources").join(&id["sha256:".len()..]);
+
+    // 断电可能留下空文件，或者长度对但内容错的文件。
+    for damaged in [Vec::new(), vec![b'x'; text.len()]] {
+        fs::write(&path, damaged).unwrap();
+        let store = crate::source::file::FileSources::new(dir.path());
+        let mut restarted = memory();
+        journal.replay(&mut restarted, &store).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(snapshot(&restarted), snapshot(&live));
+    }
+}
+
+#[test]
+fn a_lost_source_does_not_stop_the_rest_of_the_memory() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let mut live = memory();
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&format!(
+            "source a\n title \"t\"\n desc \"d\"\n source {} 0..3\n related_by entry\nend",
+            source()
+        ));
+    assert!(output.ok, "{}", output.text);
+    fs::remove_dir_all(dir.path().join("sources")).unwrap();
+
+    // 日志引用的原文丢了，也能重放。
+    let store = crate::source::file::FileSources::new(dir.path());
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert!(restarted.contains("a"));
+
+    let output = Session::new(&mut restarted, &store, Mode::ReadWrite).run("show a");
+    assert!(output.text.contains("error[E901]"), "{}", output.text);
+    assert!(output.text.contains("title: \"t\""), "{}", output.text);
+    let output = Session::new(&mut restarted, &store, Mode::ReadWrite).run("check");
+    assert!(output.text.contains("丢失或不完整"), "{}", output.text);
+    assert!(
+        output.text.contains("引用它的节点：conclusion") || output.text.contains("entry"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("份原文有问题"), "{}", output.text);
+    // 导出时才要求原文都在。
+    let target = dir.path().join("导出");
+    let output = Session::new(&mut restarted, &store, Mode::ReadWrite).run(&export_to(&target));
+    assert!(output.text.contains("error[E902]"), "{}", output.text);
+    assert!(!target.exists());
+}
+
+#[test]
+fn a_range_cut_inside_a_character_is_refused_when_written() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let source = source();
+
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!(
+            "source a\n title \"t\"\n desc \"d\"\n source {source} 1..2\n related_by entry\nend"
+        ),
+    );
+    assert!(output.text.contains("error[E209]"), "{}", output.text);
+    assert!(output.text.contains("不是有效的文本"), "{}", output.text);
+
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("cite entry source {source} 1..2"),
+    );
+    assert!(output.text.contains("error[E209]"), "{}", output.text);
+}
+
+#[test]
+fn the_timeline_cannot_be_forged_with_line_breaks() {
+    let mut memory = memory();
+
+    ok(
+        &mut memory,
+        "log \"\"\"真的\n2020-01-01T00:00Z remove ownership\"\"\"\ngoal create g \"\"\"目标\n2020-01-01T00:00Z 假目标\"\"\"\n desc \"d\"\nend",
+    );
+
+    let text = read(&mut memory, "timeline").text;
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.contains("真的\\n2020-01-01T00:00Z remove ownership"),
+        "{text}"
+    );
+    assert!(text.lines().all(|line| !line.starts_with("2020")), "{text}");
+}
+
+#[test]
+fn full_source_reads_pages_without_splitting_characters() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    // 一 占 3 字节。无论从哪个字节开始，都不能切开字符，也不能漏内容。
+    let content = "一二三四五";
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!(
+            "source long\n title \"t\"\n desc \"d\"\n text \"\"\"{content}\"\"\"\n related_by entry\nend"
+        ),
+    );
+    assert!(output.ok, "{}", output.text);
+    let page = |memory: &mut Memory, offset: usize, limit: usize| {
+        run_with(
+            memory,
+            &store,
+            &format!("full_source long offset {offset} limit {limit}"),
+        )
+        .text
+    };
+
+    let text = page(&mut memory, 4, 3);
+    assert!(text.contains("显示 3..6: \"二\""), "{text}");
+    assert!(text.contains("offset 6"), "{text}");
+    let text = page(&mut memory, 3, 7);
+    assert!(text.contains("显示 3..9: \"二三\""), "{text}");
+    // limit 小于一个字符时也往前走。
+    let text = page(&mut memory, 0, 1);
+    assert!(text.contains("显示 0..3: \"一\""), "{text}");
+    // 超过末尾。
+    let text = page(&mut memory, 99, 3);
+    assert!(text.contains("显示 15..15: \"\""), "{text}");
+    assert!(!text.contains("还没有显示完"), "{text}");
+    // 按提示一页页读，能读完全部内容。
+    let mut all = String::new();
+    let mut offset = 0;
+    loop {
+        let text = page(&mut memory, offset, 4);
+        let quoted = text
+            .split(": \"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        all.push_str(quoted);
+        match text.split_once("offset ") {
+            Some((_, next)) => offset = next.split_whitespace().next().unwrap().parse().unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(all, content);
+}

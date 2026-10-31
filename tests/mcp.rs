@@ -521,3 +521,114 @@ fn an_oversized_catalog_cannot_crowd_out_the_result() {
     assert!(blocks[1].contains("用 catalog show 看全"), "{blocks:?}");
     client.stop();
 }
+
+/// 用文件大小上限模拟磁盘写满：日志只写进去一部分。之后不能留下半行。
+#[cfg(unix)]
+#[test]
+fn a_full_disk_leaves_the_journal_intact() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let bin = env!("CARGO_BIN_EXE_memweave");
+    let run = |script: &str| {
+        Command::new(bin)
+            .args(["run", "--write"])
+            .arg(&kb)
+            .arg(script)
+            .output()
+            .unwrap()
+    };
+    assert!(run("log \"第一条\"").status.success());
+    let journal = kb.join("journal.jsonl");
+    let size = fs::metadata(&journal).unwrap().len();
+
+    // ulimit -f 的单位是 512 字节。写入超过上限时 write 返回错误。
+    let long = "很长的内容".repeat(400);
+    let limited = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 1; exec \"$0\" run --write \"$1\" \"$2\"")
+        .arg(bin)
+        .arg(&kb)
+        .arg(format!("log \"{long}\""))
+        .output()
+        .unwrap();
+
+    assert!(!limited.status.success());
+    let text = String::from_utf8_lossy(&limited.stdout);
+    assert!(text.contains("写入日志失败"), "{text}");
+    assert_eq!(fs::metadata(&journal).unwrap().len(), size, "半行要去掉");
+    assert!(run("log \"磁盘恢复后\"").status.success());
+    let check = Command::new(bin)
+        .arg("run")
+        .arg(&kb)
+        .arg("timeline")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        text.contains("磁盘恢复后") && text.contains("第一条"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_damaged_knowledge_base_points_to_doctor_and_doctor_fixes_it() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    fs::write(kb.join("nodes/drop.json"), "{").unwrap();
+    let bin = env!("CARGO_BIN_EXE_memweave");
+
+    let server = Command::new(bin)
+        .arg("mcp")
+        .arg(&kb)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!server.status.success());
+    assert!(String::from_utf8_lossy(&server.stderr).contains("memweave doctor"));
+    assert!(server.stdout.is_empty());
+
+    let report = Command::new(bin).arg("doctor").arg(&kb).output().unwrap();
+    assert!(String::from_utf8_lossy(&report.stdout).contains("drop.json"));
+    let fixed = Command::new(bin)
+        .args(["doctor"])
+        .arg(&kb)
+        .arg("--fix")
+        .output()
+        .unwrap();
+    assert!(
+        fixed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
+
+    let mut client = Client::start(&kb, true);
+    let (ok, text) = client.read("check");
+    assert!(ok && text.contains("没有问题"), "{text}");
+    client.stop();
+}
+
+#[test]
+fn maintenance_waits_for_the_server_to_exit() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let bin = env!("CARGO_BIN_EXE_memweave");
+    let mut client = Client::start(&kb, true);
+    assert!(client.write("log \"x\"").0);
+
+    let compact = Command::new(bin).arg("compact").arg(&kb).output().unwrap();
+    assert!(!compact.status.success());
+    assert!(String::from_utf8_lossy(&compact.stderr).contains("另一个进程正在写"));
+    assert!(client.read("timeline").0);
+    client.stop();
+
+    let compact = Command::new(bin).arg("compact").arg(&kb).output().unwrap();
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    assert!(!kb.join("journal.jsonl").exists());
+    let mut next = Client::start(&kb, true);
+    assert!(next.read("timeline").1.contains("log x"));
+    next.stop();
+}

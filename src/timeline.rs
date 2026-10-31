@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::durable;
 use crate::error::Error;
 
 pub const FILE_NAME: &str = "timeline.jsonl";
@@ -90,22 +91,38 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
-/// 读取知识库的时间线。没有文件时是空的。
-pub fn read(knowledge_base: &Path) -> Result<Vec<Event>, Error> {
+/// 读出来的时间线。
+pub struct Loaded {
+    pub events: Vec<Event>,
+    /// 损坏被跳过的行数。
+    pub skipped: usize,
+}
+
+/// 读取知识库的时间线。时间线只是历史，坏了不影响记忆，所以损坏的部分跳过，不报错。
+pub fn read(knowledge_base: &Path) -> Loaded {
     let path = knowledge_base.join(FILE_NAME);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Parse(vec![format!("{}：{e}", path.display())])),
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(_) => {
+            return Loaded {
+                events: Vec::new(),
+                skipped: 1,
+            };
+        }
     };
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str(line).map_err(|e| {
-                Error::Parse(vec![format!("{} 第 {} 行：{e}", path.display(), index + 1)])
-            })
-        })
-        .collect()
+    let mut events = Vec::new();
+    let mut skipped = 0;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice(line) {
+            Ok(event) => events.push(event),
+            Err(_) => skipped += 1,
+        }
+    }
+    Loaded { events, skipped }
 }
 
 /// 写出时间线。没有内容时不写文件。
@@ -119,7 +136,8 @@ pub fn write(events: &[Event], dir: &Path) -> Result<(), Error> {
         text.push_str(&serde_json::to_string(event).expect("事件总是可以序列化"));
         text.push('\n');
     }
-    fs::write(&path, text).map_err(|e| Error::Save(format!("{}：{e}", path.display())))
+    durable::write_private(&path, text.as_bytes())
+        .map_err(|e| Error::Save(format!("{}：{e}", path.display())))
 }
 
 #[cfg(test)]
@@ -139,7 +157,7 @@ mod tests {
     #[test]
     fn reads_back_what_it_writes() {
         let dir = TempDir::new().unwrap();
-        assert!(read(dir.path()).unwrap().is_empty());
+        assert!(read(dir.path()).events.is_empty());
         write(&[], dir.path()).unwrap();
         assert!(!dir.path().join(FILE_NAME).exists());
 
@@ -158,14 +176,21 @@ mod tests {
             },
         ];
         write(&events, dir.path()).unwrap();
-        assert_eq!(read(dir.path()).unwrap(), events);
+        assert_eq!(read(dir.path()).events, events);
     }
 
     #[test]
-    fn a_damaged_file_is_reported() {
+    fn damaged_lines_are_skipped() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join(FILE_NAME), "不是 JSON\n").unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            b"not json\n{\"at\":1,\"text\":\"ok\"}\n\xE4\xB8\n",
+        )
+        .unwrap();
 
-        assert!(matches!(read(dir.path()), Err(Error::Parse(_))));
+        let loaded = read(dir.path());
+
+        assert_eq!(loaded.skipped, 2);
+        assert_eq!(loaded.events[0].text, "ok");
     }
 }
