@@ -242,8 +242,8 @@ fn build_tree(id: &str, kept: &HashMap<NodeId, Kept>) -> TreeNode {
     TreeNode {
         id: entry.node.id.clone(),
         title: entry.node.title.clone(),
-        raw: entry.node.raw.clone(),
-        understanding: entry.node.understanding.clone(),
+        description: entry.node.description.clone(),
+        evidence: entry.node.evidence.clone(),
         children: entry
             .children
             .iter()
@@ -275,8 +275,8 @@ mod tests {
                     let node = Node {
                         id: id.to_string(),
                         title: format!("标题{id}"),
-                        raw: format!("原始{id}"),
-                        understanding: format!("理解{id}"),
+                        description: format!("描述{id}"),
+                        evidence: Vec::new(),
                         related: related.iter().map(|r| r.to_string()).collect(),
                     };
                     (id.to_string(), node)
@@ -397,8 +397,7 @@ mod tests {
         assert_eq!(tree.roots.len(), 1);
         let a = &tree.roots[0];
         assert_eq!(a.id, "a");
-        assert_eq!(a.raw, "原始a");
-        assert_eq!(a.understanding, "理解a");
+        assert_eq!(a.description, "描述a");
         assert_eq!(child_ids(a), ["c"]);
         assert_eq!(child_ids(&a.children[0]), ["e"]);
         // d 被丢弃后不再往下爬，f 从未被读取。
@@ -416,8 +415,7 @@ mod tests {
         assert_eq!(request["query"], "问题");
         assert_eq!(request["kept"][0]["id"], "a");
         let candidate = &request["candidates"][0];
-        assert_eq!(candidate["raw"], "原始b");
-        assert_eq!(candidate["understanding"], "理解b");
+        assert_eq!(candidate["description"], "描述b");
         assert_eq!(candidate["sources"][0], "a");
     }
 
@@ -528,7 +526,7 @@ mod tests {
     fn overflow_names_the_layer_and_excess() {
         let big = "很长".repeat(1000);
         let mut store = MemStore::new(&["a"], &[("a", &["b"]), ("b", &[])]);
-        store.nodes.get_mut("b").unwrap().raw = big;
+        store.nodes.get_mut("b").unwrap().description = big;
         let mut model = ScriptedModel::new(&[&["a"], &["a"]]);
         model.limit = 1000;
 

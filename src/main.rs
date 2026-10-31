@@ -8,6 +8,7 @@ use memweave::model::anthropic::{self, AnthropicModel};
 use memweave::model::deepseek::{self, DeepSeekModel};
 use memweave::parse::json::{self, JsonParser};
 use memweave::retrieve::retrieve;
+use memweave::source::file::FileSources;
 use memweave::weave::Weaver;
 use memweave::weave::text::TextWeaver;
 
@@ -15,6 +16,7 @@ const USAGE: &str = "\
 用法：
   memweave weave <文本文件> <知识库目录>   调用模型把文本组织成新的知识库
   memweave query <知识库目录> <问题>       从知识库检索，返回知识树
+  memweave evidence <知识库目录> <节点>    读取节点的证据原文，不调用模型
 
 环境变量：
   MEMWEAVE_PROVIDER       可选，模型厂商：deepseek（默认）或 anthropic
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [command, input, kb] if command == "weave" => run_weave(input, kb),
         [command, kb, query] if command == "query" => run_query(kb, query),
+        [command, kb, node] if command == "evidence" => run_evidence(kb, node),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -50,7 +53,7 @@ fn main() -> ExitCode {
 
 fn run_query(kb: &str, query: &str) -> Result<String, String> {
     // 先解析知识库：有问题就不必连接模型。
-    let memory = Memory::load(&JsonParser, Path::new(kb)).map_err(|e| e.to_string())?;
+    let memory = load_memory(kb)?;
     let model = connect_model()?;
     let tree = retrieve(&memory, model.as_ref(), query).map_err(|e| e.to_string())?;
     serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())
@@ -61,16 +64,29 @@ fn run_weave(input: &str, kb: &str) -> Result<String, String> {
     // 先确认能写入：目标不可用时不必调用模型。
     json::check_target(target).map_err(|e| e.to_string())?;
     let model = connect_model()?;
-    let knowledge = TextWeaver
+    let woven = TextWeaver
         .weave(Path::new(input), model.as_ref())
         .map_err(|e| e.to_string())?;
-    let sections = knowledge.catalog.sections.len();
-    let memory = Memory::from_parsed(knowledge).map_err(|e| e.to_string())?;
-    json::save(&memory, target).map_err(|e| e.to_string())?;
+    let sections = woven.knowledge.catalog.sections.len();
+    let memory = Memory::from_parsed(woven.knowledge, &woven.sources).map_err(|e| e.to_string())?;
+    json::save(&memory, &woven.sources, target).map_err(|e| e.to_string())?;
     Ok(format!(
         "已生成 {} 个节点、{sections} 个板块，写入 {kb}",
         memory.node_count()
     ))
+}
+
+fn run_evidence(kb: &str, node: &str) -> Result<String, String> {
+    let memory = load_memory(kb)?;
+    let evidence = memory
+        .evidence(node, &FileSources::new(Path::new(kb)))
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&evidence).map_err(|e| e.to_string())
+}
+
+fn load_memory(kb: &str) -> Result<Memory, String> {
+    let path = Path::new(kb);
+    Memory::load(&JsonParser, &FileSources::new(path), path).map_err(|e| e.to_string())
 }
 
 /// 根据环境变量创建模型。接入新厂商时，在这里加一个分支。

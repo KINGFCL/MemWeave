@@ -1,7 +1,20 @@
 {
   "id": "borrowing",
   "title": "借用",
-  "raw": "引用可以在不转移所有权的情况下访问值。同一时刻，一个值要么有多个不可变引用，要么只有一个可变引用，且引用不能比值活得更久。",
-  "understanding": "“共享不可变、可变不共享”这条规则在编译期排除了数据竞争和悬垂引用，也是 Send 与 Sync 能保证线程安全的基础。",
-  "related": ["ownership", "send-sync"]
+  "description": "引用可以在不转移所有权的情况下访问值。同一时刻，一个值要么有多个不可变引用，要么只有一个可变引用，且引用不能比值活得更久。“共享不可变、可变不共享”这条规则在编译期排除了数据竞争和悬垂引用，也是 Send 与 Sync 能保证线程安全的基础。",
+  "evidence": [
+    {
+      "type": "source",
+      "source": "sha256:95b2eaa8612c4c91a340e14f884b6af3dabb03a762db88ec68aea84217ce0e49",
+      "locator": {
+        "type": "text_range",
+        "start": 161,
+        "end": 344
+      }
+    }
+  ],
+  "related": [
+    "ownership",
+    "send-sync"
+  ]
 }

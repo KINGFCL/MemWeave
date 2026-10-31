@@ -9,5 +9,6 @@ pub mod model;
 pub mod parse;
 mod prompt;
 pub mod retrieve;
+pub mod source;
 pub mod store;
 pub mod weave;

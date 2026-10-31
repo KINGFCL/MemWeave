@@ -1,7 +1,20 @@
 {
   "id": "ownership",
   "title": "所有权",
-  "raw": "Rust 中每个值都有唯一的所有者。所有者离开作用域时，值被释放。赋值或传参默认会移动所有权，除非类型实现了 Copy。",
-  "understanding": "所有权把资源释放的时机固定在编译期可推导的位置，因此不需要垃圾回收，也避免了重复释放。",
-  "related": ["borrowing", "drop"]
+  "description": "Rust 中每个值都有唯一的所有者。所有者离开作用域时，值被释放。赋值或传参默认会移动所有权，除非类型实现了 Copy。所有权把资源释放的时机固定在编译期可推导的位置，因此不需要垃圾回收，也避免了重复释放。",
+  "evidence": [
+    {
+      "type": "source",
+      "source": "sha256:95b2eaa8612c4c91a340e14f884b6af3dabb03a762db88ec68aea84217ce0e49",
+      "locator": {
+        "type": "text_range",
+        "start": 0,
+        "end": 160
+      }
+    }
+  ],
+  "related": [
+    "borrowing",
+    "drop"
+  ]
 }

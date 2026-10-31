@@ -9,9 +9,11 @@ use super::{ParsedKnowledge, Parser};
 use crate::error::Error;
 use crate::knowledge::{Catalog, Node};
 use crate::memory::Memory;
+use crate::source::file::FileSources;
+use crate::source::in_memory::InMemorySources;
 use crate::store::Store;
 
-/// JSON 目录格式：`catalog.json` 加 `nodes/<节点地址>.json`。
+/// JSON 目录格式：`catalog.json` 加 `nodes/<节点地址>.json`。来源不会被读取，它们留在固态硬盘上。
 ///
 /// `nodes` 目录只读取第一层的 `.json` 文件，其他文件会被忽略。
 pub struct JsonParser;
@@ -49,11 +51,16 @@ pub fn check_target(dir: &Path) -> Result<(), Error> {
     }
 }
 
-/// 把 `memory` 以 JSON 目录格式写入 `dir`。
+/// 把 `memory` 和它的来源以 JSON 目录格式写入 `dir`。
 ///
 /// 最后才写总表：中途失败时缺少 `catalog.json`，解析会报错，不会被当成完整的知识库。
-pub fn save(memory: &Memory, dir: &Path) -> Result<(), Error> {
+pub fn save(memory: &Memory, sources: &InMemorySources, dir: &Path) -> Result<(), Error> {
     check_target(dir)?;
+    let file_sources = FileSources::new(dir);
+    for bytes in sources.contents() {
+        file_sources.put(bytes)?;
+    }
+
     let nodes_dir = dir.join("nodes");
     fs::create_dir_all(&nodes_dir)
         .map_err(|e| Error::Save(format!("{}：{e}", nodes_dir.display())))?;
@@ -130,14 +137,33 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::knowledge::{Evidence, Locator};
+    use crate::source::{LoadedEvidence, SourceStore, source_id};
 
     const CATALOG: &str = r#"{"sections":[{"name":"板块","nodes":[{"id":"a","title":"A"}]}]}"#;
 
     fn node_json(id: &str) -> String {
-        format!(r#"{{"id":"{id}","title":"T","raw":"R","understanding":"U"}}"#)
+        format!(r#"{{"id":"{id}","title":"T","description":"D","evidence":[]}}"#)
     }
 
     /// 创建知识库目录。`nodes` 的每一项是（文件名，内容）。
+    fn demo_path() -> &'static Path {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"))
+    }
+
+    fn load_demo() -> Memory {
+        Memory::load(&JsonParser, &FileSources::new(demo_path()), demo_path()).unwrap()
+    }
+
+    /// 把示例知识库的来源读进内存，用于测试写入。
+    fn demo_sources() -> InMemorySources {
+        let mut sources = InMemorySources::new();
+        for entry in fs::read_dir(demo_path().join("sources")).unwrap() {
+            sources.insert(fs::read(entry.unwrap().path()).unwrap());
+        }
+        sources
+    }
+
     fn knowledge_base(catalog: &str, nodes: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("catalog.json"), catalog).unwrap();
@@ -157,12 +183,26 @@ mod tests {
 
     #[test]
     fn demo_knowledge_base_loads_into_memory() {
-        let source = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb");
-
-        let memory = Memory::load(&JsonParser, Path::new(source)).unwrap();
+        let memory = load_demo();
 
         // drop 不在总表里，只能沿关联到达。
         assert_eq!(memory.node_count(), 4);
+    }
+
+    #[test]
+    fn demo_evidence_can_be_traced_to_its_source() {
+        let memory = load_demo();
+        let sources = FileSources::new(demo_path());
+
+        for node in memory.nodes() {
+            let evidence = memory.evidence(&node.id, &sources).unwrap();
+            assert!(!evidence.is_empty(), "{}", node.id);
+        }
+        let LoadedEvidence::Source { text, .. } = &memory.evidence("drop", &sources).unwrap()[0]
+        else {
+            panic!("drop 的第一条证据应该来自来源");
+        };
+        assert!(text.contains("Drop"), "{text}");
     }
 
     #[test]
@@ -217,35 +257,69 @@ mod tests {
 
     #[test]
     fn saved_memory_loads_back_unchanged() {
-        let source = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"));
-        let original = Memory::load(&JsonParser, source).unwrap();
+        let original = load_demo();
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("新目录/知识库");
 
-        save(&original, &target).unwrap();
+        save(&original, &demo_sources(), &target).unwrap();
 
-        let loaded = Memory::load(&JsonParser, &target).unwrap();
+        let target_sources = FileSources::new(&target);
+        let loaded = Memory::load(&JsonParser, &target_sources, &target).unwrap();
         assert_eq!(loaded.catalog().unwrap(), original.catalog().unwrap());
         assert_eq!(loaded.node_count(), original.node_count());
+        let demo = FileSources::new(demo_path());
         for node in original.nodes() {
             assert_eq!(loaded.node(&node.id).unwrap().as_ref(), Some(node));
+            assert_eq!(
+                loaded.evidence(&node.id, &target_sources).unwrap(),
+                original.evidence(&node.id, &demo).unwrap()
+            );
         }
     }
 
     #[test]
     fn save_refuses_to_overwrite() {
-        let source = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo-kb"));
-        let memory = Memory::load(&JsonParser, source).unwrap();
+        let memory = load_demo();
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("已有文件"), "内容").unwrap();
 
         assert!(matches!(check_target(dir.path()), Err(Error::Save(_))));
-        assert!(matches!(save(&memory, dir.path()), Err(Error::Save(_))));
+        assert!(matches!(
+            save(&memory, &demo_sources(), dir.path()),
+            Err(Error::Save(_))
+        ));
         assert_eq!(
             fs::read_to_string(dir.path().join("已有文件")).unwrap(),
             "内容"
         );
         assert!(!dir.path().join("nodes").exists());
+        assert!(!dir.path().join("sources").exists());
+    }
+
+    #[test]
+    fn parsing_does_not_need_the_sources() {
+        let text = "一段原文";
+        let node = format!(
+            r#"{{"id":"a","title":"T","description":"D","evidence":[{{"type":"source","source":"{}","locator":{{"type":"text_range","start":0,"end":3}}}}]}}"#,
+            source_id(text.as_bytes())
+        );
+        let dir = knowledge_base(CATALOG, &[("a.json", &node)]);
+
+        // 只有解析时来源文件不存在也没关系，校验时才报告。
+        let parsed = JsonParser.parse(dir.path()).unwrap();
+        assert_eq!(
+            parsed.nodes[0].evidence,
+            [Evidence::Source {
+                source: source_id(text.as_bytes()),
+                locator: Locator::TextRange { start: 0, end: 3 },
+            }]
+        );
+        let sources = FileSources::new(dir.path());
+        assert!(sources.size(&source_id(text.as_bytes())).unwrap().is_none());
+        assert!(matches!(
+            Memory::from_parsed(parsed, &sources),
+            Err(Error::InvalidMemory(_))
+        ));
     }
 
     #[test]

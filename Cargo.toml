@@ -8,11 +8,12 @@ readme = "README.md"
 keywords = ["knowledge-graph", "retrieval", "llm", "rag"]
 categories = ["command-line-utilities"]
 # 白名单：只打包列出的文件，避免把本地的密钥或笔记带进发布包。
-include = ["/src/**/*.rs", "/examples/demo-kb/**/*.json", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
+include = ["/src/**/*.rs", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 ureq = "3.5.0"
 

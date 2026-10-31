@@ -56,6 +56,12 @@ pub enum Error {
     #[error("知识库写入失败：{0}")]
     Save(String),
 
+    #[error("来源读取失败：{0}")]
+    Source(String),
+
+    #[error("节点 {0} 不存在")]
+    UnknownNode(NodeId),
+
     #[error("模型调用失败：{0}")]
     Model(String),
 }
