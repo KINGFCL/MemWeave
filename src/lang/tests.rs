@@ -2371,3 +2371,279 @@ fn export_follows_the_current_citations() {
     assert_eq!(names, [&source_id(text.as_bytes())["sha256:".len()..]]);
     assert_eq!(same_content(&load_exported(&target)), same_content(&memory));
 }
+
+fn stored_text(store: &crate::source::file::FileSources, memory: &Memory, id: &str) -> String {
+    let (source, start, end) = source_entries(memory, id).pop().unwrap();
+    store
+        .read(&source, &Locator::TextRange { start, end })
+        .unwrap()
+}
+
+#[test]
+fn source_text_is_stored_exactly_as_written() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let new = |id: &str, text: &str| {
+        format!(
+            "source {id}\n title \"t\"\n desc \"\"\"  描述  \"\"\"\n text {text}\n related_by entry\nend"
+        )
+    };
+
+    for (id, written, expected) in [
+        // 首行缩进和结尾的空白都是内容。
+        (
+            "缩进",
+            "\"\"\"\n  key: value\n    nested: 1\n\n\"\"\"",
+            "  key: value\n    nested: 1\n",
+        ),
+        ("空白", "\"\"\"  两边有空格  \"\"\"", "  两边有空格  "),
+        ("单行", "\"  单行也一样  \"", "  单行也一样  "),
+        // 只去掉紧贴开头和结尾的那个换行。
+        ("换行", "\"\"\"\n\n中间\n\n\"\"\"", "\n中间\n"),
+        ("回车", "\"\"\"\r\nWindows\r\n\"\"\"", "Windows"),
+        // 含三个连续的引号时，用四个引号包住。
+        (
+            "三引号",
+            "\"\"\"\"\ndef f():\n    \"\"\"文档\"\"\"\n\"\"\"\"",
+            "def f():\n    \"\"\"文档\"\"\"",
+        ),
+        ("五引号", "\"\"\"\"\"a\"\"\"\"b\"\"\"\"\"", "a\"\"\"\"b"),
+        // 结尾的引号比开头多时，多出来的算内容。
+        ("结尾引号", "\"\"\"他说\"好\"\"\"\"", "他说\"好\""),
+    ] {
+        let output = run_with(&mut memory, &store, &new(id, written));
+        assert!(output.ok, "{id}\n{}", output.text);
+        assert_eq!(stored_text(&store, &memory, id), expected, "{id}");
+        assert_eq!(
+            source_entries(&memory, id)[0].0,
+            source_id(expected.as_bytes()),
+            "{id}"
+        );
+        // 描述的首尾空白还是去掉。
+        assert_eq!(memory.node(id).unwrap().description(), "描述", "{id}");
+    }
+
+    // cite 也一样。
+    let output = run_with(
+        &mut memory,
+        &store,
+        "cite entry text \"\"\"\n  缩进\n\"\"\"",
+    );
+    assert!(output.ok, "{}", output.text);
+    assert_eq!(stored_text(&store, &memory, "entry"), "  缩进");
+}
+
+#[test]
+fn unfinished_or_mismatched_quotes_are_reported() {
+    let mut memory = memory();
+
+    let text = fails(&mut memory, "set entry desc \"\"\"没有结束", "E003");
+    assert!(text.contains("在内容末尾补上 \"\"\""), "{text}");
+    let text = fails(&mut memory, "set entry desc \"\"\"\"开头四个\"\"\"", "E003");
+    assert!(text.contains("在内容末尾补上 \"\"\"\""), "{text}");
+
+    // 只用三个引号包住含三引号的内容时，提示要说到点子上。
+    let text = fails(
+        &mut memory,
+        "set entry desc \"\"\"def f():\n    \"\"\"文档\"\"\"\n\"\"\"",
+        "E106",
+    );
+    assert!(text.contains("用四个引号包住"), "{text}");
+
+    fails(&mut memory, "cite entry text", "E102");
+    fails(&mut memory, "cite entry text \"\"\"  \n \"\"\"", "E206");
+}
+
+#[test]
+fn verbatim_text_survives_replay_and_export() {
+    let (dir, store) = file_store();
+    let journal = Journal::new(dir.path());
+    let target = dir.path().join("导出");
+    let mut live = memory();
+    let script = format!(
+        "source 代码\n title \"t\"\n desc \"d\"\n text \"\"\"\"\n  \"\"\"缩进\"\"\"\n\"\"\"\"\n related_by entry\nend\n{}",
+        export_to(&target)
+    );
+
+    let output = Session::new(&mut live, &store, Mode::ReadWrite)
+        .with_journal(&journal)
+        .run(&script);
+    assert!(output.ok, "{}", output.text);
+
+    let mut restarted = memory();
+    journal.replay(&mut restarted, &store).unwrap();
+    assert_eq!(snapshot(&restarted), snapshot(&live));
+    assert_eq!(
+        stored_text(&store, &restarted, "代码"),
+        "  \"\"\"缩进\"\"\""
+    );
+    let exported = crate::source::file::FileSources::new(&target);
+    assert_eq!(
+        stored_text(&exported, &load_exported(&target), "代码"),
+        "  \"\"\"缩进\"\"\""
+    );
+}
+
+/// 菱形依据：结论 -> 甲、乙 -> 根。
+fn memory_with_diamond(store: &crate::source::file::FileSources) -> Memory {
+    let mut memory = memory();
+    let new = "source 根\n title \"根标题\"\n desc \"根描述\"\n text \"根原文\"\n related_by entry\nend\nadd 甲\n title \"甲标题\"\n desc \"甲描述\"\n based_on 根\n related_by entry\nend\nadd 乙\n title \"乙标题\"\n desc \"乙描述\"\n based_on 根\n text \"乙原文\"\n related_by entry\nend\nadd 结论乙\n title \"结论标题\"\n desc \"结论描述\"\n based_on 甲, 乙\n related_by entry\nend";
+    let output = run_with(&mut memory, store, new);
+    assert!(output.ok, "{}", output.text);
+    memory
+}
+
+#[test]
+fn evidence_follows_the_reasoning_down_to_the_sources() {
+    let (_dir, store) = file_store();
+    let mut memory = memory_with_diamond(&store);
+
+    let output = run_with(&mut memory, &store, "evidence 结论乙");
+
+    assert!(output.ok, "{}", output.text);
+    let root_source = source_id("根原文".as_bytes());
+    let second_source = source_id("乙原文".as_bytes());
+    assert_eq!(
+        output.text,
+        format!(
+            "evidence 结论乙\n  node 甲 \"甲标题\"\n    desc: \"甲描述\"\n    node 根 \"根标题\"\n      desc: \"根描述\"\n      source {root_source} 0..9: \"根原文\"\n  node 乙 \"乙标题\"\n    desc: \"乙描述\"\n    source {second_source} 0..9: \"乙原文\"\n    node 根（上面已列出）\n"
+        )
+    );
+}
+
+#[test]
+fn a_damaged_source_does_not_hide_the_rest_of_the_evidence() {
+    let (dir, store) = file_store();
+    let mut memory = memory_with_diamond(&store);
+    let damaged = source_id("根原文".as_bytes());
+    fs::write(
+        dir.path().join("sources").join(&damaged["sha256:".len()..]),
+        "改动过",
+    )
+    .unwrap();
+
+    let output = run_with(&mut memory, &store, "evidence 结论乙");
+
+    assert!(!output.ok);
+    assert!(output.text.contains("error[E901]"), "{}", output.text);
+    assert!(output.text.contains("乙原文"), "{}", output.text);
+    assert!(output.text.contains("有 1 条语句失败"), "{}", output.text);
+}
+
+#[test]
+fn show_and_evidence_accept_several_nodes() {
+    let mut memory = memory();
+
+    let together = read(
+        &mut memory,
+        "show entry, ownership\nevidence entry, conclusion",
+    );
+    let apart = read(
+        &mut memory,
+        "show entry\nshow ownership\nevidence entry\nevidence conclusion",
+    );
+    assert_eq!(together, apart);
+    assert!(together.ok, "{}", together.text);
+
+    let text = fails(&mut memory, "show entry, ghost", "E201");
+    assert!(text.contains("第 1 行第 13 列"), "{text}");
+    fails(&mut memory, "show entry,", "E102");
+    // 这一行有错时，前面的地址也不算数，下一行照常检查。
+    let text = fails(
+        &mut memory,
+        "show entry, ownership borrowing\nshow ghost",
+        "E106",
+    );
+    assert!(text.contains("共 1 个错误"), "{text}");
+}
+
+#[test]
+fn asking_to_search_explains_how_recall_works() {
+    let mut memory = memory();
+
+    for word in ["search 内存", "find 内存", "list", "grep x"] {
+        let text = fails(&mut memory, word, "E101");
+        assert!(text.contains("从 catalog show 开始"), "{word}：{text}");
+        assert!(!text.contains("你是不是想写"), "{word}：{text}");
+    }
+    let text = fails(&mut memory, "shwo entry", "E101");
+    assert!(text.contains("你是不是想写 show？"), "{text}");
+}
+
+#[test]
+fn truncated_output_says_where_it_stopped() {
+    let (_dir, store) = file_store();
+    let mut memory = memory();
+    let run = |memory: &mut Memory, script: &str, limit: usize| {
+        Session::new(memory, &store, Mode::ReadWrite)
+            .with_output_limit(limit)
+            .run(script)
+    };
+
+    let output = run(
+        &mut memory,
+        "check\nshow entry\nshow ownership\nshow borrowing",
+        120,
+    );
+    assert!(output.ok, "{}", output.text);
+    assert!(output.text.contains("语句都已执行"), "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains("第 2 行的 show entry 没有显示完，原文可以用 full_source entry 分段读"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output
+            .text
+            .contains("它后面还有 2 条语句的输出没有显示，从第 3 行开始"),
+        "{}",
+        output.text
+    );
+
+    // 最后一条语句被截断时，不用说后面还有。
+    let output = run(&mut memory, "check\nshow entry", 120);
+    assert!(!output.text.contains("它后面还有"), "{}", output.text);
+
+    // 没有超过上限时不写说明。
+    let output = run(&mut memory, "check", 120);
+    assert!(!output.text.contains("被截断"), "{}", output.text);
+
+    // 写语句已经生效，说明里要提醒不要重复提交。
+    let output = run(
+        &mut memory,
+        "set entry title \"新\"\nshow entry\nshow ownership",
+        40,
+    );
+    assert!(
+        output.text.contains("写语句不要重复提交"),
+        "{}",
+        output.text
+    );
+    assert_eq!(memory.node("entry").unwrap().title(), "新");
+}
+
+#[test]
+fn the_failure_summary_survives_truncation() {
+    let (dir, store) = file_store();
+    let mut memory = memory();
+    fs::write(
+        dir.path()
+            .join("sources")
+            .join(&source()["sha256:".len()..]),
+        "改动过",
+    )
+    .unwrap();
+
+    let output = Session::new(&mut memory, &store, Mode::ReadOnly)
+        .with_output_limit(60)
+        .run("show entry\nshow ownership");
+
+    assert!(!output.ok);
+    assert!(
+        output.text.ends_with("其余语句都已执行。"),
+        "{}",
+        output.text
+    );
+}

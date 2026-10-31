@@ -12,7 +12,7 @@ use crate::export::Exporter;
 use crate::export::json::JsonExporter;
 use crate::knowledge::{Evidence, Locator, Node};
 use crate::memory::{Memory, NodeRef, RemovedNode};
-use crate::source::{LoadedEvidence, SourceStore, source_id};
+use crate::source::{SourceStore, source_id};
 
 /// 板块的代表超过这个数量时提醒模型：总表不是索引。
 const MANY_REPRESENTATIVES: usize = 5;
@@ -22,6 +22,8 @@ pub struct Report {
     pub text: String,
     /// 读取或导出失败的语句数。它们不影响后面的语句，这样实际效果才和重放日志一致。
     pub failures: usize,
+    /// 每条语句的输出在 `text` 里结束的位置，输出被截断时用来说明停在了哪里。
+    pub ends: Vec<usize>,
 }
 
 /// 依次执行语句。`Err` 里的 usize 是已经执行完的语句数，只有内存不足这类意外才会走到那里。
@@ -33,11 +35,13 @@ pub fn execute(
     let mut report = Report {
         text: String::new(),
         failures: 0,
+        ends: Vec::with_capacity(statements.len()),
     };
     for (done, located) in statements.iter().enumerate() {
         if let Err(error) = statement(&located.statement, memory, sources, &mut report) {
             return Err((done, report.text, error));
         }
+        report.ends.push(report.text.len());
     }
     Ok(report)
 }
@@ -144,13 +148,15 @@ fn statement(
         } => {
             render_links(existing(memory, &id.text)?, *depth, *limit, *offset, output);
         }
-        Statement::Evidence(id) => match memory.evidence(&id.text, sources) {
-            Ok(evidence) => render_evidence(&id.text, evidence, output),
-            Err(error) => {
-                report.failures += 1;
-                let _ = writeln!(output, "error[E901] evidence {} 读取失败：{error}", id.text);
-            }
-        },
+        Statement::Evidence(id) => {
+            render_evidence(
+                existing(memory, &id.text)?,
+                memory,
+                sources,
+                output,
+                &mut report.failures,
+            );
+        }
         Statement::BasedBy(id) => {
             let ids: Vec<String> = existing(memory, &id.text)?
                 .based_by()
@@ -482,19 +488,56 @@ fn render_links(
     }
 }
 
-fn render_evidence(id: &str, evidence: Vec<LoadedEvidence>, output: &mut String) {
-    let _ = writeln!(output, "evidence {id}");
-    for entry in evidence {
+/// 沿依据一路追到原文。依据节点带上标题和描述，推理才看得完整。每个节点只展开一次。
+fn render_evidence(
+    start: NodeRef<'_>,
+    memory: &Memory,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    let _ = writeln!(output, "evidence {}", start.id());
+    let mut seen = HashSet::from([start]);
+    // 用栈而不是递归：依据链再长也不会撑爆调用栈。
+    let mut pending: Vec<(Evidence, usize)> = start
+        .evidence()
+        .into_iter()
+        .rev()
+        .map(|entry| (entry, 1))
+        .collect();
+    while let Some((entry, depth)) = pending.pop() {
+        let indent = "  ".repeat(depth);
         match entry {
-            LoadedEvidence::Source {
-                source,
-                locator: Locator::TextRange { start, end },
-                text,
-            } => {
-                let _ = writeln!(output, "  source {source} {start}..{end}: {}", quote(&text));
-            }
-            LoadedEvidence::Node { id } => {
-                let _ = writeln!(output, "  node {id}");
+            Evidence::Source { source, locator } => match sources.read(&source, &locator) {
+                Ok(text) => {
+                    let Locator::TextRange { start, end } = locator;
+                    let _ = writeln!(
+                        output,
+                        "{indent}source {source} {start}..{end}: {}",
+                        quote(&text)
+                    );
+                }
+                Err(error) => {
+                    *failures += 1;
+                    let _ = writeln!(output, "{indent}error[E901] 原文读取失败：{error}");
+                }
+            },
+            Evidence::Node { id } => {
+                let Some(node) = memory.node(&id) else {
+                    continue;
+                };
+                if !seen.insert(node) {
+                    let _ = writeln!(output, "{indent}node {id}（上面已列出）");
+                    continue;
+                }
+                let _ = writeln!(output, "{indent}node {id} {}", quote(node.title()));
+                let _ = writeln!(output, "{indent}  desc: {}", quote(node.description()));
+                pending.extend(
+                    node.evidence()
+                        .into_iter()
+                        .rev()
+                        .map(|entry| (entry, depth + 1)),
+                );
             }
         }
     }
@@ -553,4 +596,28 @@ fn render_check(memory: &Memory, output: &mut String) {
         unreachable.len(),
         empty.len()
     );
+}
+
+/// 输出停在这条语句中间时，怎么看到剩下的内容。
+pub fn continue_hint(statement: &Statement) -> String {
+    match statement {
+        Statement::Show(id) => format!(
+            "show {0} 没有显示完，原文可以用 full_source {0} 分段读",
+            id.text
+        ),
+        Statement::Evidence(id) => format!(
+            "evidence {0} 没有显示完，原文可以用 full_source 分段读，依据的节点可以单独 show",
+            id.text
+        ),
+        Statement::FullSource { id, .. } => {
+            format!("full_source {} 没有显示完，用更小的 limit 分段读", id.text)
+        }
+        Statement::Links { id, .. } => {
+            format!(
+                "links {} 没有显示完，用更小的 limit 和 offset 分段看",
+                id.text
+            )
+        }
+        _ => "这条语句的输出没有显示完".to_owned(),
+    }
 }

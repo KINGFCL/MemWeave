@@ -34,9 +34,9 @@ pub const INSTRUCTIONS: &str = "\
 第一次使用，先调用 memory_manual 读 overview，再读 recall 和 write。说明书写明了系统的原理和各种情况的处理方式，照做，不用自己设计。
 
 必须遵守：
-- 任务可能用到过往知识时，先用 memory_read 执行 catalog show，再一层一层 show 节点，不要凭印象回答。
+- 记忆不会自己出现，你不查就想不起来。任务可能用到过往知识时，拿不准也要先用 memory_read 执行 catalog show，再一层一层 show 节点，不要凭印象回答。
 - 用户说了长期有用的事实或偏好，或者纠正了你，就用 memory_write 记下，并用一句话告诉用户。写之前先查，已有节点就更新，不要建重复的。
-- 重要结论用 evidence 追到原文。text 只放用户原话或文件、工具返回的真实内容，你自己的结论不是原文。
+- 重要结论用 evidence 追到原文。text 只放用户原话或文件、工具返回的真实内容，逐字照抄，你自己的结论不是原文。
 - 两条记忆矛盾时，说明矛盾并问用户，不要悄悄选一个，也不要自己改。
 - 只有用户要求，或者已确认错误时才删除。
 - 脚本报错时整段都没有执行，按提示改好后重新提交整段。
@@ -47,8 +47,8 @@ pub const READ_DESCRIPTION: &str = "\
 查询长期记忆：执行只读脚本，每条语句一行。第一次使用先读 memory_manual。
 
 catalog show                  总表：每个领域的描述和代表节点。回忆从这里开始
-show 节点                     节点的全部内容。一次写多条，一层一层读
-evidence 节点                 这条知识依据的原文和节点
+show 节点, 节点               节点的全部内容。一层一层读
+evidence 节点, 节点           沿依据一路追到原文
 links 节点 [depth N] [limit N] [offset N]  沿关联看结构
 based_by 节点 / related_by 节点  谁依据它 / 谁关联它
 full_source 节点 [offset N] [limit N]  完整的原始文件
@@ -56,8 +56,7 @@ check                         走不到的节点和没有代表的板块
 
 例子：
 catalog show
-show ownership
-show borrowing";
+show ownership, borrowing";
 
 /// 读写工具的描述。
 pub const WRITE_DESCRIPTION: &str = "\
@@ -72,7 +71,7 @@ cite 节点 text \"\"\"原文\"\"\" / cite 节点 source sha256:... 起始..结�
 catalog create \"板块\" desc \"\"\"描述\"\"\" / describe / rename / delete / add 节点 to \"板块\" / remove 节点 from \"板块\"
 export \"路径\"
 
-新节点在脚本结束前必须接入图：写 related_by、link 或 catalog add。text 只放用户原话或文件、工具返回的真实内容，不放你自己的结论。
+新节点在脚本结束前必须接入图：写 related_by、link 或 catalog add。text 只放用户原话或文件、工具返回的真实内容，不放你自己的结论。text 逐字保存；内容含三个连续引号时，用四个引号包住。
 
 例子：
 source arc-atomic

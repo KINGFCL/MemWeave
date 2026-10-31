@@ -44,6 +44,8 @@ const SOURCE_CLAUSES: [&str; 7] = [
     "related_by",
     "end",
 ];
+/// 写这些的人想搜索，但这个系统靠走图回忆。
+const SEARCH_WORDS: [&str; 7] = ["search", "find", "grep", "list", "ls", "query", "lookup"];
 const CATALOG_COMMANDS: [&str; 7] = [
     "show", "create", "describe", "rename", "delete", "add", "remove",
 ];
@@ -59,6 +61,7 @@ pub fn parse(tokens: Vec<Token>) -> (Vec<Located>, Vec<Diagnostic>) {
         tokens,
         position: 0,
         errors: Vec::new(),
+        extra: Vec::new(),
     };
     let statements = parser.script();
     (statements, parser.errors)
@@ -68,6 +71,8 @@ struct Parser {
     tokens: Vec<Token>,
     position: usize,
     errors: Vec<Diagnostic>,
+    /// `show a, b` 的第二条及之后的语句，等这一行确认无误后才算数。
+    extra: Vec<Located>,
 }
 
 /// 这一行已经报过错，跳过它。
@@ -82,11 +87,17 @@ impl Parser {
                 return statements;
             };
             match self.statement(&token) {
-                Ok(statement) => statements.push(Located {
-                    statement,
-                    span: token.span,
-                }),
-                Err(Skip) => self.skip_line(),
+                Ok(statement) => {
+                    statements.push(Located {
+                        statement,
+                        span: token.span,
+                    });
+                    statements.append(&mut self.extra);
+                }
+                Err(Skip) => {
+                    self.extra.clear();
+                    self.skip_line();
+                }
             }
         }
     }
@@ -105,8 +116,8 @@ impl Parser {
             "catalog" => self.catalog(token)?,
             "export" => Statement::Export(self.label("导出路径")?),
             "check" => Statement::Check,
-            "show" => Statement::Show(self.name("节点地址")?),
-            "evidence" => Statement::Evidence(self.name("节点地址")?),
+            "show" => self.for_each_name(Statement::Show)?,
+            "evidence" => self.for_each_name(Statement::Evidence)?,
             "based_by" => Statement::BasedBy(self.name("节点地址")?),
             "related_by" => Statement::RelatedBy(self.name("节点地址")?),
             "remove" => Statement::Remove(self.name("节点地址")?),
@@ -143,9 +154,15 @@ impl Parser {
             other => {
                 let mut error =
                     Diagnostic::new("E101", token.span, format!("没有 {other} 这条指令"));
-                error = match closest(other, KEYWORDS.into_iter()) {
-                    Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
-                    None => error.with_hint(format!("可用的指令：{}", KEYWORDS.join("、"))),
+                error = if SEARCH_WORDS.contains(&other) {
+                    error.with_hint(
+                        "这里没有搜索，也不能列出所有节点。从 catalog show 开始，沿关联一层层走",
+                    )
+                } else {
+                    match closest(other, KEYWORDS.into_iter()) {
+                        Some(suggestion) => error.with_hint(format!("你是不是想写 {suggestion}？")),
+                        None => error.with_hint(format!("可用的指令：{}", KEYWORDS.join("、"))),
+                    }
                 };
                 return self.fail(error);
             }
@@ -160,7 +177,7 @@ impl Parser {
         let citation = match kind.as_deref() {
             Some("text") => {
                 self.position += 1;
-                Citation::Text(self.label("原文")?)
+                Citation::Text(self.source_text()?)
             }
             Some("source") => {
                 self.position += 1;
@@ -195,6 +212,17 @@ impl Parser {
         }
         let end = self.number("结束位置")?;
         Ok(SourceRef { source, start, end })
+    }
+
+    /// 每个地址一条语句：`show a, b` 和分两行写完全相同。
+    fn for_each_name(&mut self, statement: fn(Name) -> Statement) -> Result<Statement, Skip> {
+        let mut names = self.names()?.into_iter();
+        let first = names.next().expect("names 至少返回一个地址");
+        self.extra.extend(names.map(|name| Located {
+            span: name.span,
+            statement: statement(name),
+        }));
+        Ok(statement(first))
     }
 
     fn catalog(&mut self, keyword: &Token) -> Result<Statement, Skip> {
@@ -278,6 +306,23 @@ impl Parser {
         }
     }
 
+    /// 原文必须逐字保存，所以不去掉任何空白。
+    fn source_text(&mut self) -> Result<Label, Skip> {
+        match self.peek().cloned() {
+            Some(Token {
+                kind: TokenKind::Text(text) | TokenKind::Block(text),
+                span,
+            }) => {
+                self.position += 1;
+                Ok(Label { text, span })
+            }
+            _ => self.fail(
+                Diagnostic::new("E102", self.current_span(), "这里应该写原文")
+                    .with_hint("写在引号里。内容有三个连续的引号时，用四个引号包住"),
+            ),
+        }
+    }
+
     fn label(&mut self, what: &str) -> Result<Label, Skip> {
         match self.peek().cloned() {
             Some(Token {
@@ -286,6 +331,16 @@ impl Parser {
             }) => {
                 self.position += 1;
                 Ok(Label { text, span })
+            }
+            Some(Token {
+                kind: TokenKind::Block(text),
+                span,
+            }) => {
+                self.position += 1;
+                Ok(Label {
+                    text: text.trim().to_owned(),
+                    span,
+                })
             }
             _ => self.fail(
                 Diagnostic::new("E102", self.current_span(), format!("这里应该写{what}"))
@@ -519,7 +574,7 @@ impl Parser {
                 self.once(&mut add.description, value, token.span, "desc")?;
             }
             "text" => {
-                let value = self.text()?;
+                let value = self.source_text()?.text;
                 self.once(&mut add.text, value, token.span, "text")?;
             }
             "source" => {
@@ -593,6 +648,13 @@ impl Parser {
                 self.position += 1;
                 Ok(text)
             }
+            Some(Token {
+                kind: TokenKind::Block(text),
+                ..
+            }) => {
+                self.position += 1;
+                Ok(text.trim().to_owned())
+            }
             _ => self.fail(
                 Diagnostic::new("E102", self.current_span(), "这里应该写带引号的文字")
                     .with_hint("短文字用 \"...\"，多行或含引号的内容用 \"\"\"...\"\"\""),
@@ -626,6 +688,8 @@ impl Parser {
     }
 
     fn end_of_line(&mut self) -> Result<(), Skip> {
+        let after_block =
+            self.position > 0 && matches!(self.tokens[self.position - 1].kind, TokenKind::Block(_));
         match self.peek() {
             None
             | Some(Token {
@@ -638,7 +702,11 @@ impl Parser {
                     token.span,
                     format!("这一行多写了 {}", describe(token)),
                 )
-                .with_hint("每条语句单独占一行");
+                .with_hint(if after_block {
+                    "如果这是文字内容的一部分：内容有三个连续的引号时，用四个引号包住整段"
+                } else {
+                    "每条语句单独占一行"
+                });
                 self.fail(error)
             }
         }
@@ -714,7 +782,7 @@ fn word_of(token: &Token) -> String {
 fn describe(token: &Token) -> String {
     match &token.kind {
         TokenKind::Word(word) => word.clone(),
-        TokenKind::Text(_) => "一段文字".to_owned(),
+        TokenKind::Text(_) | TokenKind::Block(_) => "一段文字".to_owned(),
         TokenKind::Arrow => "->".to_owned(),
         TokenKind::DotDot => "..".to_owned(),
         TokenKind::Comma => "逗号".to_owned(),

@@ -415,6 +415,11 @@ fn large_output_is_cut_at_the_limit_with_a_note() {
 
     assert!(ok);
     assert!(text.contains("输出超过上限"), "{text}");
-    assert!(text.len() < 500, "{}", text.len());
+    assert!(
+        text.contains("第 1 行的 show ownership 没有显示完"),
+        "{text}"
+    );
+    assert!(text.contains("后面还有 2 条语句"), "{text}");
+    assert!(!text.contains("show drop\n"), "{text}");
     client.stop();
 }

@@ -6,8 +6,11 @@ use super::diagnostic::{Diagnostic, Span};
 pub enum TokenKind {
     /// 关键字、节点地址、来源地址或数字，具体含义由语法分析决定。
     Word(String),
-    /// `"..."` 或 `"""..."""`。
+    /// `"..."`，内容原样。
     Text(String),
+    /// 三个或更多引号包住的文字，内容原样。只去掉紧贴开头和结尾的那个换行，要不要去掉别的空白由
+    /// 语法分析决定：原文必须逐字保存，描述不必。
+    Block(String),
     Arrow,
     DotDot,
     Comma,
@@ -18,6 +21,22 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
+}
+
+/// 这么多个引号开始的是可以多行的文字。
+const BLOCK_QUOTES: usize = 3;
+
+/// 去掉紧贴开头和结尾的那个换行，这样内容可以从下一行写起。其他空白都是内容。
+fn strip_edge_newlines(text: &str) -> String {
+    let text = text
+        .strip_prefix("\r\n")
+        .or_else(|| text.strip_prefix('\n'))
+        .unwrap_or(text);
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    text.to_owned()
 }
 
 pub fn tokenize(script: &str) -> (Vec<Token>, Vec<Diagnostic>) {
@@ -101,8 +120,9 @@ impl Lexer {
     }
 
     fn text(&mut self, start: Span) {
-        if self.peek(1) == Some('"') && self.peek(2) == Some('"') {
-            self.block_text(start);
+        let quotes = self.quotes_at(0);
+        if quotes >= BLOCK_QUOTES {
+            self.block_text(start, quotes);
         } else {
             self.line_text(start);
         }
@@ -134,28 +154,46 @@ impl Lexer {
         }
     }
 
-    fn block_text(&mut self, start: Span) {
-        for _ in 0..3 {
+    /// 从当前位置往后数，连续有多少个引号。
+    fn quotes_at(&self, offset: usize) -> usize {
+        self.chars[self.position + offset..]
+            .iter()
+            .take_while(|c| **c == '"')
+            .count()
+    }
+
+    /// 开头有几个引号，结尾就要有几个，所以内容里可以有更少的连续引号。
+    /// 结尾的引号比开头多时，多出来的算内容：`"""他说"好""""` 的内容是 `他说"好"`。
+    fn block_text(&mut self, start: Span, quotes: usize) {
+        for _ in 0..quotes {
             self.advance();
         }
+        let span = Span {
+            length: quotes,
+            ..start
+        };
         let mut text = String::new();
         while let Some(c) = self.peek(0) {
-            if c == '"' && self.peek(1) == Some('"') && self.peek(2) == Some('"') {
-                for _ in 0..3 {
+            if c == '"' {
+                let run = self.quotes_at(0);
+                for _ in 0..run {
                     self.advance();
                 }
-                self.push(
-                    TokenKind::Text(text.trim().to_owned()),
-                    Span { length: 3, ..start },
-                );
-                return;
+                if run >= quotes {
+                    text.extend(std::iter::repeat_n('"', run - quotes));
+                    self.push(TokenKind::Block(strip_edge_newlines(&text)), span);
+                    return;
+                }
+                text.extend(std::iter::repeat_n('"', run));
+                continue;
             }
             text.push(c);
             self.advance();
         }
+        let delimiter = "\"".repeat(quotes);
         self.errors.push(
-            Diagnostic::new("E003", Span { length: 3, ..start }, "\"\"\" 没有结束")
-                .with_hint("在内容末尾补上 \"\"\""),
+            Diagnostic::new("E003", span, format!("{delimiter} 没有结束"))
+                .with_hint(format!("在内容末尾补上 {delimiter}")),
         );
     }
 
@@ -231,7 +269,7 @@ mod tests {
     fn block_text_keeps_quotes_and_newlines() {
         assert_eq!(
             kinds("\"\"\"\n他说\"你好\"\n第二行\n\"\"\""),
-            [TokenKind::Text("他说\"你好\"\n第二行".to_owned())]
+            [TokenKind::Block("他说\"你好\"\n第二行".to_owned())]
         );
     }
 

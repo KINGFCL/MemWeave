@@ -27,9 +27,9 @@ pub const SPEC: &str = r####"用下面的语言操作记忆。每条语句占一
 
 读取：
 catalog show                             查看总表：每个领域的名字、描述和代表节点
-show 节点                                 查看节点的全部内容：标题、描述、所有关系和证据原文
+show 节点, 节点                           查看节点的全部内容：标题、描述、所有关系和证据原文
 links 节点 [depth N] [limit N] [offset N] 沿关联往外看，默认 depth 1，limit 50。没看完时用 offset 接着看
-evidence 节点                             读取证据指向的原文
+evidence 节点, 节点                       沿依据一路追到原文：依据节点的标题和描述，以及所有原文
 based_by 节点                             只列出基于这个节点推导的节点，删除节点前用它查依赖
 related_by 节点                           只列出关联了这个节点的节点，可以用来反向探索
 full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
@@ -38,7 +38,7 @@ check                                    列出从总表走不到的节点和没
 修改：
 add 节点                                  新增由别的节点推出的知识
   title "标题"
-  desc """描述，可以多行，可以含引号"""
+  desc """描述，可以多行，可以含引号，首尾空白会去掉"""
   based_on 节点, 节点                      必填：它依据哪些节点
   text """原文"""                          可选：同时存入一段新原文
   source sha256:... 起始..结束             可选：同时引用已有的原文，可以写多条
@@ -48,7 +48,7 @@ end
 source 节点                               新增直接来自原文的知识，不能写 based_on
   title "标题"
   desc """描述"""
-  text """原文"""                          把这段文字存成不可变的原文
+  text """原文"""                          把这段文字逐字存成不可变的原文，含 """ 时用 """" 包住
   source sha256:... 起始..结束             或者引用已有的原文。这两项至少写一个
   related 节点, 节点
   related_by 节点, 节点
@@ -186,27 +186,24 @@ impl<'a> Session<'a> {
         match exec::execute(&statements, self.memory, self.sources) {
             Ok(report) if report.failures == 0 => Output {
                 ok: true,
-                text: limit_output(report.text, self.output_limit),
+                text: limit_report(&report, &statements, self.output_limit),
             },
             Ok(report) => Output {
                 ok: false,
-                text: limit_output(
-                    format!(
-                        "{}有 {} 条语句失败，其余语句都已执行。",
-                        report.text, report.failures
-                    ),
-                    self.output_limit,
+                // 截断之后再写结论，否则结论可能被截掉。
+                text: format!(
+                    "{}有 {} 条语句失败，其余语句都已执行。",
+                    limit_report(&report, &statements, self.output_limit),
+                    report.failures
                 ),
             },
             // 检查已经通过，只有内存不足才会走到这里。
             Err((done, text, error)) => Output {
                 ok: false,
-                text: limit_output(
-                    format!(
-                        "{text}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
-                        done + 1
-                    ),
-                    self.output_limit,
+                text: format!(
+                    "{}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
+                    truncate(text, self.output_limit, "\n（输出超过上限，被截断了。）\n",),
+                    done + 1
                 ),
             },
         }
@@ -281,12 +278,32 @@ fn failure(errors: &[Diagnostic], script: &str, limit: usize) -> Output {
     }
 }
 
-fn limit_output(text: String, limit: usize) -> String {
-    truncate(
-        text,
-        limit,
-        "\n（输出超过上限，后面的内容被截断了。语句都已执行，可以用 limit 或分多次查看。）",
-    )
+/// 截断时说清楚停在哪条语句，否则模型不知道少了什么，也不知道怎么接着看。
+fn limit_report(report: &exec::Report, statements: &[ast::Located], limit: usize) -> String {
+    if report.text.len() <= limit {
+        return report.text.clone();
+    }
+    let mut note = String::from("\n（输出超过上限，被截断了。语句都已执行，写语句不要重复提交。");
+    let cut = report
+        .ends
+        .iter()
+        .position(|end| *end > limit)
+        .unwrap_or(statements.len().saturating_sub(1));
+    let located = &statements[cut];
+    note.push_str(&format!(
+        "第 {} 行的 {}。",
+        located.span.line,
+        exec::continue_hint(&located.statement)
+    ));
+    let hidden = statements.len() - cut - 1;
+    if hidden > 0 {
+        note.push_str(&format!(
+            "它后面还有 {hidden} 条语句的输出没有显示，从第 {} 行开始。",
+            statements[cut + 1].span.line
+        ));
+    }
+    note.push_str("）\n");
+    truncate(report.text.clone(), limit, &note)
 }
 
 fn truncate(mut text: String, limit: usize, note: &str) -> String {
