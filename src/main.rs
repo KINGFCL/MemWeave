@@ -8,6 +8,7 @@ use memweave::export::{self, Exporter};
 use memweave::lang::journal::{self, Journal, WriteLock};
 use memweave::lang::{self, Mode, Session};
 use memweave::maintain;
+use memweave::manual::Manual;
 use memweave::memory::Memory;
 use memweave::model::Model;
 use memweave::model::anthropic::{self, AnthropicModel};
@@ -171,8 +172,10 @@ fn run_script(mode: Mode, kb: &str, script: &str) -> Result<lang::Output, String
     let mut memory = load_memory(kb)?;
     let sources = FileSources::new(path);
     let journal = Journal::new(path);
+    let manual = Manual::new().map_err(|e| e.to_string())?;
     let output = Session::new(&mut memory, &sources, mode)
         .with_journal(&journal)
+        .with_manual(&manual)
         .run(&script);
     Ok(output)
 }

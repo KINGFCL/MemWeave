@@ -8,7 +8,7 @@ readme = "README.md"
 keywords = ["knowledge-graph", "mcp", "llm", "memory", "agent"]
 categories = ["command-line-utilities"]
 # 白名单：只打包列出的文件，避免把本地的密钥或笔记带进发布包。
-include = ["/src/**/*.rs", "/src/mcp/manual/*.md", "/build.rs", "/cpp/**", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
+include = ["/src/**/*.rs", "/src/manual/*.md", "/build.rs", "/cpp/**", "/examples/demo-kb/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
 [dependencies]
 rmcp = { version = "3.8.0", default-features = false, features = ["server", "transport-io"], optional = true }

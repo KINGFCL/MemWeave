@@ -151,6 +151,40 @@ impl Statement {
         )
     }
 
+    /// 写语句提到的节点。`add` 和 `source` 要新建的地址也算在内。
+    pub fn written_nodes(&self) -> Vec<&Name> {
+        match self {
+            Statement::Add(add) | Statement::Source(add) => std::iter::once(&add.id)
+                .chain(&add.based_on)
+                .chain(&add.related)
+                .chain(&add.related_by)
+                .collect(),
+            Statement::CatalogAdd { id, .. }
+            | Statement::CatalogRemove { id, .. }
+            | Statement::Cite { id, .. }
+            | Statement::Uncite { id, .. }
+            | Statement::Remove(id)
+            | Statement::Set { id, .. } => vec![id],
+            Statement::Link { from, to } | Statement::Unlink { from, to } => vec![from, to],
+            Statement::Base { id, on } | Statement::Unbase { id, on } => vec![id, on],
+            _ => Vec::new(),
+        }
+    }
+
+    /// 写语句提到的板块，包括要新建和改成的名字。
+    pub fn written_sections(&self) -> Vec<&Label> {
+        match self {
+            Statement::CatalogCreate { name, .. }
+            | Statement::CatalogDescribe { name, .. }
+            | Statement::CatalogDelete(name) => vec![name],
+            Statement::CatalogRename { name, new_name } => vec![name, new_name],
+            Statement::CatalogAdd { section, .. } | Statement::CatalogRemove { section, .. } => {
+                vec![section]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 只读会话能不能执行。`export` 不改图，不写日志，但会写磁盘，所以也要写权限。
     pub fn needs_write_session(&self) -> bool {
         self.writes() || matches!(self, Statement::Export(_))

@@ -1905,7 +1905,7 @@ fn random_scripts_export_exactly_what_execution_produces() {
                 lexer_errors.is_empty() && parse_errors.is_empty(),
                 "{script}"
             );
-            let errors = check::check(&statements, &live, &store, Mode::ReadWrite);
+            let errors = check::check(&statements, &live, &store, Mode::ReadWrite, None);
             if errors.iter().any(|error| error.code != "E217") {
                 continue;
             }

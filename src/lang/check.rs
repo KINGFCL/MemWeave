@@ -11,6 +11,7 @@ use super::diagnostic::{Diagnostic, Span, closest};
 use crate::board::{self, BoardOp, Goal};
 use crate::export::target_problem;
 use crate::knowledge::{Evidence, Locator};
+use crate::manual::{self, Manual};
 use crate::memory::{Memory, check_sources, is_valid_id};
 use crate::source::{SourceStore, source_id};
 
@@ -22,10 +23,12 @@ pub fn check(
     memory: &Memory,
     sources: &dyn SourceStore,
     mode: Mode,
+    manual: Option<&Manual>,
 ) -> Vec<Diagnostic> {
     let mut checker = Checker {
         memory,
         sources,
+        manual,
         added: HashSet::new(),
         removed: HashSet::new(),
         related: HashMap::new(),
@@ -63,6 +66,9 @@ pub fn check(
             );
             continue;
         }
+        if checker.touches_manual(&located.statement) {
+            continue;
+        }
         if let Statement::Board(op) = &located.statement {
             checker.board(op, located.span);
             continue;
@@ -87,6 +93,8 @@ fn cited_text(text: &str) -> Cited {
 struct Checker<'a> {
     memory: &'a Memory,
     sources: &'a dyn SourceStore,
+    /// 内置说明。重放日志时没有它：那些脚本当时已经检查过了，旧知识库里可能有用这个前缀的节点。
+    manual: Option<&'a Manual>,
     /// 脚本前面的语句已经造成的变化。
     added: HashSet<String>,
     removed: HashSet<String>,
@@ -110,6 +118,66 @@ struct Checker<'a> {
 }
 
 impl Checker<'_> {
+    /// 写语句碰到内置说明时报错。内置说明只能读，也不能和记忆相连，否则它们就分不开了。
+    fn touches_manual(&mut self, statement: &Statement) -> bool {
+        let Some(manual) = self.manual else {
+            return false;
+        };
+        let before = self.errors.len();
+        for name in statement.written_nodes() {
+            let creates = matches!(statement, Statement::Add(add) | Statement::Source(add) if add.id == *name);
+            if creates && name.text.starts_with(manual::RESERVED_PREFIX) {
+                self.errors.push(
+                    Diagnostic::new(
+                        "E223",
+                        name.span,
+                        format!(
+                            "{} 开头的地址留给内置说明，新节点不能用",
+                            manual::RESERVED_PREFIX
+                        ),
+                    )
+                    .with_hint("换一个能看出内容的地址"),
+                );
+            } else if manual.contains(&name.text) && !self.memory.contains(&name.text) {
+                // 旧知识库里可能已经有同名节点，让模型能把它迁走。
+                self.errors.push(
+                    Diagnostic::new(
+                        "E223",
+                        name.span,
+                        format!(
+                            "{} 是内置说明，只能读，不能修改，也不能和记忆相连",
+                            name.text
+                        ),
+                    )
+                    .with_hint("用户的知识写成普通节点，放在自己的板块里"),
+                );
+            }
+        }
+        for section in statement.written_sections() {
+            if section.text == manual::SECTION {
+                self.errors.push(
+                    Diagnostic::new(
+                        "E223",
+                        section.span,
+                        format!("板块“{}”是内置的，只能读", section.text),
+                    )
+                    .with_hint("用户的知识放在自己的板块里，用 catalog create 新建"),
+                );
+            }
+        }
+        self.errors.len() > before
+    }
+
+    /// 读语句要的节点：内置说明也算。
+    fn require_readable(&mut self, name: &Name) {
+        if !self
+            .manual
+            .is_some_and(|manual| manual.contains(&name.text))
+        {
+            self.require(name);
+        }
+    }
+
     fn statement(&mut self, statement: &Statement) {
         match statement {
             Statement::CatalogShow | Statement::Check | Statement::Timeline { .. } => {}
@@ -190,12 +258,8 @@ impl Checker<'_> {
             | Statement::Evidence(id)
             | Statement::BasedBy(id)
             | Statement::RelatedBy(id)
-            | Statement::FullSource { id, .. } => {
-                self.require(id);
-            }
-            Statement::Links { id, .. } => {
-                self.require(id);
-            }
+            | Statement::FullSource { id, .. }
+            | Statement::Links { id, .. } => self.require_readable(id),
             Statement::Add(add) => self.add(add, "add"),
             Statement::Source(add) => self.add(add, "source"),
             Statement::Remove(id) => {
@@ -738,9 +802,16 @@ impl Checker<'_> {
         if self.memory.node_count() > MAX_SUGGESTION_SCAN {
             return None;
         }
-        let nodes: Vec<&str> = self.memory.nodes().map(|node| node.id()).collect();
-        let candidates = nodes
-            .into_iter()
+        let builtin: Vec<&str> = self
+            .manual
+            .iter()
+            .flat_map(|manual| manual.memory().nodes().map(|node| node.id()))
+            .collect();
+        let candidates = self
+            .memory
+            .nodes()
+            .map(|node| node.id())
+            .chain(builtin)
             .chain(self.added.iter().map(String::as_str));
         closest(
             id,

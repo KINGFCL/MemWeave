@@ -3,8 +3,6 @@
 //! 调用方就是模型，它自己走图、判断和写记忆，所以服务不调用模型。图只属于一个线程：这里用一个
 //! 专门的线程持有 [`Memory`]，tokio 只负责收发消息，脚本排队依次执行。
 
-pub mod manual;
-
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -27,6 +25,7 @@ use crate::lang::exec::render_overview;
 use crate::lang::journal::{Journal, WriteLock, load_current};
 use crate::lang::{Mode, Output, Session};
 use crate::maintain;
+use crate::manual::{self, Manual};
 use crate::memory::Memory;
 use crate::parse::ParsedKnowledge;
 use crate::parse::json::JsonParser;
@@ -38,7 +37,6 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 40 * 1024;
 
 const READ_TOOL: &str = "memory_read";
 const WRITE_TOOL: &str = "memory_write";
-const MANUAL_TOOL: &str = "memory_manual";
 const ATTACHED_HEADER: &str = "--- 当前工作板和总表（第一次调用和它们变化时附带）---";
 
 /// 在标准输入输出上提供服务，标准输入关闭时返回。
@@ -56,10 +54,19 @@ pub fn serve(knowledge_base: &Path, max_output_bytes: usize) -> Result<(), Error
         );
     })?;
     let journal = Journal::new(knowledge_base);
+    let manual = Manual::new()?;
 
     let (jobs, queue) = mpsc::channel();
-    let worker =
-        thread::spawn(move || run_scripts(memory, &sources, &journal, max_output_bytes, &queue));
+    let worker = thread::spawn(move || {
+        run_scripts(
+            memory,
+            &manual,
+            &sources,
+            &journal,
+            max_output_bytes,
+            &queue,
+        );
+    });
 
     let server = Server { jobs };
     let result = tokio::runtime::Builder::new_current_thread()
@@ -106,19 +113,20 @@ fn create_if_empty(knowledge_base: &Path) -> Result<(), Error> {
 
 /// 脚本的结果和执行后的工作板、总表。
 struct Reply {
-    output: Option<Output>,
+    output: Output,
     /// 模型还没看到过的工作板和总表。
     overview: Option<String>,
 }
 
 struct Job {
-    /// 没有脚本时只取工作板和总表。
-    script: Option<(String, Mode)>,
+    script: String,
+    mode: Mode,
     reply: oneshot::Sender<Reply>,
 }
 
 fn run_scripts(
     mut memory: Memory,
+    manual: &Manual,
     sources: &FileSources,
     journal: &Journal,
     max_output_bytes: usize,
@@ -127,21 +135,16 @@ fn run_scripts(
     // 模型最后一次看到的总表。一样就不再附带，所以一次查询走多少层，总表都不会重复出现。
     let mut shown: Option<Catalog> = None;
     for job in queue {
-        let listed = job
-            .script
-            .as_ref()
-            .map_or(Listed::No, |(script, _)| listed(script));
+        let listed = listed(&job.script);
         let before = (listed == Listed::Before).then(|| memory.catalog().clone());
-        let output = job.script.map(|(script, mode)| {
-            Session::new(&mut memory, sources, mode)
-                .with_journal(journal)
-                .with_output_limit(max_output_bytes)
-                .run(&script)
-        });
+        let output = Session::new(&mut memory, sources, job.mode)
+            .with_journal(journal)
+            .with_manual(manual)
+            .with_output_limit(max_output_bytes)
+            .run(&job.script);
         let current = memory.catalog();
         // 脚本报错时什么都没执行，输出里没有总表。
-        let succeeded = output.as_ref().is_some_and(|output| output.ok);
-        let in_output = succeeded
+        let in_output = output.ok
             && match listed {
                 Listed::No => false,
                 Listed::Last => true,
@@ -155,7 +158,7 @@ fn run_scripts(
             None
         } else {
             shown = Some(current.clone());
-            Some(attached_overview(&memory, max_output_bytes))
+            Some(attached_overview(&memory, manual, max_output_bytes))
         };
         // 客户端已经取消时没有人接收结果，脚本的效果不受影响。
         let _ = job.reply.send(Reply { output, overview });
@@ -183,8 +186,8 @@ fn listed(script: &str) -> Listed {
 }
 
 /// 附带的内容。最多占输出上限的一半，总能留出位置给脚本的结果。
-fn attached_overview(memory: &Memory, max_output_bytes: usize) -> String {
-    let mut text = render_overview(memory);
+fn attached_overview(memory: &Memory, manual: &Manual, max_output_bytes: usize) -> String {
+    let mut text = render_overview(memory, Some(manual));
     let limit = max_output_bytes / 2;
     if text.len() > limit {
         let mut end = limit;
@@ -209,8 +212,8 @@ impl Server {
     ) -> Result<CallToolResult, ErrorData> {
         let script = string_argument(request, "script")?
             .ok_or_else(|| ErrorData::invalid_params("缺少参数 script", None))?;
-        let reply = self.ask(Some((script.to_owned(), mode))).await?;
-        let output = reply.output.ok_or_else(lost_worker)?;
+        let reply = self.ask(script.to_owned(), mode).await?;
+        let output = reply.output;
         let mut content = vec![ContentBlock::text(output.text)];
         content.extend(reply.overview.map(ContentBlock::text));
         // 脚本写错是模型能自己改正的错误，不是协议错误。
@@ -223,10 +226,14 @@ impl Server {
 }
 
 impl Server {
-    async fn ask(&self, script: Option<(String, Mode)>) -> Result<Reply, ErrorData> {
+    async fn ask(&self, script: String, mode: Mode) -> Result<Reply, ErrorData> {
         let (reply, result) = oneshot::channel();
         self.jobs
-            .send(Job { script, reply })
+            .send(Job {
+                script,
+                mode,
+                reply,
+            })
             .map_err(|_| lost_worker())?;
         result.await.map_err(|_| lost_worker())
     }
@@ -248,17 +255,6 @@ fn string_argument<'a>(
             None,
         )),
     }
-}
-
-fn read_manual(request: &CallToolRequestParams) -> Result<CallToolResult, ErrorData> {
-    let name = string_argument(request, "topic")?.unwrap_or("overview");
-    Ok(match manual::topic(name) {
-        Some(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        None => CallToolResult::error(vec![ContentBlock::text(format!(
-            "没有主题 {name}。可用的主题：{}",
-            manual::TOPICS.join("、")
-        ))]),
-    })
 }
 
 fn schema(value: Value) -> Arc<Map<String, Value>> {
@@ -289,18 +285,6 @@ fn tools() -> Vec<Tool> {
                 .idempotent(false)
                 .open_world(false),
         ),
-        Tool::new(
-            MANUAL_TOOL,
-            manual::MANUAL_DESCRIPTION,
-            schema(json!({
-                "type": "object",
-                "properties": {
-                    "topic": { "type": "string", "enum": manual::TOPICS }
-                },
-                "additionalProperties": false
-            })),
-        )
-        .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
     ]
 }
 
@@ -331,14 +315,6 @@ impl ServerHandler for Server {
         let result = match request.name.as_ref() {
             READ_TOOL => self.run_script(&request, Mode::ReadOnly).await?,
             WRITE_TOOL => self.run_script(&request, Mode::ReadWrite).await?,
-            MANUAL_TOOL => {
-                let mut result = read_manual(&request)?;
-                let reply = self.ask(None).await?;
-                result
-                    .content
-                    .extend(reply.overview.map(ContentBlock::text));
-                result
-            }
             other => {
                 return Err(ErrorData::invalid_params(format!("没有工具 {other}"), None));
             }

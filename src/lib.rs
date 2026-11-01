@@ -10,6 +10,7 @@ mod ffi;
 pub mod knowledge;
 pub mod lang;
 pub mod maintain;
+pub mod manual;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;

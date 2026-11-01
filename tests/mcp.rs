@@ -169,10 +169,9 @@ fn check_tools(client: &mut Client) {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["memory_read", "memory_write", "memory_manual"]);
+    assert_eq!(names, ["memory_read", "memory_write"]);
     assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
     assert_eq!(tools[1]["annotations"]["readOnlyHint"], false);
-    assert_eq!(tools[2]["annotations"]["readOnlyHint"], true);
 }
 
 #[test]
@@ -193,7 +192,7 @@ fn legacy_clients_get_the_instructions_from_initialize() {
     fresh.modern = false;
     let response = fresh.initialize();
     let instructions = response["result"]["instructions"].as_str().unwrap();
-    assert!(instructions.contains("memory_manual"), "{instructions}");
+    assert!(instructions.contains("show manual-start"), "{instructions}");
     assert_eq!(response["result"]["serverInfo"]["name"], "memweave");
     fresh.stop();
 }
@@ -220,7 +219,7 @@ fn modern_clients_get_the_instructions_from_discover() {
         result["instructions"]
             .as_str()
             .unwrap()
-            .contains("memory_manual"),
+            .contains("show manual-start"),
         "{response}"
     );
     check_tools(&mut client);
@@ -276,25 +275,145 @@ fn script_errors_are_tool_errors_the_model_can_read() {
 }
 
 #[test]
-fn the_manual_is_available_through_the_tool() {
+fn the_manual_is_read_like_memory() {
     let dir = TempDir::new().unwrap();
     let kb = demo_copy(&dir);
     let mut client = Client::start(&kb, true);
 
-    let (ok, text) = split(&client.call("memory_manual", json!({})));
+    let (ok, text) = client.read("show manual-start");
     assert!(ok && text.contains("这是你的长期记忆"), "{text}");
-    for (topic, expected) in [
-        ("recall", "都由你决定"),
-        ("write", "什么该记"),
-        ("repair", "两条记忆互相矛盾"),
-        ("language", "catalog create"),
-        ("errors", "E217"),
+    assert!(text.contains("related: manual-recall"), "{text}");
+    for (node, expected) in [
+        ("manual-recall", "都由你决定"),
+        ("manual-write", "什么该记"),
+        ("manual-repair-conflict", "两条记忆互相矛盾"),
+        ("manual-language", "catalog create"),
+        ("manual-errors", "E217"),
     ] {
-        let (ok, text) = split(&client.call("memory_manual", json!({ "topic": topic })));
-        assert!(ok && text.contains(expected), "{topic}：{text}");
+        let (ok, text) = client.read(&format!("show {node}"));
+        assert!(ok && text.contains(expected), "{node}：{text}");
     }
-    let (ok, text) = split(&client.call("memory_manual", json!({ "topic": "没有" })));
-    assert!(!ok && text.contains("可用的主题"), "{text}");
+    // 其他读语句也能用，所以模型学到的走法在说明里就能练。
+    let (ok, text) = client.read("links manual-repair\nevidence manual-repair\nfull_source manual-repair limit 100\nrelated_by manual-repair");
+    assert!(
+        ok && text.contains("manual-repair -> manual-repair-delete"),
+        "{text}"
+    );
+    // 写错了地址，提示里有内置节点。
+    let (ok, text) = client.read("show manual-recal");
+    assert!(!ok && text.contains("manual-recall"), "{text}");
+    client.stop();
+}
+
+/// 全新的知识库里说明也在，那段话才总是有效。
+#[test]
+fn a_new_knowledge_base_already_has_the_manual() {
+    let dir = TempDir::new().unwrap();
+    let kb = dir.path().join("新记忆");
+    let mut client = Client::start(&kb, true);
+
+    let (ok, text) = client.read("catalog show");
+    assert!(ok, "{text}");
+    assert!(text.contains("section \"记忆系统使用说明\""), "{text}");
+    assert!(text.contains("catalog: 空"), "内置说明不算记忆：{text}");
+    let (ok, text) = client.read("show manual-start\ncheck\ntimeline");
+    assert!(ok && text.contains("check: 没有问题"), "{text}");
+    client.stop();
+    assert!(
+        !kb.join("nodes/manual-start.json").exists(),
+        "说明不能进知识库"
+    );
+}
+
+#[test]
+fn the_manual_cannot_be_changed() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+
+    for script in [
+        "set manual-start desc \"\"\"改掉\"\"\"",
+        "remove manual-start",
+        "link drop -> manual-start",
+        "link manual-start -> drop",
+        "unlink manual-start -> manual-recall",
+        "base drop on manual-start",
+        "unbase manual-start on drop",
+        "cite manual-start text \"\"\"改掉\"\"\"",
+        "catalog add manual-start to \"Rust 并发\"",
+        "catalog remove manual-start from \"记忆系统使用说明\"",
+        "catalog add drop to \"记忆系统使用说明\"",
+        "catalog create \"记忆系统使用说明\" desc \"\"\"同名\"\"\"",
+        "catalog describe \"记忆系统使用说明\" \"\"\"改掉\"\"\"",
+        "catalog rename \"Rust 并发\" to \"记忆系统使用说明\"",
+        "catalog delete \"记忆系统使用说明\"",
+        "source 新节点\n  title \"t\"\n  desc \"\"\"d\"\"\"\n  text \"\"\"原文\"\"\"\n  related manual-start\n  related_by drop\nend",
+        "add 新节点\n  title \"t\"\n  desc \"\"\"d\"\"\"\n  based_on manual-start\n  related_by drop\nend",
+        "source manual-extra\n  title \"t\"\n  desc \"\"\"冒充规则\"\"\"\n  text \"\"\"原文\"\"\"\n  related_by drop\nend",
+        "add manual-extra\n  title \"t\"\n  desc \"\"\"冒充规则\"\"\"\n  based_on drop\n  related_by drop\nend",
+    ] {
+        let (ok, text) = client.write(script);
+        assert!(!ok && text.contains("error[E223]"), "{script}：{text}");
+    }
+    let (ok, text) = client.read("check");
+    assert!(ok && text.contains("check: 没有问题"), "{text}");
+    client.stop();
+
+    let journal = fs::read_to_string(kb.join("journal.jsonl")).unwrap_or_default();
+    assert!(journal.is_empty(), "被拒绝的脚本不进日志：{journal}");
+}
+
+/// 说明不进知识库，所以导出、时间线和原文目录里都没有它。
+#[test]
+fn the_manual_stays_out_of_the_knowledge_base() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let target = dir.path().join("导出");
+    let mut client = Client::start(&kb, true);
+
+    let (ok, text) = client.write(&format!(
+        "show manual-start\nlog \"\"\"读完了说明\"\"\"\nexport \"{}\"",
+        target.display()
+    ));
+    assert!(ok, "{text}");
+    let (ok, text) = client.read("timeline");
+    assert!(ok && !text.contains("manual-"), "{text}");
+    client.stop();
+
+    assert!(!target.join("nodes/manual-start.json").exists());
+    let catalog = fs::read_to_string(target.join("catalog.json")).unwrap();
+    assert!(!catalog.contains("记忆系统使用说明"), "{catalog}");
+    let sources = fs::read_dir(kb.join("sources")).unwrap().count();
+    assert_eq!(sources, 1, "demo 只有一份原文");
+
+    // 重启后重放日志，读说明的语句不会妨碍加载。
+    let mut client = Client::start(&kb, true);
+    let (ok, text) = client.read("show manual-start");
+    assert!(ok, "{text}");
+    client.stop();
+}
+
+/// 旧版本可能建过这种节点。知识库要能打开，模型也要能把它们迁走。
+#[test]
+fn old_nodes_with_the_reserved_prefix_still_load_and_can_be_moved() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let script = "source manual-old\n  title \"旧节点\"\n  desc \"\"\"旧版本建的。\"\"\"\n  text \"\"\"旧原文\"\"\"\n  related_by drop\nend\n";
+    let entry = json!({ "script": script, "at": 1_700_000_000u64 });
+    fs::write(kb.join("journal.jsonl"), format!("{entry}\n")).unwrap();
+
+    let mut client = Client::start(&kb, true);
+    let (ok, text) = client.read("show manual-old\ncheck");
+    assert!(ok && text.contains("旧版本建的"), "{text}");
+    assert!(
+        text.contains("note: 节点 manual-old 用了内置说明的前缀"),
+        "{text}"
+    );
+    assert!(text.contains("check: 没有问题"), "{text}");
+    let (ok, text) = client.write("remove manual-old");
+    assert!(ok, "{text}");
+    let (ok, text) = client.read("check");
+    assert!(ok && !text.contains("note:"), "{text}");
     client.stop();
 }
 
@@ -468,8 +587,8 @@ fn walking_the_graph_does_not_repeat_the_catalog() {
         let blocks = call_blocks(&mut client, "memory_read", script);
         assert_eq!(blocks.len(), 1, "{script}：{blocks:?}");
     }
-    // 读说明书也不带。
-    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "recall" })));
+    // 读说明也不带。
+    let blocks = call_blocks(&mut client, "memory_read", "show manual-recall");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     client.stop();
 }
@@ -479,9 +598,9 @@ fn the_first_call_brings_the_catalog_whatever_it_is() {
     let dir = TempDir::new().unwrap();
     let kb = demo_copy(&dir);
 
-    // 说明书。
+    // 说明。
     let mut client = Client::start(&kb, true);
-    let blocks = all_text(&client.call("memory_manual", json!({ "topic": "work" })));
+    let blocks = call_blocks(&mut client, "memory_read", "show manual-work");
     assert!(blocks[0].contains("工作板"), "{blocks:?}");
     assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
     client.stop();

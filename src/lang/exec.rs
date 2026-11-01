@@ -12,9 +12,13 @@ use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
 use crate::knowledge::{Evidence, Locator, Node, SourceId};
+use crate::manual::{self, Manual};
 use crate::memory::{Memory, NodeRef, RemovedNode};
 use crate::source::{SourceStore, source_id};
 use crate::timeline::{Action, Event, NodeTimes, format_time};
+
+/// 原文读不到时模型该告诉用户什么。模型不一定读过说明，所以写在报错里。
+const DOCTOR_HINT: &str = "。告诉用户可以运行 memweave doctor，不要改记忆来掩盖";
 
 /// 板块的代表超过这个数量时提醒模型：总表不是索引。
 const MANY_REPRESENTATIVES: usize = 5;
@@ -33,6 +37,7 @@ pub fn execute(
     statements: &[Located],
     memory: &mut Memory,
     sources: &dyn SourceStore,
+    manual: Option<&Manual>,
     at: Option<u64>,
 ) -> Result<Report, (usize, String, Error)> {
     let mut report = Report {
@@ -41,7 +46,7 @@ pub fn execute(
         ends: Vec::with_capacity(statements.len()),
     };
     for (done, located) in statements.iter().enumerate() {
-        if let Err(error) = statement(&located.statement, memory, sources, &mut report) {
+        if let Err(error) = statement(&located.statement, memory, sources, manual, &mut report) {
             return Err((done, report.text, error));
         }
         if let Some(event) = event_for(&located.statement, at) {
@@ -56,11 +61,26 @@ fn statement(
     statement: &Statement,
     memory: &mut Memory,
     sources: &dyn SourceStore,
+    manual: Option<&Manual>,
     report: &mut Report,
 ) -> Result<(), Error> {
+    if let Some(id) = node_read_by(statement) {
+        // 内置说明是另一张图，读的时候换过去。两张图之间没有边，所以不会走串。
+        return match manual.filter(|manual| manual.contains(id)) {
+            Some(manual) => read_node(statement, manual.memory(), manual.sources(), report),
+            None => read_node(statement, memory, sources, report),
+        };
+    }
     let output = &mut report.text;
     match statement {
-        Statement::CatalogShow => output.push_str(&render_overview(memory)),
+        Statement::CatalogShow => output.push_str(&render_overview(memory, manual)),
+        Statement::Check => render_check(memory, sources, manual, output),
+        Statement::Show(_)
+        | Statement::Links { .. }
+        | Statement::Evidence(_)
+        | Statement::BasedBy(_)
+        | Statement::RelatedBy(_)
+        | Statement::FullSource { .. } => unreachable!("读节点的语句在上面处理"),
         Statement::Board(op) => {
             let text = memory
                 .apply_board(op)
@@ -161,47 +181,6 @@ fn statement(
             );
             let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
         }
-        Statement::Check => render_check(memory, sources, output),
-        Statement::Show(id) => {
-            let node = existing(memory, &id.text)?;
-            let times = memory.node_times(&id.text);
-            render_node(node, times, sources, output, &mut report.failures);
-        }
-        Statement::Links {
-            id,
-            depth,
-            limit,
-            offset,
-        } => {
-            render_links(existing(memory, &id.text)?, *depth, *limit, *offset, output);
-        }
-        Statement::Evidence(id) => {
-            render_evidence(
-                existing(memory, &id.text)?,
-                memory,
-                sources,
-                output,
-                &mut report.failures,
-            );
-        }
-        Statement::BasedBy(id) => {
-            let ids: Vec<String> = existing(memory, &id.text)?
-                .based_by()
-                .map(|node| node.id().to_owned())
-                .collect();
-            let _ = writeln!(output, "based_by {}: {}", id.text, join_ids(&ids));
-        }
-        Statement::RelatedBy(id) => {
-            let ids: Vec<String> = existing(memory, &id.text)?
-                .related_by()
-                .map(|node| node.id().to_owned())
-                .collect();
-            let _ = writeln!(output, "related_by {}: {}", id.text, join_ids(&ids));
-        }
-        Statement::FullSource { id, offset, limit } => {
-            let node = existing(memory, &id.text)?;
-            render_full_source(node, *offset, *limit, sources, output, &mut report.failures);
-        }
         Statement::Add(add) | Statement::Source(add) => {
             let (node, related_by) = build_node(add);
             memory.add_node(node, &related_by, sources)?;
@@ -274,6 +253,73 @@ fn statement(
     Ok(())
 }
 
+/// 这条语句要读哪个节点。
+fn node_read_by(statement: &Statement) -> Option<&str> {
+    match statement {
+        Statement::Show(id)
+        | Statement::Links { id, .. }
+        | Statement::Evidence(id)
+        | Statement::BasedBy(id)
+        | Statement::RelatedBy(id)
+        | Statement::FullSource { id, .. } => Some(&id.text),
+        _ => None,
+    }
+}
+
+/// 读节点的语句。只读，所以可以在记忆或内置说明上执行。
+fn read_node(
+    statement: &Statement,
+    memory: &Memory,
+    sources: &dyn SourceStore,
+    report: &mut Report,
+) -> Result<(), Error> {
+    let output = &mut report.text;
+    match statement {
+        Statement::Show(id) => {
+            let node = existing(memory, &id.text)?;
+            let times = memory.node_times(&id.text);
+            render_node(node, times, sources, output, &mut report.failures);
+        }
+        Statement::Links {
+            id,
+            depth,
+            limit,
+            offset,
+        } => {
+            render_links(existing(memory, &id.text)?, *depth, *limit, *offset, output);
+        }
+        Statement::Evidence(id) => {
+            render_evidence(
+                existing(memory, &id.text)?,
+                memory,
+                sources,
+                output,
+                &mut report.failures,
+            );
+        }
+        Statement::BasedBy(id) => {
+            let ids: Vec<String> = existing(memory, &id.text)?
+                .based_by()
+                .map(|node| node.id().to_owned())
+                .collect();
+            let _ = writeln!(output, "based_by {}: {}", id.text, join_ids(&ids));
+        }
+        Statement::RelatedBy(id) => {
+            let ids: Vec<String> = existing(memory, &id.text)?
+                .related_by()
+                .map(|node| node.id().to_owned())
+                .collect();
+            let _ = writeln!(output, "related_by {}: {}", id.text, join_ids(&ids));
+        }
+        Statement::FullSource { id, offset, limit } => {
+            let node = existing(memory, &id.text)?;
+            render_full_source(node, *offset, *limit, sources, output, &mut report.failures);
+        }
+        _ => unreachable!("node_read_by 只放行读节点的语句"),
+    }
+    Ok(())
+}
+
 fn existing<'m>(memory: &'m Memory, id: &str) -> Result<NodeRef<'m>, Error> {
     memory
         .node(id)
@@ -329,7 +375,7 @@ const RECENT_EVENTS: usize = 5;
 const RECENT_EVENT_CHARS: usize = 80;
 
 /// 工作板、最近行为和总表：模型一眼就知道在做什么、做过什么、记忆里有什么。
-pub fn render_overview(memory: &Memory) -> String {
+pub fn render_overview(memory: &Memory, manual: Option<&Manual>) -> String {
     let mut output = String::new();
     let goals = &memory.catalog().goals;
     let recent = memory.timeline().iter().rev().take(RECENT_EVENTS);
@@ -358,6 +404,10 @@ pub fn render_overview(memory: &Memory) -> String {
     }
     if !output.is_empty() {
         output.push_str("总表\n");
+    }
+    // 内置板块放在最前面：总表太长被截断时，模型仍然知道说明在哪。
+    if let Some(manual) = manual {
+        render_sections(manual.memory(), &mut output);
     }
     render_catalog(memory, &mut output);
     output
@@ -550,12 +600,15 @@ fn event_for(statement: &Statement, at: Option<u64>) -> Option<Event> {
 }
 
 fn render_catalog(memory: &Memory, output: &mut String) {
-    let sections = &memory.catalog().sections;
-    if sections.is_empty() {
+    if memory.catalog().sections.is_empty() {
         output.push_str("catalog: 空\n");
-        return;
+    } else {
+        render_sections(memory, output);
     }
-    for section in sections {
+}
+
+fn render_sections(memory: &Memory, output: &mut String) {
+    for section in &memory.catalog().sections {
         let _ = writeln!(output, "section {}", quote(&section.name));
         if section.description.is_empty() {
             output.push_str("  desc: 无\n");
@@ -603,7 +656,7 @@ fn render_node(
                 Err(error) => {
                     *failures += 1;
                     let _ = writeln!(output, "  source: {source} {start}..{end}");
-                    let _ = writeln!(output, "error[E901] 原文读取失败：{error}");
+                    let _ = writeln!(output, "error[E901] 原文读取失败：{error}{DOCTOR_HINT}");
                 }
             }
         }
@@ -800,7 +853,10 @@ fn render_evidence(
                 }
                 Err(error) => {
                     *failures += 1;
-                    let _ = writeln!(output, "{indent}error[E901] 原文读取失败：{error}");
+                    let _ = writeln!(
+                        output,
+                        "{indent}error[E901] 原文读取失败：{error}{DOCTOR_HINT}"
+                    );
                 }
             },
             Evidence::Node { id } => {
@@ -876,7 +932,24 @@ fn damaged_sources(memory: &Memory, sources: &dyn SourceStore) -> BTreeMap<Sourc
     damaged
 }
 
-fn render_check(memory: &Memory, sources: &dyn SourceStore, output: &mut String) {
+fn render_check(
+    memory: &Memory,
+    sources: &dyn SourceStore,
+    manual: Option<&Manual>,
+    output: &mut String,
+) {
+    // 旧版本可能建过这种节点。它们看起来像规则，其实是数据，提醒模型迁走。
+    if manual.is_some() {
+        for node in memory.nodes() {
+            if node.id().starts_with(manual::RESERVED_PREFIX) {
+                let _ = writeln!(
+                    output,
+                    "note: 节点 {} 用了内置说明的前缀，但它是记忆，不是规则。新建节点把它迁走，见 manual-repair-delete",
+                    node.id()
+                );
+            }
+        }
+    }
     let unreachable = memory.unreachable();
     let empty: Vec<&str> = memory
         .catalog()

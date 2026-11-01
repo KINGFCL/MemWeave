@@ -12,6 +12,7 @@ pub mod journal;
 pub mod lexer;
 pub mod parser;
 
+use crate::manual::Manual;
 use crate::memory::Memory;
 use crate::source::{SourceStore, Trusted};
 use crate::timeline;
@@ -93,7 +94,7 @@ log """做了什么"""                         记下记忆之外的行为，比
 - source 必须有 title、desc，至少一段原文。要记下对话或工具结果里的新内容，就用它。
 - 新节点必须能被找到：在同一段脚本里写 related_by、link 某节点 -> 它，或者 catalog add 它 to "板块"。
 - 总表由你维护。它是目录，不是索引：每个领域只放几个代表节点，其他节点靠 related 到达。
-- 节点地址只能包含字母、数字、- 和 _，不能修改。
+- 节点地址只能包含字母、数字、- 和 _，不能修改。manual- 开头的地址留给内置说明，只能读。
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
 - 还有结论依据某个节点时不能删除它。先用 base 和 unbase 给这些结论换依据，或者先删除它们，可以写在同一段脚本里。
@@ -123,6 +124,7 @@ pub struct Session<'a> {
     sources: &'a dyn SourceStore,
     mode: Mode,
     journal: Option<&'a Journal>,
+    manual: Option<&'a Manual>,
     output_limit: usize,
     /// 固定的时间，测试用。没有时取当前时间。
     fixed_time: Option<Option<u64>>,
@@ -135,6 +137,7 @@ impl<'a> Session<'a> {
             sources,
             mode,
             journal: None,
+            manual: None,
             output_limit: MAX_OUTPUT_BYTES,
             fixed_time: None,
         }
@@ -143,6 +146,12 @@ impl<'a> Session<'a> {
     /// 修改记忆的脚本会先记到这个日志里。
     pub fn with_journal(mut self, journal: &'a Journal) -> Self {
         self.journal = Some(journal);
+        self
+    }
+
+    /// 让模型能读内置说明，并保护它不被改动。
+    pub fn with_manual(mut self, manual: &'a Manual) -> Self {
+        self.manual = Some(manual);
         self
     }
 
@@ -179,7 +188,13 @@ impl<'a> Session<'a> {
             return failure(&errors, script, self.output_limit);
         }
 
-        let errors = check::check(&statements, self.memory, self.sources, self.mode);
+        let errors = check::check(
+            &statements,
+            self.memory,
+            self.sources,
+            self.mode,
+            self.manual,
+        );
         if !errors.is_empty() {
             return failure(&errors, script, self.output_limit);
         }
@@ -211,7 +226,7 @@ impl<'a> Session<'a> {
             };
         }
 
-        match exec::execute(&statements, self.memory, self.sources, at) {
+        match exec::execute(&statements, self.memory, self.sources, self.manual, at) {
             Ok(report) if report.failures == 0 => Output {
                 ok: true,
                 text: limit_report(&report, &statements, self.output_limit),
@@ -254,6 +269,7 @@ impl Session<'_> {
             self.memory,
             &trusted,
             Mode::ReadWrite,
+            None,
         ));
         if !errors.is_empty() {
             return failure(&errors, script, MAX_OUTPUT_BYTES);
@@ -265,7 +281,7 @@ impl Session<'_> {
                 text: error.to_string(),
             };
         }
-        match exec::execute(&statements, self.memory, &trusted, at) {
+        match exec::execute(&statements, self.memory, &trusted, None, at) {
             Ok(report) => Output {
                 ok: true,
                 text: report.text,
