@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::Path;
 
-use super::ast::{AddNode, Citation, Field, Located, RevisionView, Statement, Version};
+use super::ast::{AddNode, Citation, Field, Located, Name, RevisionView, Statement, Version};
+use super::textdiff::{self, Part};
 use crate::board::{Goal, StepStatus};
 use crate::error::Error;
 use crate::export::Exporter;
@@ -82,9 +83,8 @@ fn statement(
         Statement::Versioned(Version::Origin, inner) => {
             return memory.with_origin(|origin| read(inner, origin, sources, manual, report));
         }
-        Statement::RevisionDisplay { view, node } => {
-            let only = node.as_ref().map(|n| n.text.as_str());
-            render_revision(memory, *view, only, sources, report);
+        Statement::RevisionDisplay { view, nodes } => {
+            render_revision(memory, *view, nodes, sources, manual, report);
             return Ok(());
         }
         _ => {}
@@ -216,6 +216,12 @@ fn statement(
                 render_review(node, "内容", output);
             }
         }
+        Statement::Append { id, value, .. } => {
+            let joined = joined_description(existing(memory, &id.text)?.description(), value);
+            memory.set_description(&id.text, &joined)?;
+            let _ = writeln!(output, "appended {}", id.text);
+            render_review(existing(memory, &id.text)?, "内容", output);
+        }
         Statement::Cite { id, citation } => {
             let (source, start, end) = match citation {
                 Citation::Text(text) => (source_id(text.text.as_bytes()), 0, text.text.len()),
@@ -311,6 +317,21 @@ pub fn revision_note(memory: &Memory) -> Option<String> {
             memory.draft_scripts().len()
         )
     })
+}
+
+/// 把内容接在描述后面。中文直接接上。两边都是英文时补一个空格，否则 `foo.` 和 `Bar` 会粘在一起。
+/// 这个结果不进日志，日志里存的是脚本，重放时重新算，所以改这条规则要升语言版本。
+fn joined_description(description: &str, addition: &str) -> String {
+    let needs_space = description
+        .chars()
+        .next_back()
+        .is_some_and(|last| last.is_ascii_alphanumeric() || last.is_ascii_punctuation())
+        && addition
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric());
+    let separator = if needs_space { " " } else { "" };
+    format!("{description}{separator}{addition}")
 }
 
 /// 这条语句要读哪个节点。
@@ -585,6 +606,9 @@ fn event_for(statement: &Statement, at: Option<u64>) -> Option<Event> {
                 Field::Description => "desc",
             };
             change(format!("set {} {field}", id.text), vec![id.text.clone()])
+        }
+        Statement::Append { id, .. } => {
+            change(format!("append {} desc", id.text), vec![id.text.clone()])
         }
         Statement::Base { id, on } => change(
             format!("base {} on {}", id.text, on.text),
@@ -1057,13 +1081,18 @@ fn render_check(
 pub fn continue_hint(statement: &Statement) -> String {
     let (prefix, inner) = match statement {
         Statement::Versioned(version, inner) => (version.keyword(), &**inner),
-        Statement::RevisionDisplay { view, node: None } => {
+        Statement::RevisionDisplay { view, nodes } => {
             let name = match view {
                 RevisionView::Brief => "revision display",
                 RevisionView::Detail => "revision display-detail",
                 RevisionView::Comparison => "comparison display",
+                RevisionView::ComparisonDiff => "comparison display-diff",
             };
-            return format!("{name} 没有显示完，用 {name} 节点 逐个看");
+            return if nodes.is_empty() {
+                format!("{name} 没有显示完，用 {name} 节点, 节点 分开看")
+            } else {
+                format!("{name} 没有显示完，一次少写几个节点")
+            };
         }
         other => ("revision", other),
     };
@@ -1096,8 +1125,9 @@ pub fn continue_hint(statement: &Statement) -> String {
 fn render_revision(
     memory: &mut Memory,
     view: RevisionView,
-    only: Option<&str>,
+    only: &[Name],
     sources: &dyn SourceStore,
+    manual: Option<&Manual>,
     report: &mut Report,
 ) {
     let output = &mut report.text;
@@ -1111,13 +1141,29 @@ fn render_revision(
     let mut render_node_change = |change: &NodeChange, output: &mut String| match view {
         RevisionView::Brief => render_brief_change(change, output),
         RevisionView::Detail => render_detailed_change(change, memory, sources, output, failures),
-        RevisionView::Comparison => render_compared_change(change, sources, output, failures),
+        RevisionView::Comparison => {
+            render_compared_change(change, false, sources, output, failures);
+        }
+        RevisionView::ComparisonDiff => {
+            render_compared_change(change, true, sources, output, failures);
+        }
     };
-    if let Some(id) = only {
-        match revision.nodes.iter().find(|change| change.id == id) {
-            Some(change) => render_node_change(change, output),
-            None => {
+    if !only.is_empty() {
+        let mut shown = HashSet::new();
+        for name in only {
+            let id = name.text.as_str();
+            if !shown.insert(id) {
+                continue;
+            }
+            if let Some(change) = revision.nodes.iter().find(|change| change.id == id) {
+                render_node_change(change, output);
+            } else if memory.contains(id)
+                || memory.in_origin(id)
+                || manual.is_some_and(|manual| manual.contains(id))
+            {
                 let _ = writeln!(output, "{id} 没有改动");
+            } else {
+                let _ = writeln!(output, "{id} 不存在：已保存的版本和草稿里都没有这个节点");
             }
         }
         return;
@@ -1129,10 +1175,18 @@ fn render_revision(
         match view {
             RevisionView::Brief => render_brief_catalog(before, memory.catalog(), output),
             RevisionView::Detail => render_detailed_catalog(before, memory.catalog(), output),
-            RevisionView::Comparison => render_compared_catalog(before, memory.catalog(), output),
+            RevisionView::Comparison => {
+                render_compared_catalog(before, memory.catalog(), false, output);
+            }
+            RevisionView::ComparisonDiff => {
+                render_compared_catalog(before, memory.catalog(), true, output);
+            }
         }
     }
-    if view == RevisionView::Comparison {
+    if matches!(
+        view,
+        RevisionView::Comparison | RevisionView::ComparisonDiff
+    ) {
         if revision.nodes.is_empty() && revision.catalog_before.is_none() {
             output.push_str("节点、总表和工作板都没有变化，做过什么用 revision display 看\n");
         }
@@ -1300,17 +1354,23 @@ fn render_detailed_change(
     }
 }
 
+/// 两个列表的增减，保持原来的顺序。一个节点可能有几十万条关联，所以不能逐个在列表里找。
+fn list_changes<'a>(
+    before: &'a [String],
+    after: &'a [String],
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    let old: HashSet<&String> = before.iter().collect();
+    let new: HashSet<&String> = after.iter().collect();
+    (
+        after.iter().filter(|item| !old.contains(item)).collect(),
+        before.iter().filter(|item| !new.contains(item)).collect(),
+    )
+}
+
 fn render_list_change(name: &str, before: &[String], after: &[String], output: &mut String) {
-    let added: Vec<String> = after
-        .iter()
-        .filter(|item| !before.contains(item))
-        .map(|item| format!("+{item}"))
-        .collect();
-    let removed: Vec<String> = before
-        .iter()
-        .filter(|item| !after.contains(item))
-        .map(|item| format!("-{item}"))
-        .collect();
+    let (added, removed) = list_changes(before, after);
+    let added: Vec<String> = added.iter().map(|item| format!("+{item}")).collect();
+    let removed: Vec<String> = removed.iter().map(|item| format!("-{item}")).collect();
     if added.is_empty() && removed.is_empty() {
         let _ = writeln!(output, "  {name}: 顺序变了");
     } else {
@@ -1372,8 +1432,10 @@ fn render_detailed_catalog(before: &Catalog, after: &Catalog, output: &mut Strin
 }
 
 /// 逐项对照：只列出变了的字段，没变的不显示，否则改一个字也要读完整个节点。
+/// `word_level` 时文字逐字比较，列表只列增减。新增和删除的节点没有可比的另一边，都显示全部内容。
 fn render_compared_change(
     change: &NodeChange,
+    word_level: bool,
     sources: &dyn SourceStore,
     output: &mut String,
     failures: &mut usize,
@@ -1396,6 +1458,10 @@ fn render_compared_change(
         (None, None) => return,
     };
     let _ = writeln!(output, "~ {}", change.id);
+    if word_level {
+        render_word_level_change(before, after, sources, output, failures);
+        return;
+    }
     if before.title != after.title {
         render_pair("title", &quote(&before.title), &quote(&after.title), output);
     }
@@ -1420,6 +1486,119 @@ fn render_compared_change(
         render_evidence_lines(&before.evidence, "      ", sources, output, failures);
         output.push_str("    revision:\n");
         render_evidence_lines(&after.evidence, "      ", sources, output, failures);
+    }
+}
+
+fn render_word_level_change(
+    before: &Node,
+    after: &Node,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    if before.title != after.title {
+        render_text_diff("title", &before.title, &after.title, output);
+    }
+    if before.description != after.description {
+        render_text_diff("desc", &before.description, &after.description, output);
+    }
+    if before.related != after.related {
+        render_list_diff("related", &before.related, &after.related, output);
+    }
+    if before.evidence != after.evidence {
+        let (added, removed): (Vec<Evidence>, Vec<Evidence>) = (
+            after
+                .evidence
+                .iter()
+                .filter(|entry| !before.evidence.contains(entry))
+                .cloned()
+                .collect(),
+            before
+                .evidence
+                .iter()
+                .filter(|entry| !after.evidence.contains(entry))
+                .cloned()
+                .collect(),
+        );
+        if added.is_empty() && removed.is_empty() {
+            output.push_str("  evidence: 顺序变了\n");
+            return;
+        }
+        output.push_str("  evidence\n");
+        for entry in added {
+            render_evidence_lines(&[entry], "    + ", sources, output, failures);
+        }
+        for entry in removed {
+            render_evidence_lines(&[entry], "    - ", sources, output, failures);
+        }
+    }
+}
+
+/// 没变的文字两边各留这么多个字，让模型知道改动在哪。
+const DIFF_CONTEXT_CHARS: usize = 10;
+/// 省略的字数少于这个就不省略：省略的提示本身也要占地方。
+const DIFF_MIN_FOLDED_CHARS: usize = 5;
+
+/// 每段单独一行，内容都是 JSON 字符串。不用行内标记，记忆内容里可能就有那些符号。
+fn render_text_diff(name: &str, old: &str, new: &str, output: &mut String) {
+    let Some(parts) = textdiff::compare(old, new) else {
+        let _ = writeln!(output, "  {name}（内容太长，没有逐字比较）");
+        let _ = writeln!(output, "    origin:   {}", quote(old));
+        let _ = writeln!(output, "    revision: {}", quote(new));
+        return;
+    };
+    let _ = writeln!(output, "  {name}");
+    let last = parts.len().saturating_sub(1);
+    for (index, part) in parts.iter().enumerate() {
+        match part {
+            Part::Removed(text) => {
+                let _ = writeln!(output, "    - {}", quote(text));
+            }
+            Part::Added(text) => {
+                let _ = writeln!(output, "    + {}", quote(text));
+            }
+            Part::Same(text) => {
+                // 开头那段只要后面几个字，结尾那段只要前面几个字。
+                let head = if index == 0 { 0 } else { DIFF_CONTEXT_CHARS };
+                let tail = if index == last { 0 } else { DIFF_CONTEXT_CHARS };
+                render_kept_text(text, head, tail, output);
+            }
+        }
+    }
+}
+
+fn render_kept_text(text: &str, head: usize, tail: usize, output: &mut String) {
+    let chars = text.chars().count();
+    if chars < head + tail + DIFF_MIN_FOLDED_CHARS {
+        let _ = writeln!(output, "    = {}", quote(text));
+        return;
+    }
+    let byte_at = |position: usize| {
+        text.char_indices()
+            .nth(position)
+            .map_or(text.len(), |(byte, _)| byte)
+    };
+    if head > 0 {
+        let _ = writeln!(output, "    = {}", quote(&text[..byte_at(head)]));
+    }
+    let _ = writeln!(output, "    （省略 {} 字）", chars - head - tail);
+    if tail > 0 {
+        let _ = writeln!(output, "    = {}", quote(&text[byte_at(chars - tail)..]));
+    }
+}
+
+fn render_list_diff(name: &str, before: &[String], after: &[String], output: &mut String) {
+    let (added, removed) = list_changes(before, after);
+    if added.is_empty() && removed.is_empty() {
+        let _ = writeln!(output, "  {name}: 顺序变了");
+        return;
+    }
+    let _ = writeln!(output, "  {name}");
+    for item in added {
+        let _ = writeln!(output, "    + {item}");
+    }
+    for item in removed {
+        let _ = writeln!(output, "    - {item}");
     }
 }
 
@@ -1482,7 +1661,12 @@ fn render_evidence_lines(
     }
 }
 
-fn render_compared_catalog(before: &Catalog, after: &Catalog, output: &mut String) {
+fn render_compared_catalog(
+    before: &Catalog,
+    after: &Catalog,
+    word_level: bool,
+    output: &mut String,
+) {
     let render_section = |section: &Section, output: &mut String| {
         let _ = writeln!(output, "    desc: {}", quote(&section.description));
         let _ = writeln!(output, "    代表: {}", join_ids(&section_ids(section)));
@@ -1508,15 +1692,23 @@ fn render_compared_catalog(before: &Catalog, after: &Catalog, output: &mut Strin
         }
         let _ = writeln!(output, "~ section {}", quote(&new.name));
         if old.description != new.description {
-            render_pair(
-                "desc",
-                &quote(&old.description),
-                &quote(&new.description),
-                output,
-            );
+            if word_level {
+                render_text_diff("desc", &old.description, &new.description, output);
+            } else {
+                render_pair(
+                    "desc",
+                    &quote(&old.description),
+                    &quote(&new.description),
+                    output,
+                );
+            }
         }
         if old_ids != new_ids {
-            render_pair("代表", &join_ids(&old_ids), &join_ids(&new_ids), output);
+            if word_level {
+                render_list_diff("代表", &old_ids, &new_ids, output);
+            } else {
+                render_pair("代表", &join_ids(&old_ids), &join_ids(&new_ids), output);
+            }
         }
     }
     let render_goal_side = |goal: &Goal, output: &mut String| {

@@ -78,16 +78,18 @@ pub enum RevisionView {
     Detail,
     /// `comparison display`：已保存的版本和草稿逐项对照。
     Comparison,
+    /// `comparison display-diff`：和上面一样，但文字逐字比较。
+    ComparisonDiff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     /// `revision show a` 或 `origin show a`。里面是一条读语句或 `export`。
     Versioned(Version, Box<Statement>),
-    /// 看未保存的修改。可以只看一个节点。
+    /// 看未保存的修改。可以只看某几个节点。
     RevisionDisplay {
         view: RevisionView,
-        node: Option<Name>,
+        nodes: Vec<Name>,
     },
     /// 把草稿写进日志。
     Save,
@@ -166,6 +168,12 @@ pub enum Statement {
         value: String,
         value_span: Span,
     },
+    /// 在描述末尾补一段，不用重写全文。
+    Append {
+        id: Name,
+        value: String,
+        value_span: Span,
+    },
     Base {
         id: Name,
         on: Name,
@@ -210,7 +218,8 @@ impl Statement {
             | Statement::Cite { id, .. }
             | Statement::Uncite { id, .. }
             | Statement::Remove(id)
-            | Statement::Set { id, .. } => vec![id],
+            | Statement::Set { id, .. }
+            | Statement::Append { id, .. } => vec![id],
             Statement::Link { from, to } | Statement::Unlink { from, to } => vec![from, to],
             Statement::Base { id, on } | Statement::Unbase { id, on } => vec![id, on],
             _ => Vec::new(),

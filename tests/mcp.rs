@@ -987,3 +987,83 @@ fn the_command_line_carries_a_draft_across_calls() {
     );
     assert_eq!(run(None, "revision display").trim(), "has_revision: false");
 }
+
+#[test]
+fn the_word_level_view_works_over_the_tools_and_stays_within_the_limit() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+    assert!(
+        client
+            .write("set drop title \"Drop 与资源释放规则\"\nset ownership title \"新的所有权\"")
+            .0
+    );
+
+    let (ok, text) = client.read("comparison display-diff drop, borrowing, 写错的");
+    assert!(ok, "{text}");
+    assert!(text.starts_with("has_revision: true"), "{text}");
+    assert!(text.contains("+ \"规则\""), "{text}");
+    assert!(text.contains("borrowing 没有改动"), "{text}");
+    assert!(text.contains("写错的 不存在"), "{text}");
+    client.stop();
+
+    // 输出很小时，第一行还在，并且说明怎么看剩下的。
+    let bin = env!("CARGO_BIN_EXE_memweave");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .arg(&kb)
+        .args(["--max-output-bytes", "60"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut client = Client {
+        child,
+        stdin,
+        stdout,
+        next_id: 0,
+        modern: true,
+    };
+    let (ok, text) = client.read("comparison display-diff");
+    assert!(ok, "{text}");
+    assert!(text.starts_with("has_revision: true"), "{text}");
+    assert!(
+        text.contains("comparison display-diff 没有显示完"),
+        "{text}"
+    );
+    client.stop();
+}
+
+#[test]
+fn a_read_only_command_sees_a_running_servers_draft_without_disturbing_it() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let bin = env!("CARGO_BIN_EXE_memweave");
+    let mut client = Client::start(&kb, true);
+    assert!(client.write("set drop title \"服务里的草稿\"").0);
+
+    let output = Command::new(bin)
+        .arg("run")
+        .arg(&kb)
+        .arg("revision display")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.starts_with("has_revision: true"), "{text}");
+    // 写入和维护要等服务退出，不能抢。
+    let output = Command::new(bin)
+        .args(["run", "--write"])
+        .arg(&kb)
+        .arg("save")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("另一个进程正在写"));
+    let (ok, text) = client.read("revision display");
+    assert!(ok && text.contains("~ drop: title"), "{text}");
+    assert!(client.write("save").0);
+    client.stop();
+}

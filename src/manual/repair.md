@@ -3,6 +3,7 @@
 | 情况 | 怎么做 |
 | --- | --- |
 | 描述写错了，原文没错 | `set 节点 desc`，原文不动 |
+| 描述没错，只是要补一句 | `append 节点 desc`，不用重写全文 |
 | 原文说错了或过时了 | 存新原文，换掉引用，需要时改描述 |
 | 用户纠正了你，但记忆里没有这件事 | 按 `manual-write` 新建 |
 
@@ -12,6 +13,14 @@
 cite borrowing text """用户纠正：同一时刻可以有多个共享引用，或者一个可变引用，两者不能并存。"""
 uncite borrowing source sha256:95b2eaa8612c4c91a340e14f884b6af3dabb03a762db88ec68aea84217ce0e49 161..344
 set borrowing desc """同一时刻可以有多个共享引用，或者一个可变引用，两者不能并存。"""
+save
+```
+
+只是补一句，用 `append`。它接在描述末尾：中文直接接上，两边都是英文时自动补一个空格。
+
+```memweave
+append drop desc """释放顺序不能手动改变。"""
+comparison display-diff drop
 save
 ```
 
@@ -45,7 +54,7 @@ cite borrowing text """新原文"""
 
 ## 处理“可能需要复查”
 
-`set desc`、`cite`、`uncite` 之后，输出可能出现这样的 warning：
+`set desc`、`append`、`cite`、`uncite` 之后，输出可能出现这样的 warning：
 
 ```text
 warning: send-sync 依据 borrowing，证据变了，它可能需要复查

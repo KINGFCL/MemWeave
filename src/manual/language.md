@@ -5,6 +5,7 @@
 - 开头和结尾的引号数量要相同，可以多于三个，所以内容含 `"""` 时用 `""""` 包住。
 - `text` 逐字保存，只有紧贴开头和结尾的那个换行不算内容。标题、描述和名字的首尾空白会被去掉。
 - `show`、`evidence`、`based_by`、`related_by` 可以用逗号写多个节点，和分几行写完全相同，前缀对每个节点都生效。
+- `revision display`、`revision display-detail`、`comparison display`、`comparison display-diff` 也可以用逗号写多个节点，一次显示。
 - 一段脚本最多 1 MiB、1000 条语句。输出有上限，超出时会截断并写明。
 - 读语句可以和写语句写在同一段脚本里，按顺序执行，`revision` 读到的是前面语句生效之后的结果，`origin` 读到的总是已保存的版本。
 - `save` 只能写在脚本最后一行，`discard` 要单独执行。

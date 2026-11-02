@@ -68,7 +68,9 @@ pub fn load_current(
 /// 日志里的脚本用第几版语言写的。不兼容地改语言时要加一。旧版本遇到更新的日志会拒绝，不会读错。
 ///
 /// 第 2 版：读语句要写 `revision` 或 `origin`，一行里可以有多段脚本。第 1 版的日志还能读。
-pub const LANGUAGE_VERSION: u32 = 2;
+/// 第 3 版：加了 `append` 和 `comparison display-diff`。重放时要解析整段脚本，读语句也算，所以新指令
+/// 写进日志后旧版本就读不了，要让它说“请升级”，不能说重放失败。
+pub const LANGUAGE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Entry {

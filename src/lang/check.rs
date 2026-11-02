@@ -353,6 +353,17 @@ impl Checker<'_> {
                         .push(Diagnostic::new("E206", *value_span, "内容不能为空"));
                 }
             }
+            Statement::Append {
+                id,
+                value,
+                value_span,
+            } => {
+                self.require(id);
+                if value.trim().is_empty() {
+                    self.errors
+                        .push(Diagnostic::new("E206", *value_span, "要补的内容不能为空"));
+                }
+            }
             Statement::Base { id, on } => self.base(id, on),
             Statement::Unbase { id, on } => self.unbase(id, on),
         }
@@ -668,16 +679,7 @@ impl Checker<'_> {
             .chain(self.added.iter().cloned())
             .filter(|id| self.exists(id))
             .collect();
-        let representatives: HashSet<&str> = self
-            .sections
-            .iter()
-            .flat_map(|(_, nodes)| nodes.iter().map(String::as_str))
-            .collect();
-        let mut waiting: Vec<String> = new_nodes
-            .iter()
-            .filter(|id| !self.has_way_in(id, &new_nodes, &representatives))
-            .cloned()
-            .collect();
+        let mut waiting = self.unjoined(&new_nodes);
         waiting.sort();
         for id in waiting {
             // 这段脚本里建的就指向那一行，之前的脚本里建的只能指向 save。
@@ -696,58 +698,65 @@ impl Checker<'_> {
         }
     }
 
-    /// 这个新节点有没有接入：它是代表，或者有已有节点关联它，或者有已接入的新节点关联它。
-    /// 只在新节点之间走，不走完全图，所以保存的时间和图的大小无关。已有节点本身是否可达由 `check`
-    /// 负责，新节点只是互相关联不算接入。
-    fn has_way_in(
-        &self,
-        id: &str,
-        new_nodes: &HashSet<String>,
-        representatives: &HashSet<&str>,
-    ) -> bool {
-        let mut seen = HashSet::from([id.to_owned()]);
-        let mut pending = vec![id.to_owned()];
-        while let Some(current) = pending.pop() {
-            if representatives.contains(current.as_str()) {
-                return true;
-            }
-            for from in self.pointing_at(&current) {
-                if !new_nodes.contains(&from) {
-                    return true;
-                }
-                if seen.insert(from.clone()) {
-                    pending.push(from);
-                }
-            }
-        }
-        false
-    }
-
-    /// 模拟到当前语句时，哪些节点关联了 `id`。
-    fn pointing_at(&self, id: &str) -> Vec<String> {
-        // 脚本前面的语句改过的关联，以模拟的结果为准。
-        let mut from: Vec<String> = self
-            .related
+    /// 没有接入的新节点。接入是指：它是代表，或者有已有节点关联它，或者有已接入的新节点关联它。
+    /// 新节点只是互相关联不算接入。已有节点本身是否可达由 `check` 负责。
+    ///
+    /// 只看和新节点相连的边，不走完全图，所以保存的时间和图的大小无关；每条边只看一次，所以和新节点
+    /// 怎么连也无关。逐个节点往上找的话，2 万个新节点连成一条链要一分钟，这期间所有调用都在排队。
+    fn unjoined(&self, new_nodes: &HashSet<String>) -> Vec<String> {
+        let mut joined: Vec<&str> = self
+            .sections
             .iter()
-            .filter(|(other, list)| self.exists(other) && list.iter().any(|to| to == id))
-            .map(|(other, _)| other.clone())
+            .flat_map(|(_, nodes)| nodes.iter().map(String::as_str))
+            .filter(|id| new_nodes.contains(*id))
             .collect();
-        // 本脚本删除过的节点，内存里的关联已经不算数了。
-        if !self.removed_ever.contains(id)
-            && let Some(node) = self.memory.node(id)
-        {
-            from.extend(
-                node.related_by()
-                    .map(|other| other.id())
-                    .filter(|other| {
-                        self.exists(other)
-                            && !self.removed_ever.contains(*other)
-                            && !self.related.contains_key(*other)
-                    })
-                    .map(str::to_owned),
-            );
+        let mut next: HashMap<&str, Vec<&str>> = HashMap::new();
+        // 脚本前面的语句改过的关联，以模拟的结果为准。
+        for (from, list) in &self.related {
+            if !self.exists(from) {
+                continue;
+            }
+            for to in list.iter().filter(|to| new_nodes.contains(*to)) {
+                match new_nodes.get(from) {
+                    Some(from) => next.entry(from).or_default().push(to),
+                    None => joined.push(to),
+                }
+            }
         }
-        from
+        for to in new_nodes {
+            // 本脚本删除过的节点，内存里的关联已经不算数了。
+            if self.removed_ever.contains(to) {
+                continue;
+            }
+            let Some(node) = self.memory.node(to) else {
+                continue;
+            };
+            for from in node.related_by().map(|other| other.id()) {
+                if !self.exists(from)
+                    || self.removed_ever.contains(from)
+                    || self.related.contains_key(from)
+                {
+                    continue;
+                }
+                match new_nodes.get(from) {
+                    Some(from) => next.entry(from).or_default().push(to),
+                    None => joined.push(to),
+                }
+            }
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(id) = joined.pop() {
+            if seen.insert(id)
+                && let Some(targets) = next.get(id)
+            {
+                joined.extend(targets);
+            }
+        }
+        new_nodes
+            .iter()
+            .filter(|id| !seen.contains(id.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// 读已保存的版本。脚本前面的修改和草稿都不影响它。

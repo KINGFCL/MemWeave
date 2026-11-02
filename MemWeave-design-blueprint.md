@@ -380,7 +380,7 @@ memweave run --write my-kb -                   # 从标准输入读脚本
 | --- | --- |
 | 读 | `catalog show`、`timeline`、`show`、`links`、`evidence`、`based_by`、`related_by`、`full_source`、`check`，前面必须写 `revision` 或 `origin` |
 | 草稿 | `revision display`、`revision display-detail`、`comparison display`、`save`、`discard` |
-| 写 | `add`、`source`、`remove`、`set`、`link`、`unlink`、`base`、`unbase`、`cite`、`uncite`、`catalog create`、`catalog describe`、`catalog rename`、`catalog delete`、`catalog add`、`catalog remove`、`goal`、`step`、`log` |
+| 写 | `add`、`source`、`remove`、`set`、`append`、`link`、`unlink`、`base`、`unbase`、`cite`、`uncite`、`catalog create`、`catalog describe`、`catalog rename`、`catalog delete`、`catalog add`、`catalog remove`、`goal`、`step`、`log` |
 | 导出 | `revision export`、`origin export`：不改图，不写日志，但会写磁盘，所以只读会话不能用 |
 
 agent 不一定要从总表开始，知道地址就可以直接 `revision show`，再用 `revision links` 沿关系走。
@@ -524,9 +524,11 @@ agent 不一定要从总表开始，知道地址就可以直接 `revision show`�
 
 **没保存的脚本。** 记在 `draft.jsonl`，不等落盘：进程退出后能接上，命令行每次调用都是新进程也能接上，断电丢了也只是没保存的修改。第一行记着开始时日志里完整的行有多长，日志变长了就说明这份草稿已经保存过，只是没来得及删，所以不会重放两次。写日志写到一半崩溃时完整的行数没变，草稿还在。草稿读不出来或者接不上时不影响打开知识库，文件改名留着。
 
-**看修改的三个指令。** `revision display` 只说有没有、改了哪些，门控时读起来短；`revision display-detail` 说具体改了什么，新节点显示全部内容；`comparison display` 把已保存的版本和草稿逐项对照，只列出变了的字段，证据变了时带上原文。三个都可以只看一个节点。
+**看修改的四个指令。** `revision display` 只说有没有、改了哪些，门控时读起来短；`revision display-detail` 说具体改了什么，新节点显示全部内容；`comparison display` 把已保存的版本和草稿逐项对照，只列出变了的字段，证据变了时带上原文；`comparison display-diff` 对标题和描述逐字比较，只显示改了的字词。四个都可以只看某几个节点，用逗号分开。没改动的节点写明没有改动，写错的地址写明不存在，都不算报错：门控和检查的指令不能因为一个地址写错就拿不到结果。
 
-**门控。** 这三个指令的第一行固定是 `has_revision: true/false`，输出被截断也还在；库里是 `Memory::has_revision()`。有未保存的脚本就是 `true`，不看内容有没有差异：改了又改回去，时间线也已经变了。
+**逐字比较。** 记忆里的文字短（真实记忆的描述都是单行，中位 67 字符，最长 226 字符），所以不要代码 diff 那些行级比较和移动检测，难点是中文的字符很容易碰巧相同。用 `dissimilar`（Myers 加语义整理，Google diff-match-patch 的移植）：12 组真实改动里，改动片段一共 43 个，`similar` 的 Myers 是 73 个，而且会切成读不懂的碎片。它没有超时，完全不同的文字 60 KB 要 2.6 秒，所以去掉首尾相同的部分后超过 8 KiB 就不比较，显示两边全文。每段单独一行、内容都是 JSON 字符串，不用行内标记，记忆内容里可能就有那些符号。
+
+**门控。** 这四个指令的第一行固定是 `has_revision: true/false`，输出被截断也还在；库里是 `Memory::has_revision()`。有未保存的脚本就是 `true`，不看内容有没有差异：改了又改回去，时间线也已经变了。
 
 **限制。** 同一时间只有一份草稿，连接同一个服务的调用共用它。要支持多份并行的草稿，就得换成覆盖层。
 
@@ -642,6 +644,7 @@ agent 不一定要从总表开始，知道地址就可以直接 `revision show`�
 - 每条日志记语言版本，`format.json` 记目录格式版本。遇到更新的版本时拒绝，不会读错。
 - 升级前先用旧版本 `compact`，日志合并进快照后，就不用再重放旧语法。
 - 第 2 版语言的读语句要写版本前缀。第 1 版日志里的读语句语法上还接受，重放时本来就跳过。
+- 第 3 版加了 `append` 和 `comparison display-diff`。重放时要解析整段脚本，读语句也算，所以只加读语句也要升版本，否则旧版本会报重放失败，而不是请升级。
 - 忘了压缩时，`doctor --fix` 跳过无法重放的脚本，内容保存在备份里。
 
 ## 12. 暂不实现

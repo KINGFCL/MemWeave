@@ -101,7 +101,7 @@ const ENTRIES: [Entry; 19] = [
     Entry {
         id: "manual-write",
         title: "写入：什么该记，发现关系和结论时怎么加",
-        description: "长期有用的事实、偏好和纠正适合记，闲聊和中间过程不记。发现关系用 link，推出新结论用 add。",
+        description: "长期有用的事实、偏好和纠正适合记，闲聊和中间过程不记。发现关系用 link，推出新结论用 add，给已有节点补一句用 append。",
         text: include_str!("manual/write.md"),
         related: &[
             "manual-draft",
@@ -114,14 +114,14 @@ const ENTRIES: [Entry; 19] = [
     Entry {
         id: "manual-draft",
         title: "草稿：改完检查，再保存",
-        description: "所有修改先进草稿，save 才算保存。revision 读草稿，origin 读已保存的版本，revision display 看有没有未保存的修改，comparison display 对照差异，discard 放弃。",
+        description: "所有修改先进草稿，save 才算保存。revision 读草稿，origin 读已保存的版本，revision display 看有没有未保存的修改，comparison display 对照差异，comparison display-diff 逐字看改了哪些字，discard 放弃。",
         text: include_str!("manual/draft.md"),
         related: &["manual-repair", "manual-errors"],
     },
     Entry {
         id: "manual-write-lookup",
         title: "写之前先查，不建重复节点",
-        description: "同一件事一致就不写，要补充就 set 加 cite，矛盾按矛盾规则，只是相关就新建并关联。",
+        description: "同一件事一致就不写，要补充就 append 加 cite，矛盾按矛盾规则，只是相关就新建并关联。",
         text: include_str!("manual/write-lookup.md"),
         related: &[
             "manual-recall",
@@ -167,7 +167,7 @@ const ENTRIES: [Entry; 19] = [
     Entry {
         id: "manual-repair",
         title: "纠正记忆：和环境对不上、可能需要复查",
-        description: "和环境对不上时以环境为准，看过再更新。描述错了 set，原文错了先 cite 再 uncite。warning 只出现一次，要当场 revision show 依据它的结论并处理。没保存可以 discard，保存之后改错了就写新的修改。",
+        description: "和环境对不上时以环境为准，看过再更新。描述错了 set，要补一句 append，原文错了先 cite 再 uncite。warning 只出现一次，要当场 revision show 依据它的结论并处理。没保存可以 discard，保存之后改错了就写新的修改。",
         text: include_str!("manual/repair.md"),
         related: &[
             "manual-repair-conflict",
@@ -439,6 +439,37 @@ mod tests {
         let manual = all_raw();
         for statement in crate::lang::parser::KEYWORDS {
             assert!(manual.contains(statement), "说明书没有提到 {statement}");
+        }
+        // 一级关键字相同的指令，上面查不出来。
+        for statement in [
+            "revision display",
+            "revision display-detail",
+            "comparison display",
+            "comparison display-diff",
+            "origin show",
+        ] {
+            assert!(manual.contains(statement), "说明书没有提到 {statement}");
+        }
+        // 模型靠节点简介决定读不读，每个查看指令都要在语法说明和草稿页里。
+        for statement in ["revision display-detail", "comparison display-diff"] {
+            assert!(SPEC.contains(statement), "语法说明没有提到 {statement}");
+            let draft = raw_text(ENTRIES.iter().find(|e| e.id == "manual-draft").unwrap());
+            assert!(
+                draft.contains(statement),
+                "manual-draft 没有提到 {statement}"
+            );
+        }
+        let draft = ENTRIES.iter().find(|e| e.id == "manual-draft").unwrap();
+        assert!(draft.description.contains("comparison display-diff"));
+        // 模型写之前通常只读这几页，append 不在里面就用不上，会手抄全文。
+        for id in [
+            "manual-start",
+            "manual-write",
+            "manual-draft",
+            "manual-write-node",
+        ] {
+            let entry = ENTRIES.iter().find(|e| e.id == id).unwrap();
+            assert!(raw_text(entry).contains("append"), "{id} 没有提到 append");
         }
     }
 

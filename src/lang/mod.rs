@@ -11,6 +11,7 @@ pub mod exec;
 pub mod journal;
 pub mod lexer;
 pub mod parser;
+pub mod textdiff;
 
 use crate::manual::Manual;
 use crate::memory::{DraftScript, Memory};
@@ -45,6 +46,8 @@ revision export "路径"                    把这个版本的记忆导出成新
 revision display [节点]                   第一行 has_revision 说明有没有未保存的修改，后面列出改了哪些，不带内容
 revision display-detail [节点]            看具体改了什么，新节点显示全部内容
 comparison display [节点]                 已保存的版本和草稿逐项对照，只列出变了的字段
+comparison display-diff [节点]            和上面一样，但标题和描述逐字比较，只显示改了的字词
+这四条后面的节点可以用逗号写多个。没改过的节点写明没有改动，地址写错的写明不存在，都不算报错。
 save                                      保存所有修改。可以单独执行，也可以写在脚本最后一行
 discard                                   放弃所有未保存的修改，要单独执行
 
@@ -77,6 +80,7 @@ link 甲 -> 乙
 unlink 甲 -> 乙
 set 节点 title "新标题"
 set 节点 desc """新描述"""
+append 节点 desc """要补的内容"""          在描述末尾补一段，不用重写全文。只想补充时用它，手抄全文容易抄漏
 base 结论 on 依据
 unbase 结论 on 依据
 cite 节点 text """原文"""                  存一段新原文，并让节点引用它
@@ -108,7 +112,7 @@ log """做了什么"""                         记下记忆之外的行为，比
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
 - 没 save 的修改不算数。结果里出现 revision: N 段脚本未保存 时，做完就 save，不要了就 discard。
 - 还有结论依据某个节点时不能删除它。先用 base 和 unbase 给这些结论换依据，或者先删除它们，可以写在同一段脚本里。
-- 修改描述或原文引用后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
+- 修改或补充描述、改原文引用后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
 - 原文说错或过时了：写一段脚本，用 cite 引用新原文，uncite 去掉旧的，需要时用 set 改描述。原文本身不可变，节点至少要留一条证据。
 - 删除节点或减少关联后，可能有节点走不到了，用 revision check 确认。
 - export 的目标必须不存在或是空目录，不会覆盖。有节点走不到时会拒绝导出并列出它们，接入或删除后再导出。
@@ -252,6 +256,11 @@ impl<'a> Session<'a> {
                 };
             }
             self.memory.begin_draft();
+            // 执行前就记下：脚本里的 revision display 要把它自己算进去。执行失败时整份草稿都会撤销。
+            self.memory.note_draft_script(DraftScript {
+                script: script.to_owned(),
+                at,
+            });
         }
 
         let report = exec::execute(body, self.memory, self.sources, self.manual, at);
@@ -282,13 +291,6 @@ impl<'a> Session<'a> {
                 };
             }
         };
-        if writes {
-            self.memory.note_draft_script(DraftScript {
-                script: script.to_owned(),
-                at,
-            });
-        }
-
         let mut text = limit_report(&report, body, self.output_limit);
         let mut ok = report.failures == 0;
         if !ok {

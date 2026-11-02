@@ -8,7 +8,7 @@ use super::ast::{
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-pub(crate) const KEYWORDS: [&str; 28] = [
+pub(crate) const KEYWORDS: [&str; 29] = [
     "revision",
     "origin",
     "comparison",
@@ -29,6 +29,7 @@ pub(crate) const KEYWORDS: [&str; 28] = [
     "link",
     "unlink",
     "set",
+    "append",
     "base",
     "unbase",
     "cite",
@@ -155,8 +156,14 @@ impl Parser {
             "revision" => self.versioned(token, Version::Revision)?,
             "origin" => self.versioned(token, Version::Origin)?,
             "comparison" => {
-                self.command(token, "comparison", &["display"])?;
-                self.revision_display(RevisionView::Comparison)?
+                let view = match self
+                    .command(token, "comparison", &["display", "display-diff"])?
+                    .as_str()
+                {
+                    "display" => RevisionView::Comparison,
+                    _ => RevisionView::ComparisonDiff,
+                };
+                self.revision_display(view)?
             }
             "save" => Statement::Save,
             "discard" => Statement::Discard,
@@ -173,6 +180,7 @@ impl Parser {
                 Statement::Unlink { from, to }
             }
             "set" => self.set()?,
+            "append" => self.append()?,
             "base" => {
                 let (id, on) = self.on()?;
                 Statement::Base { id, on }
@@ -274,13 +282,13 @@ impl Parser {
         Ok(Statement::Versioned(version, Box::new(statement)))
     }
 
-    /// 看未保存的修改的语句，后面可以写一个节点。
+    /// 看未保存的修改的语句，后面可以写几个节点，用逗号分开。
     fn revision_display(&mut self, view: RevisionView) -> Result<Statement, Skip> {
-        let node = match self.peek_word() {
-            Some(_) => Some(self.name("节点地址")?),
-            None => None,
+        let nodes = match self.peek_word() {
+            Some(_) => self.names()?,
+            None => Vec::new(),
         };
-        Ok(Statement::RevisionDisplay { view, node })
+        Ok(Statement::RevisionDisplay { view, nodes })
     }
 
     /// 取出 `keyword` 后面的操作名。
@@ -716,6 +724,21 @@ impl Parser {
         Ok(Statement::Set {
             id,
             field,
+            value,
+            value_span,
+        })
+    }
+
+    fn append(&mut self) -> Result<Statement, Skip> {
+        let id = self.name("节点地址")?;
+        self.expect_word(
+            "desc",
+            "append 只能补描述，写法：append 节点 desc \"\"\"要补的内容\"\"\"。标题用 set 改",
+        )?;
+        let value_span = self.current_span();
+        let value = self.text()?;
+        Ok(Statement::Append {
+            id,
             value,
             value_span,
         })
