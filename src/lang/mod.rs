@@ -42,7 +42,9 @@ revision timeline [limit N] [offset N] [node 节点] 时间线，从新到旧。
 revision export "路径"                    把这个版本的记忆导出成新的知识库目录，只带节点引用到的原文
 
 草稿：
-revision display [节点]                   第一行 has_revision 说明有没有未保存的修改，后面是和已保存版本的差异
+revision display [节点]                   第一行 has_revision 说明有没有未保存的修改，后面列出改了哪些，不带内容
+revision display-detail [节点]            看具体改了什么，新节点显示全部内容
+comparison display [节点]                 已保存的版本和草稿逐项对照，只列出变了的字段
 save                                      保存所有修改。可以单独执行，也可以写在脚本最后一行
 discard                                   放弃所有未保存的修改，要单独执行
 
@@ -99,7 +101,7 @@ log """做了什么"""                         记下记忆之外的行为，比
 规则：
 - add 必须有 title、desc、based_on。
 - source 必须有 title、desc，至少一段原文。要记下对话或工具结果里的新内容，就用它。
-- 新节点必须能被找到：在同一段脚本里写 related_by、link 某节点 -> 它，或者 catalog add 它 to "板块"。
+- 新节点必须能被找到：save 之前写 related_by、link 某节点 -> 它，或者 catalog add 它 to "板块"。可以分几段脚本写完，没接入时不能保存。
 - 总表由你维护。它是目录，不是索引：每个领域只放几个代表节点，其他节点靠 related 到达。
 - 节点地址只能包含字母、数字、- 和 _，不能修改。manual- 开头的地址留给内置说明，只能读。
 - 证据不能形成循环。

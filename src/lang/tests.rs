@@ -588,7 +588,7 @@ fn add_is_checked_like_a_compiler() {
         ),
         (
             "E208",
-            format!("add n\n title \"t\"\n desc \"d\"\n source {source} 0..3\nend"),
+            format!("add n\n title \"t\"\n desc \"d\"\n source {source} 0..3\nend\nsave"),
         ),
         (
             "E209",
@@ -759,7 +759,7 @@ fn hand_repaired_scripts_succeed_after_errors() {
 
     let second = write(
         &mut memory,
-        "add new\n  title \"t\"\n  desc \"d\"\n  based_on ownershp\nend",
+        "add new\n  title \"t\"\n  desc \"d\"\n  based_on ownershp\nend\nsave",
     );
     assert!(
         second.text.contains("你是不是想写 ownership？"),
@@ -1209,7 +1209,10 @@ fn source_is_checked_like_a_compiler_and_writes_nothing_on_error() {
             "E206",
             "source n\n text \"x\"\n related_by entry\nend".to_owned(),
         ),
-        ("E208", format!("source n\n {body}\n text \"新原文\"\nend")),
+        (
+            "E208",
+            format!("source n\n {body}\n text \"新原文\"\nend\nsave"),
+        ),
         (
             "E205",
             format!("source entry\n {body}\n text \"新原文\"\n related_by entry\nend"),
@@ -1557,13 +1560,17 @@ fn catalog_checks_see_earlier_statements() {
 }
 
 #[test]
-fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
+fn new_nodes_must_be_reachable_when_saved() {
     let (_dir, store) = file_store();
     let mut memory = memory();
     let body = "title \"t\"\n desc \"d\"\n text \"原文\"";
 
     // 没有任何路可达。
-    let output = run_with(&mut memory, &store, &format!("source a\n {body}\nend"));
+    let output = run_with(
+        &mut memory,
+        &store,
+        &format!("source a\n {body}\nend\nsave"),
+    );
     assert!(output.text.contains("error[E208]"), "{}", output.text);
 
     // 后面的语句接入也可以，三种写法都行。
@@ -1578,7 +1585,7 @@ fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
         let output = run_with(
             &mut memory,
             &store,
-            &format!("source {id}\n {body}\nend\n{join}"),
+            &format!("source {id}\n {body}\nend\n{join}\nsave"),
         );
         assert!(output.ok, "{}", output.text);
         assert!(memory.unreachable().is_empty(), "{id}");
@@ -1588,21 +1595,23 @@ fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
     let output = run_with(
         &mut memory,
         &store,
-        &format!("source 丁\n {body}\nend\nlink entry -> 丁\nunlink entry -> 丁"),
+        &format!("source 丁\n {body}\nend\nlink entry -> 丁\nunlink entry -> 丁\nsave"),
     );
     assert!(output.text.contains("error[E208]"), "{}", output.text);
     // 只有自己关联自己也不算。
     let output = run_with(
         &mut memory,
         &store,
-        &format!("source 戊\n {body}\n related 戊\nend"),
+        &format!("source 戊\n {body}\n related 戊\nend\nsave"),
     );
     assert!(output.text.contains("error[E208]"), "{}", output.text);
     // 新节点只是互相关联，也不算接入。
     let output = run_with(
         &mut memory,
         &store,
-        &format!("source 庚\n {body}\nend\nsource 辛\n {body}\n related 庚\nend\nlink 庚 -> 辛"),
+        &format!(
+            "source 庚\n {body}\nend\nsource 辛\n {body}\n related 庚\nend\nlink 庚 -> 辛\nsave"
+        ),
     );
     assert!(
         output.text.contains("从总表到达不了节点 庚"),
@@ -1619,7 +1628,7 @@ fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
         &mut memory,
         &store,
         &format!(
-            "source 壬\n {body}\nend\nsource 癸\n {body}\n related 壬\n related_by entry\nend"
+            "source 壬\n {body}\nend\nsource 癸\n {body}\n related 壬\n related_by entry\nend\nsave"
         ),
     );
     assert!(output.ok, "{}", output.text);
@@ -1627,7 +1636,7 @@ fn new_nodes_must_be_reachable_by_the_end_of_the_script() {
     let output = run_with(
         &mut memory,
         &store,
-        &format!("source 己\n {body}\nend\nremove 己"),
+        &format!("source 己\n {body}\nend\nremove 己\nsave"),
     );
     assert!(output.ok, "{}", output.text);
 }
@@ -1638,7 +1647,7 @@ fn a_duplicate_address_only_reports_that_it_exists() {
     let new = "add n\n title \"t\"\n desc \"d\"\n based_on ownership\nend\n";
 
     // 第二次写同一个地址：只报重复，也不能让到达检查停不下来。
-    let text = fails(&mut memory, &format!("{new}{new}"), "E205");
+    let text = fails(&mut memory, &format!("{new}{new}save"), "E205");
     assert_eq!(text.matches("从总表到达不了节点 n").count(), 1, "{text}");
 
     let text = fails(
@@ -3460,48 +3469,291 @@ fn a_node_only_in_the_draft_is_missing_from_the_origin() {
     assert!(output.text.contains("error[E201]"), "{}", output.text);
 }
 
-#[test]
-fn revision_display_says_plainly_whether_anything_is_unsaved() {
+/// 一份有各种改动的草稿：改节点、加节点、删节点、改总表、改工作板，还分成了两段脚本。
+fn memory_with_a_varied_draft() -> Memory {
     let mut live = memory();
-    let output = read(&mut live, "revision display");
-    assert_eq!(output.text, "has_revision: false\n");
-
     ok(
         &mut live,
-        "set entry desc \"\"\"新描述\"\"\"\nlink entry -> borrowing\nremove conclusion\ncatalog create \"乙\" desc \"\"\"描述\"\"\"",
+        "set entry desc \"\"\"新描述\"\"\"\nlink entry -> borrowing\nremove conclusion\ncatalog create \"乙\" desc \"\"\"乙的描述\"\"\"\ncatalog describe \"Rust\" \"\"\"新的板块描述\"\"\"",
     );
-    ok(&mut live, "log \"\"\"第二段\"\"\"");
-    let output = read(&mut live, "revision display");
-    assert!(output.ok);
-    let text = output.text;
-    assert!(
-        text.starts_with("has_revision: true\nscripts: 2\n"),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "~ entry\n  desc: \"描述entry\" -> \"新描述\"\n  related: +borrowing -conclusion"
+    ok(
+        &mut live,
+        &format!(
+            "source 新节点\n title \"新标题\"\n desc \"\"\"新内容\"\"\"\n source {} 0..3\n related ownership\n related_by entry\nend\ngoal create 目标 \"目标标题\"\n desc \"\"\"目标描述\"\"\"\n step \"一\"\nend\nlog \"\"\"第二段\"\"\"",
+            source()
         ),
+    );
+    live
+}
+
+#[test]
+fn the_three_views_all_start_with_the_flag() {
+    let mut live = memory();
+    for script in [
+        "revision display",
+        "revision display-detail",
+        "comparison display",
+        "revision display entry",
+        "revision display-detail entry",
+        "comparison display entry",
+    ] {
+        assert_eq!(
+            read(&mut live, script).text,
+            "has_revision: false\n",
+            "{script}"
+        );
+    }
+    let mut live = memory_with_a_varied_draft();
+    for script in [
+        "revision display",
+        "revision display-detail",
+        "comparison display",
+        "revision display ownership",
+        "revision display-detail ownership",
+        "comparison display ownership",
+    ] {
+        let output = read(&mut live, script);
+        assert!(output.ok, "{script}：{}", output.text);
+        assert!(
+            output.text.starts_with("has_revision: true\nscripts: 2\n"),
+            "{script}：{}",
+            output.text
+        );
+    }
+    ok(&mut live, "save");
+    assert_eq!(
+        read(&mut live, "comparison display").text,
+        "has_revision: false\n"
+    );
+}
+
+#[test]
+fn revision_display_lists_what_changed_without_the_content() {
+    let mut live = memory_with_a_varied_draft();
+    let text = read(&mut live, "revision display").text;
+    assert!(text.contains("~ entry: desc, related\n"), "{text}");
+    assert!(text.contains("+ 新节点 \"新标题\"\n"), "{text}");
+    assert!(text.contains("- conclusion \"标题conclusion\"\n"), "{text}");
+    assert!(text.contains("+ section \"乙\"\n"), "{text}");
+    assert!(text.contains("~ section \"Rust\": desc\n"), "{text}");
+    assert!(text.contains("+ goal 目标\n"), "{text}");
+    assert!(text.contains("修改记录"), "{text}");
+    assert!(text.contains("log 第二段"), "{text}");
+    // 内容不在这里。
+    for content in [
+        "新描述",
+        "新内容",
+        "乙的描述",
+        "目标描述",
+        "desc:",
+        "一段原文",
+    ] {
+        assert!(!text.contains(content), "{content}：{text}");
+    }
+    // 只有反向列表变了的节点不算。
+    assert!(!text.contains("~ borrowing"), "{text}");
+    assert!(!text.contains("~ ownership"), "{text}");
+
+    let text = read(&mut live, "revision display entry").text;
+    assert_eq!(
+        text,
+        "has_revision: true\nscripts: 2\n~ entry: desc, related\n"
+    );
+    let text = read(&mut live, "revision display ownership").text;
+    assert_eq!(text, "has_revision: true\nscripts: 2\nownership 没有改动\n");
+}
+
+#[test]
+fn revision_display_detail_says_what_changed() {
+    let mut live = memory_with_a_varied_draft();
+    let text = read(&mut live, "revision display-detail").text;
+    assert!(
+        text.contains("~ entry\n  desc: \"描述entry\" -> \"新描述\"\n  related: +borrowing +新节点 -conclusion"),
         "{text}"
     );
     assert!(text.contains("- conclusion"), "{text}");
     assert!(text.contains("+ section \"乙\""), "{text}");
     assert!(text.contains("修改记录"), "{text}");
-    assert!(text.contains("log 第二段"), "{text}");
-    // 只有反向列表变了的节点不算。
     assert!(!text.contains("~ borrowing"), "{text}");
 
-    let text = read(&mut live, "revision display entry").text;
-    assert!(text.contains("~ entry"), "{text}");
-    assert!(!text.contains("- conclusion"), "{text}");
-    let text = read(&mut live, "revision display ownership").text;
-    assert!(text.contains("ownership 没有改动"), "{text}");
+    let show = read(&mut live, "revision show 新节点").text;
+    let shown = show.strip_prefix("node 新节点\n").unwrap();
+    assert!(text.contains(&format!("+ 新节点\n{shown}")), "{text}");
+    assert!(text.contains("related_by: entry"), "{text}");
+    let only = read(&mut live, "revision display-detail 新节点").text;
+    assert!(only.contains(&format!("+ 新节点\n{shown}")), "{only}");
+    assert!(!only.contains("~ entry"), "{only}");
+}
 
-    ok(&mut live, "save");
-    assert_eq!(
-        read(&mut live, "revision display").text,
-        "has_revision: false\n"
+#[test]
+fn comparison_display_puts_the_two_versions_side_by_side() {
+    let mut live = memory_with_a_varied_draft();
+    let text = read(&mut live, "comparison display").text;
+    assert!(
+        text.contains("~ entry\n  desc\n    origin:   \"描述entry\"\n    revision: \"新描述\"\n  related\n    origin:   ownership, conclusion\n    revision: ownership, borrowing, 新节点\n"),
+        "{text}"
     );
+    // 没变的字段不显示。
+    let entry = text
+        .split("~ entry\n")
+        .nth(1)
+        .unwrap()
+        .split("\n+ ")
+        .next()
+        .unwrap();
+    assert!(!entry.contains("title"), "{entry}");
+    assert!(!entry.contains("evidence"), "{entry}");
+
+    assert!(
+        text.contains(&format!(
+            "+ 新节点\n  origin:   没有这个节点\n  revision:\n    title: \"新标题\"\n    desc: \"新内容\"\n    related: ownership\n    source: {} 0..3: \"一\"\n",
+            source()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("- conclusion\n  origin:\n    title: \"标题conclusion\"\n    desc: \"描述conclusion\"\n    related: 无\n    based_on: ownership\n  revision: 已删除\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("+ section \"乙\"\n  origin:   没有这个板块\n  revision:\n    desc: \"乙的描述\"\n    代表: 无\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "~ section \"Rust\"\n  desc\n    origin:   \"\"\n    revision: \"新的板块描述\"\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "+ goal 目标\n  origin:   没有这个目标\n  revision:\n    goal 目标 \"目标标题\"\n"
+        ),
+        "{text}"
+    );
+    // 修改记录归 revision display。
+    assert!(!text.contains("修改记录"), "{text}");
+    assert!(!text.contains("~ borrowing"), "{text}");
+
+    let text = read(&mut live, "comparison display 新节点").text;
+    assert!(text.contains("+ 新节点"), "{text}");
+    assert!(!text.contains("~ entry"), "{text}");
+    let text = read(&mut live, "comparison display ownership").text;
+    assert!(text.contains("ownership 没有改动"), "{text}");
+}
+
+#[test]
+fn comparison_display_shows_the_source_text_when_citations_change() {
+    let dir = TempDir::new().unwrap();
+    let store = crate::source::file::FileSources::new(dir.path());
+    store.put(TEXT.as_bytes()).unwrap();
+    let mut live = memory();
+    let script = format!(
+        "cite entry text \"\"\"新的原文\"\"\"\nuncite entry source {} 0..3",
+        source()
+    );
+    assert!(run_saved(&mut live, &store, &dir, &script).ok);
+    let output = Session::new(&mut live, &store, Mode::ReadOnly).run("comparison display");
+    assert!(output.ok, "{}", output.text);
+    let new_source = source_id("新的原文".as_bytes());
+    assert!(
+        output.text.contains(&format!(
+            "~ entry\n  evidence\n    origin:\n      source: {} 0..3: \"一\"\n    revision:\n      source: {new_source} 0..12: \"新的原文\"\n",
+            source()
+        )),
+        "{}",
+        output.text
+    );
+    // 其他两种只说变了。
+    let output = Session::new(&mut live, &store, Mode::ReadOnly).run("revision display");
+    assert!(
+        output.text.contains("~ entry: evidence\n"),
+        "{}",
+        output.text
+    );
+}
+
+#[test]
+fn a_draft_with_only_a_log_says_nothing_else_changed() {
+    let mut live = memory();
+    ok(&mut live, "log \"\"\"只记了一下\"\"\"");
+    let text = read(&mut live, "comparison display").text;
+    assert!(text.starts_with("has_revision: true"), "{text}");
+    assert!(text.contains("都没有变化"), "{text}");
+    assert!(
+        read(&mut live, "revision display")
+            .text
+            .contains("只记了一下")
+    );
+}
+
+#[test]
+fn a_change_made_and_undone_does_not_show_but_the_flag_stays() {
+    let mut live = memory();
+    ok(&mut live, "set entry title \"改了\"");
+    ok(&mut live, "set entry title \"标题entry\"");
+    for script in [
+        "revision display",
+        "revision display-detail",
+        "comparison display",
+    ] {
+        let text = read(&mut live, script).text;
+        assert!(text.starts_with("has_revision: true"), "{text}");
+        assert!(!text.contains("~ entry"), "{script}：{text}");
+    }
+}
+
+#[test]
+fn a_lost_source_does_not_hide_the_rest_of_the_views() {
+    let mut live = memory();
+    ok(
+        &mut live,
+        &format!(
+            "source 新节点\n title \"新标题\"\n desc \"\"\"新内容\"\"\"\n source {} 0..3\n related_by entry\nend",
+            source()
+        ),
+    );
+    let empty = InMemorySources::new();
+    for script in ["revision display-detail", "comparison display"] {
+        let output = Session::new(&mut live, &empty, Mode::ReadOnly).run(script);
+        assert!(!output.ok, "{script}：{}", output.text);
+        assert!(
+            output.text.starts_with("has_revision: true"),
+            "{}",
+            output.text
+        );
+        assert!(output.text.contains("新内容"), "{}", output.text);
+        assert!(output.text.contains("error[E901]"), "{}", output.text);
+    }
+    assert!(
+        Session::new(&mut live, &empty, Mode::ReadOnly)
+            .run("revision display")
+            .ok
+    );
+}
+
+#[test]
+fn the_views_are_read_only_and_checked_like_other_statements() {
+    let mut live = memory_with_a_varied_draft();
+    let before = snapshot(&live);
+    for script in [
+        "revision display",
+        "revision display-detail",
+        "comparison display",
+    ] {
+        assert!(read(&mut live, script).ok);
+        assert_eq!(snapshot(&live), before, "{script}");
+    }
+    fails(&mut live, "comparison", "E102");
+    fails(&mut live, "comparison show", "E101");
+    fails(&mut live, "revision display entry entry", "E106");
+    fails(&mut live, "origin display-detail", "E101");
+    // 写脚本里也能用，看到的是前面语句生效之后的结果。
+    let text = ok(
+        &mut live,
+        "set ownership title \"又改了\"\ncomparison display ownership",
+    );
+    assert!(text.contains("revision: \"又改了\""), "{text}");
 }
 
 #[test]
@@ -3514,14 +3766,14 @@ fn the_flag_survives_truncated_output() {
     );
     let output = Session::new(&mut live, &store, Mode::ReadOnly)
         .with_output_limit(60)
-        .run("revision display");
+        .run("comparison display");
     assert!(
         output.text.starts_with("has_revision: true"),
         "{}",
         output.text
     );
     assert!(
-        output.text.contains("revision display 节点"),
+        output.text.contains("comparison display 节点"),
         "{}",
         output.text
     );
@@ -3654,6 +3906,21 @@ fn the_read_only_session_can_look_but_not_save() {
     assert!(live.has_revision());
 }
 
+/// 模型看到“会话是只读的”时，以为改不了就放弃了。报错要说清楚该换什么。
+#[test]
+fn writing_through_the_read_tool_says_which_tool_to_use() {
+    let mut live = memory();
+    let output = read(&mut live, "set entry title \"x\"");
+    assert!(output.text.contains("error[E301]"), "{}", output.text);
+    assert!(output.text.contains("memory_write"), "{}", output.text);
+    assert!(
+        output.text.contains("memweave run --write"),
+        "{}",
+        output.text
+    );
+    assert!(!live.has_revision());
+}
+
 #[test]
 fn each_version_exports_itself() {
     let dir = TempDir::new().unwrap();
@@ -3770,19 +4037,242 @@ fn a_save_cut_off_midway_keeps_the_draft_and_counts_for_nothing() {
 
 #[test]
 fn scripts_saved_together_replay_one_by_one() {
-    // 拼成一段脚本会报 E208：新节点要在脚本结束时走得到，而第二段删掉了它的入口。
+    // 第一段的新节点这时还走不到，第二段才接上。重放时也要能通过。
     let dir = TempDir::new().unwrap();
     let store = sources();
     let mut live = memory();
-    let first = format!(
-        "source 甲\n title \"t\"\n desc \"\"\"d\"\"\"\n source {} 0..3\n related_by borrowing\nend",
-        source()
-    );
-    assert!(run_saved(&mut live, &store, &dir, &first).ok);
-    let output = run_saved(&mut live, &store, &dir, "remove borrowing\nsave");
+    assert!(run_saved(&mut live, &store, &dir, &new_source_node("甲")).ok);
+    let output = run_saved(&mut live, &store, &dir, "link entry -> 甲\nsave");
     assert!(output.ok, "{}", output.text);
+    assert_eq!(journal_lines(&dir), 1);
     let restarted = restart(&store, &dir);
     assert_eq!(snapshot(&restarted).0, snapshot(&live).0);
+}
+
+/// 一个新节点，还没有接到图上。
+fn new_source_node(id: &str) -> String {
+    format!(
+        "source {id}\n title \"t\"\n desc \"\"\"d\"\"\"\n source {} 0..3\nend",
+        source()
+    )
+}
+
+#[test]
+fn a_new_node_can_wait_until_save_to_be_connected() {
+    let dir = TempDir::new().unwrap();
+    let store = sources();
+    let mut live = memory();
+
+    // 没接入也能进草稿，读得到，check 会列出它。
+    let output = run_saved(&mut live, &store, &dir, &new_source_node("甲"));
+    assert!(output.ok, "{}", output.text);
+    assert!(read(&mut live, "revision show 甲").ok);
+    let text = read(&mut live, "revision check").text;
+    assert!(text.contains("从总表到达不了 甲"), "{text}");
+    assert!(read(&mut live, "origin check").text.contains("没有问题"));
+
+    // 这时不能保存，草稿不变，日志也不变。
+    let before = snapshot(&live);
+    let output = run_saved(&mut live, &store, &dir, "save");
+    assert!(!output.ok);
+    assert!(output.text.contains("error[E208]"), "{}", output.text);
+    assert!(
+        output.text.contains("从总表到达不了节点 甲"),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("没有执行任何语句"), "{}", output.text);
+    assert_eq!(snapshot(&live), before);
+    assert_eq!(journal_lines(&dir), 0);
+    assert!(live.has_revision());
+
+    // 接上之后能保存。
+    assert!(run_saved(&mut live, &store, &dir, "link ownership -> 甲").ok);
+    let output = run_saved(&mut live, &store, &dir, "save");
+    assert!(output.ok, "{}", output.text);
+    assert!(output.text.contains("saved 2 段脚本"), "{}", output.text);
+    let restarted = restart(&store, &dir);
+    assert!(restarted.unreachable().is_empty());
+    assert_eq!(snapshot(&restarted).0, snapshot(&live).0);
+}
+
+#[test]
+fn saving_refuses_a_new_node_whose_way_in_was_removed_later() {
+    let mut live = memory();
+    let script = new_source_node("甲").replace("\nend", "\n related_by borrowing\nend");
+    ok(&mut live, &script);
+    ok(&mut live, "remove borrowing");
+    let text = fails(&mut live, "save", "E208");
+    assert!(text.contains("从总表到达不了节点 甲"), "{text}");
+    // 不要它了，删掉就能保存。
+    ok(&mut live, "remove 甲");
+    assert!(ok(&mut live, "save").contains("saved 3 段脚本"));
+}
+
+#[test]
+fn a_node_that_was_already_unreachable_does_not_block_saving() {
+    // 已有节点是否可达归 check 管：新节点挂在它下面也能保存，check 会把两个都列出来。
+    let mut live = memory();
+    ok(&mut live, "unlink ownership -> borrowing\nsave");
+    assert_eq!(live.unreachable(), ["borrowing"]);
+    assert!(ok(&mut live, "set entry title \"新标题\"\nsave").contains("saved"));
+    let script = new_source_node("甲").replace("\nend", "\n related_by borrowing\nend\nsave");
+    assert!(ok(&mut live, &script).contains("saved"));
+    let text = ok(&mut live, "revision check");
+    assert!(text.contains("从总表到达不了 borrowing"), "{text}");
+    assert!(text.contains("从总表到达不了 甲"), "{text}");
+}
+
+#[test]
+fn saving_reports_every_new_node_that_is_not_connected() {
+    let mut live = memory();
+    ok(&mut live, &new_source_node("甲"));
+    let script = format!("{}\nsave", new_source_node("乙"));
+    let text = fails(&mut live, &script, "E208");
+    assert!(text.contains("从总表到达不了节点 甲"), "{text}");
+    assert!(text.contains("从总表到达不了节点 乙"), "{text}");
+    // 这段脚本里建的指向那一行，之前脚本里建的指向 save。
+    assert!(text.contains("source 乙"), "{text}");
+    assert!(text.contains("| save"), "{text}");
+    // 新节点互相关联不算接入。
+    ok(&mut live, "discard");
+    ok(&mut live, &new_source_node("甲"));
+    ok(&mut live, &new_source_node("乙"));
+    ok(&mut live, "link 甲 -> 乙\nlink 乙 -> 甲");
+    let text = fails(&mut live, "save", "E208");
+    assert!(
+        text.contains("节点 甲") && text.contains("节点 乙"),
+        "{text}"
+    );
+}
+
+/// 保存时的检查只看新节点上面的那几层，这里和从头走一遍的结果对照：从代表和所有已有节点出发，
+/// 走不到的新节点就是没接入的。能保存，就一定没有这样的节点；被 E208 拒绝，就一定有。
+#[test]
+fn the_save_check_agrees_with_walking_the_whole_graph() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |limit: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as usize % limit
+    };
+    let (mut saved, mut refused) = (0, 0);
+    for round in 0..600 {
+        let mut live = memory();
+        let mut ids: Vec<String> = ["entry", "ownership", "borrowing", "conclusion"]
+            .map(str::to_owned)
+            .to_vec();
+        for step in 0..(round % 12 + 1) {
+            let (a, b) = (ids[next(ids.len())].clone(), ids[next(ids.len())].clone());
+            let line = match next(6) {
+                0 | 1 => {
+                    let id = format!("n{step}");
+                    ids.push(id.clone());
+                    // 一半直接接到别的节点上，一半先不接。
+                    let node = new_source_node(&id);
+                    if next(2) == 0 {
+                        node.replace("\nend", &format!("\n related_by {a}\nend"))
+                    } else {
+                        node
+                    }
+                }
+                2 | 3 => format!("link {a} -> {b}"),
+                4 => format!("unlink {a} -> {b}"),
+                _ => format!("remove {a}"),
+            };
+            // 有些语句不合法，比如重复的关联，跳过它们就好。
+            let output = write(&mut live, &line);
+            if line.starts_with("remove") && output.ok {
+                ids.retain(|id| *id != a);
+            }
+            if !output.ok && line.starts_with("source") {
+                ids.pop();
+            }
+            if ids.is_empty() {
+                break;
+            }
+        }
+        // 这段脚本里的新节点也要算：有时带上一个新节点再保存。
+        let extra = match next(3) {
+            0 => new_source_node("last"),
+            1 if ids.iter().any(|id| id == "entry") => {
+                new_source_node("last").replace("\nend", "\n related_by entry\nend")
+            }
+            _ => String::new(),
+        };
+
+        // 先在另一份上执行一遍，算出正确答案。
+        let mut answer = memory();
+        let scripts: Vec<String> = live
+            .draft_scripts()
+            .iter()
+            .map(|part| part.script.clone())
+            .collect();
+        for part in &scripts {
+            assert!(write(&mut answer, part).ok);
+        }
+        if !extra.is_empty() {
+            assert!(write(&mut answer, &extra).ok);
+        }
+        let new_nodes = answer.draft_new_nodes();
+        let mut pending: Vec<String> = answer
+            .catalog()
+            .sections
+            .iter()
+            .flat_map(|section| section.nodes.iter().map(|entry| entry.id.clone()))
+            .chain(
+                answer
+                    .nodes()
+                    .map(|node| node.id().to_owned())
+                    .filter(|id| !new_nodes.contains(id)),
+            )
+            .collect();
+        let mut reached = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if reached.insert(id.clone())
+                && let Some(node) = answer.node(&id)
+            {
+                pending.extend(node.related().map(|other| other.id().to_owned()));
+            }
+        }
+        let expect_refused = new_nodes.iter().any(|id| !reached.contains(id));
+
+        let attempt = if extra.is_empty() {
+            "save".to_owned()
+        } else {
+            format!("{extra}\nsave")
+        };
+        let output = write(&mut live, &attempt);
+        assert_eq!(
+            !output.ok && output.text.contains("error[E208]"),
+            expect_refused,
+            "新节点 {new_nodes:?}，走到了 {reached:?}\n{scripts:?}\n{}",
+            output.text
+        );
+        if expect_refused {
+            refused += 1;
+        } else {
+            assert!(output.ok, "{}", output.text);
+            saved += 1;
+        }
+    }
+    assert!(saved > 100 && refused > 100, "保存 {saved}，拒绝 {refused}");
+}
+
+#[test]
+fn a_restarted_draft_keeps_its_unconnected_node() {
+    let dir = TempDir::new().unwrap();
+    let store = sources();
+    let mut live = memory();
+    assert!(run_saved(&mut live, &store, &dir, &new_source_node("甲")).ok);
+    let mut restarted = restart(&store, &dir);
+    assert!(restarted.has_revision());
+    assert!(read(&mut restarted, "revision show 甲").ok);
+    let output = run_saved(&mut restarted, &store, &dir, "save");
+    assert!(output.text.contains("error[E208]"), "{}", output.text);
+    assert!(run_saved(&mut restarted, &store, &dir, "link entry -> 甲\nsave").ok);
+    assert!(!restart(&store, &dir).has_revision());
 }
 
 #[test]
@@ -3860,6 +4350,26 @@ fn old_journal_lines_still_replay() {
     let restarted = restart(&store, &dir);
     assert_eq!(restarted.node("entry").unwrap().title(), "旧日志");
     assert!(!restarted.has_revision());
+}
+
+/// 旧版本遇到新日志要说“请升级”，不能说日志坏了。它要求每行都有 `script`，所以多段的行也要写。
+#[test]
+fn lines_saved_together_still_look_readable_to_old_versions() {
+    #[derive(serde::Deserialize)]
+    struct OldEntry {
+        #[allow(dead_code)]
+        script: String,
+        v: Option<u32>,
+    }
+    let dir = TempDir::new().unwrap();
+    let store = sources();
+    let mut live = memory();
+    assert!(run_saved(&mut live, &store, &dir, "log \"\"\"一\"\"\"").ok);
+    assert!(run_saved(&mut live, &store, &dir, "log \"\"\"二\"\"\"\nsave").ok);
+    let line = fs::read_to_string(dir.path().join("journal.jsonl")).unwrap();
+    assert!(line.contains("\"scripts\""), "{line}");
+    let old: OldEntry = serde_json::from_str(&line).unwrap();
+    assert_eq!(old.v, Some(journal::LANGUAGE_VERSION));
 }
 
 #[test]

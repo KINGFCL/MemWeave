@@ -2,13 +2,16 @@
 
 use crate::board::BoardOp;
 
-use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Statement, Version};
+use super::ast::{
+    AddNode, Citation, Field, Label, Located, Name, RevisionView, SourceRef, Statement, Version,
+};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-pub(crate) const KEYWORDS: [&str; 27] = [
+pub(crate) const KEYWORDS: [&str; 28] = [
     "revision",
     "origin",
+    "comparison",
     "save",
     "discard",
     "catalog",
@@ -151,6 +154,10 @@ impl Parser {
         let statement = match keyword.as_str() {
             "revision" => self.versioned(token, Version::Revision)?,
             "origin" => self.versioned(token, Version::Origin)?,
+            "comparison" => {
+                self.command(token, "comparison", &["display"])?;
+                self.revision_display(RevisionView::Comparison)?
+            }
             "save" => Statement::Save,
             "discard" => Statement::Discard,
             "catalog" => self.catalog(token)?,
@@ -235,13 +242,16 @@ impl Parser {
             );
         };
         let command = word_of(&token);
-        if version == Version::Revision && command == "display" {
-            self.position += 1;
-            let node = match self.peek_word() {
-                Some(_) => Some(self.name("节点地址")?),
-                None => None,
+        if version == Version::Revision {
+            let view = match command.as_str() {
+                "display" => Some(RevisionView::Brief),
+                "display-detail" => Some(RevisionView::Detail),
+                _ => None,
             };
-            return Ok(Statement::RevisionDisplay(node));
+            if let Some(view) = view {
+                self.position += 1;
+                return self.revision_display(view);
+            }
         }
         let statement = if command == "catalog" {
             self.position += 1;
@@ -262,6 +272,15 @@ impl Parser {
             extra.statement = Statement::Versioned(version, Box::new(bare));
         }
         Ok(Statement::Versioned(version, Box::new(statement)))
+    }
+
+    /// 看未保存的修改的语句，后面可以写一个节点。
+    fn revision_display(&mut self, view: RevisionView) -> Result<Statement, Skip> {
+        let node = match self.peek_word() {
+            Some(_) => Some(self.name("节点地址")?),
+            None => None,
+        };
+        Ok(Statement::RevisionDisplay { view, node })
     }
 
     /// 取出 `keyword` 后面的操作名。

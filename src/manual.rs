@@ -114,7 +114,7 @@ const ENTRIES: [Entry; 19] = [
     Entry {
         id: "manual-draft",
         title: "草稿：改完检查，再保存",
-        description: "所有修改先进草稿，save 才算保存。revision 读草稿，origin 读已保存的版本，revision display 看差异和有没有未保存的修改，discard 放弃。",
+        description: "所有修改先进草稿，save 才算保存。revision 读草稿，origin 读已保存的版本，revision display 看有没有未保存的修改，comparison display 对照差异，discard 放弃。",
         text: include_str!("manual/draft.md"),
         related: &["manual-repair", "manual-errors"],
     },
@@ -139,7 +139,7 @@ const ENTRIES: [Entry; 19] = [
     Entry {
         id: "manual-write-place",
         title: "新节点放在哪，写完之后做什么",
-        description: "新节点必须在同一段脚本里接入图。总表不是索引，代表要能概括领域。写完处理 warning，运行 revision check，再 save。",
+        description: "新节点必须在 save 之前接入图。总表不是索引，代表要能概括领域。写完处理 warning，运行 revision check，再 save。",
         text: include_str!("manual/write-place.md"),
         related: &["manual-repair", "manual-errors"],
     },

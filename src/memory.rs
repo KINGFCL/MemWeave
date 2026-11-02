@@ -1151,6 +1151,17 @@ impl Memory {
         self.draft.is_some()
     }
 
+    /// 草稿新建、现在还在的节点。
+    pub fn draft_new_nodes(&self) -> Vec<NodeId> {
+        self.draft.as_ref().map_or_else(Vec::new, |draft| {
+            draft
+                .added
+                .iter()
+                .map(|raw| NodeRef::new(*raw).id().to_owned())
+                .collect()
+        })
+    }
+
     /// 草稿里的脚本，保存时写进日志。
     pub fn draft_scripts(&self) -> &[DraftScript] {
         self.draft.as_ref().map_or(&[], |draft| &draft.scripts)

@@ -132,7 +132,9 @@ memweave run my-kb "revision show manual-start"
 | --- | --- |
 | `revision 读语句` | 读当前草稿。没有未保存的修改时和已保存的版本一样 |
 | `origin 读语句` | 读已保存的版本 |
-| `revision display [节点]` | 第一行 `has_revision: true/false`，后面是和已保存版本的差异 |
+| `revision display [节点]` | 第一行 `has_revision: true/false`，后面列出改了哪些，不带内容 |
+| `revision display-detail [节点]` | 具体改了什么，新节点显示全部内容 |
+| `comparison display [节点]` | 已保存的版本和草稿逐项对照，只列出变了的字段 |
 | `save` | 保存全部修改，一次保存要么全部生效，要么都不生效。可以写在脚本最后一行 |
 | `discard` | 放弃全部未保存的修改 |
 

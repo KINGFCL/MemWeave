@@ -69,12 +69,26 @@ impl Version {
     }
 }
 
+/// 用什么方式看未保存的修改。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionView {
+    /// `revision display`：有没有未保存的修改、改了哪些，不带内容。
+    Brief,
+    /// `revision display-detail`：改了什么，新节点显示全部内容。
+    Detail,
+    /// `comparison display`：已保存的版本和草稿逐项对照。
+    Comparison,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     /// `revision show a` 或 `origin show a`。里面是一条读语句或 `export`。
     Versioned(Version, Box<Statement>),
-    /// 看有没有未保存的修改，以及具体差异。可以只看一个节点。
-    RevisionDisplay(Option<Name>),
+    /// 看未保存的修改。可以只看一个节点。
+    RevisionDisplay {
+        view: RevisionView,
+        node: Option<Name>,
+    },
     /// 把草稿写进日志。
     Save,
     /// 放弃草稿。
@@ -167,7 +181,7 @@ impl Statement {
         !matches!(
             self,
             Statement::Versioned(..)
-                | Statement::RevisionDisplay(_)
+                | Statement::RevisionDisplay { .. }
                 | Statement::Save
                 | Statement::Discard
                 | Statement::CatalogShow

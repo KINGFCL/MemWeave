@@ -72,8 +72,9 @@ pub const LANGUAGE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Entry {
-    /// 只有一段脚本时写在这里。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// 只有一段脚本时写在这里。多段时是空的，但也要写出来：旧版本要求有这一项，缺了它会在看版本号
+    /// 之前就解析失败，把新日志说成损坏，还会建议用户运行 doctor --fix。
+    #[serde(default)]
     script: String,
     /// 这段脚本执行的时间。旧日志没有这一项。
     #[serde(default, skip_serializing_if = "Option::is_none")]

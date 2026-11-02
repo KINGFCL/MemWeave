@@ -905,7 +905,11 @@ fn the_draft_gate_works_over_the_tools() {
     assert!(ok && text.contains("revision: 1 段脚本未保存"), "{text}");
     let (ok, text) = client.read("revision display");
     assert!(ok && text.starts_with("has_revision: true"), "{text}");
-    assert!(text.contains("草稿里的标题"), "{text}");
+    assert!(text.contains("~ drop: title"), "{text}");
+    let (ok, text) = client.read("comparison display drop");
+    assert!(ok && text.contains("revision: \"草稿里的标题\""), "{text}");
+    let (ok, text) = client.read("revision display-detail drop");
+    assert!(ok && text.contains("草稿里的标题"), "{text}");
     let (ok, text) = client.read("origin show drop");
     assert!(ok && !text.contains("草稿里的标题"), "{text}");
     assert!(!kb.join("journal.jsonl").exists(), "没有 save 就不写日志");

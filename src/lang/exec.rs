@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::Path;
 
-use super::ast::{AddNode, Citation, Field, Located, Statement, Version};
+use super::ast::{AddNode, Citation, Field, Located, RevisionView, Statement, Version};
 use crate::board::{Goal, StepStatus};
 use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
-use crate::knowledge::{Catalog, Evidence, Locator, Node, SourceId};
+use crate::knowledge::{Catalog, Evidence, Locator, Node, Section, SourceId};
 use crate::manual::{self, Manual};
 use crate::memory::{Memory, NodeChange, NodeRef, RemovedNode};
 use crate::source::{SourceStore, source_id};
@@ -82,12 +82,9 @@ fn statement(
         Statement::Versioned(Version::Origin, inner) => {
             return memory.with_origin(|origin| read(inner, origin, sources, manual, report));
         }
-        Statement::RevisionDisplay(node) => {
-            render_revision(
-                memory,
-                node.as_ref().map(|n| n.text.as_str()),
-                &mut report.text,
-            );
+        Statement::RevisionDisplay { view, node } => {
+            let only = node.as_ref().map(|n| n.text.as_str());
+            render_revision(memory, *view, only, sources, report);
             return Ok(());
         }
         _ => {}
@@ -95,7 +92,7 @@ fn statement(
     let output = &mut report.text;
     match statement {
         Statement::Save | Statement::Discard => unreachable!("这两条由 Session 处理"),
-        Statement::Versioned(..) | Statement::RevisionDisplay(_) => {
+        Statement::Versioned(..) | Statement::RevisionDisplay { .. } => {
             unreachable!("读语句在上面处理")
         }
         Statement::CatalogShow
@@ -310,7 +307,7 @@ fn read(
 pub fn revision_note(memory: &Memory) -> Option<String> {
     memory.has_revision().then(|| {
         format!(
-            "revision: {} 段脚本未保存。save 保存，discard 放弃，revision display 看差异",
+            "revision: {} 段脚本未保存。save 保存，discard 放弃，comparison display 对照差异",
             memory.draft_scripts().len()
         )
     })
@@ -644,7 +641,7 @@ fn event_for(statement: &Statement, at: Option<u64>) -> Option<Event> {
         Statement::Board(op) => change(op.summary(), Vec::new()),
         Statement::Log(text) => change(format!("log {}", text.text), Vec::new()),
         Statement::Versioned(..)
-        | Statement::RevisionDisplay(_)
+        | Statement::RevisionDisplay { .. }
         | Statement::Save
         | Statement::Discard
         | Statement::CatalogShow
@@ -1060,8 +1057,13 @@ fn render_check(
 pub fn continue_hint(statement: &Statement) -> String {
     let (prefix, inner) = match statement {
         Statement::Versioned(version, inner) => (version.keyword(), &**inner),
-        Statement::RevisionDisplay(None) => {
-            return "revision display 没有显示完，用 revision display 节点 逐个看".to_owned();
+        Statement::RevisionDisplay { view, node: None } => {
+            let name = match view {
+                RevisionView::Brief => "revision display",
+                RevisionView::Detail => "revision display-detail",
+                RevisionView::Comparison => "comparison display",
+            };
+            return format!("{name} 没有显示完，用 {name} 节点 逐个看");
         }
         other => ("revision", other),
     };
@@ -1090,14 +1092,27 @@ pub fn continue_hint(statement: &Statement) -> String {
     }
 }
 
-/// `revision display` 的输出。第一行固定是标志，开发者可以拿它做门控，输出被截断也还在。
-fn render_revision(memory: &mut Memory, only: Option<&str>, output: &mut String) {
+/// 看未保存的修改。第一行固定是标志，开发者可以拿它做门控，输出被截断也还在。
+fn render_revision(
+    memory: &mut Memory,
+    view: RevisionView,
+    only: Option<&str>,
+    sources: &dyn SourceStore,
+    report: &mut Report,
+) {
+    let output = &mut report.text;
+    let failures = &mut report.failures;
     let Some(revision) = memory.revision() else {
         output.push_str("has_revision: false\n");
         return;
     };
     output.push_str("has_revision: true\n");
     let _ = writeln!(output, "scripts: {}", memory.draft_scripts().len());
+    let mut render_node_change = |change: &NodeChange, output: &mut String| match view {
+        RevisionView::Brief => render_brief_change(change, output),
+        RevisionView::Detail => render_detailed_change(change, memory, sources, output, failures),
+        RevisionView::Comparison => render_compared_change(change, sources, output, failures),
+    };
     if let Some(id) = only {
         match revision.nodes.iter().find(|change| change.id == id) {
             Some(change) => render_node_change(change, output),
@@ -1111,7 +1126,17 @@ fn render_revision(memory: &mut Memory, only: Option<&str>, output: &mut String)
         render_node_change(change, output);
     }
     if let Some(before) = &revision.catalog_before {
-        render_catalog_change(before, memory.catalog(), output);
+        match view {
+            RevisionView::Brief => render_brief_catalog(before, memory.catalog(), output),
+            RevisionView::Detail => render_detailed_catalog(before, memory.catalog(), output),
+            RevisionView::Comparison => render_compared_catalog(before, memory.catalog(), output),
+        }
+    }
+    if view == RevisionView::Comparison {
+        if revision.nodes.is_empty() && revision.catalog_before.is_none() {
+            output.push_str("节点、总表和工作板都没有变化，做过什么用 revision display 看\n");
+        }
+        return;
     }
     let events = memory.draft_events();
     if !events.is_empty() {
@@ -1127,18 +1152,115 @@ fn render_revision(memory: &mut Memory, only: Option<&str>, output: &mut String)
     }
 }
 
-fn render_node_change(change: &NodeChange, output: &mut String) {
-    let (before, after) = match (&change.before, &change.after) {
+/// 只说改了哪几项，不带内容。
+fn render_brief_change(change: &NodeChange, output: &mut String) {
+    match (&change.before, &change.after) {
         (None, Some(after)) => {
             let _ = writeln!(output, "+ {} {}", change.id, quote(&after.title));
-            return;
         }
+        (Some(before), None) => {
+            let _ = writeln!(output, "- {} {}", change.id, quote(&before.title));
+        }
+        (Some(before), Some(after)) => {
+            let mut fields = Vec::new();
+            if before.title != after.title {
+                fields.push("title");
+            }
+            if before.description != after.description {
+                fields.push("desc");
+            }
+            if before.related != after.related {
+                fields.push("related");
+            }
+            if before.evidence != after.evidence {
+                fields.push("evidence");
+            }
+            let _ = writeln!(output, "~ {}: {}", change.id, fields.join(", "));
+        }
+        (None, None) => {}
+    }
+}
+
+fn render_brief_catalog(before: &Catalog, after: &Catalog, output: &mut String) {
+    for old in &before.sections {
+        if !after.sections.iter().any(|new| new.name == old.name) {
+            let _ = writeln!(output, "- section {}", quote(&old.name));
+        }
+    }
+    for new in &after.sections {
+        let Some(old) = before.sections.iter().find(|old| old.name == new.name) else {
+            let _ = writeln!(output, "+ section {}", quote(&new.name));
+            continue;
+        };
+        let mut fields = Vec::new();
+        if old.description != new.description {
+            fields.push("desc");
+        }
+        if section_ids(old) != section_ids(new) {
+            fields.push("代表");
+        }
+        if !fields.is_empty() {
+            let _ = writeln!(
+                output,
+                "~ section {}: {}",
+                quote(&new.name),
+                fields.join(", ")
+            );
+        }
+    }
+    for old in &before.goals {
+        match after.goals.iter().find(|new| new.id == old.id) {
+            None => {
+                let _ = writeln!(output, "- goal {}", old.id);
+            }
+            Some(new) if new != old => {
+                let _ = writeln!(output, "~ goal {}", old.id);
+            }
+            Some(_) => {}
+        }
+    }
+    for new in &after.goals {
+        if !before.goals.iter().any(|old| old.id == new.id) {
+            let _ = writeln!(output, "+ goal {}", new.id);
+        }
+    }
+}
+
+fn section_ids(section: &Section) -> Vec<String> {
+    section.nodes.iter().map(|entry| entry.id.clone()).collect()
+}
+
+fn render_detailed_change(
+    change: &NodeChange,
+    memory: &Memory,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    // 新节点没有可比较的旧内容，检查它就是看全部内容，所以和 show 输出的一样。
+    if change.before.is_none()
+        && let Some(node) = memory.node(&change.id)
+    {
+        let _ = writeln!(output, "+ {}", change.id);
+        let mut full = String::new();
+        render_node(
+            node,
+            memory.node_times(&change.id),
+            sources,
+            &mut full,
+            failures,
+        );
+        // 第一行是 node 地址，上面已经写了。
+        output.push_str(full.split_once('\n').map_or("", |(_, rest)| rest));
+        return;
+    }
+    let (before, after) = match (&change.before, &change.after) {
         (Some(before), None) => {
             let _ = writeln!(output, "- {} {}", change.id, quote(&before.title));
             return;
         }
         (Some(before), Some(after)) => (before, after),
-        (None, None) => return,
+        (None, _) => return,
     };
     let _ = writeln!(output, "~ {}", change.id);
     if before.title != after.title {
@@ -1196,7 +1318,7 @@ fn render_list_change(name: &str, before: &[String], after: &[String], output: &
     }
 }
 
-fn render_catalog_change(before: &Catalog, after: &Catalog, output: &mut String) {
+fn render_detailed_catalog(before: &Catalog, after: &Catalog, output: &mut String) {
     for old in &before.sections {
         if !after.sections.iter().any(|new| new.name == old.name) {
             let _ = writeln!(output, "- section {}", quote(&old.name));
@@ -1222,10 +1344,7 @@ fn render_catalog_change(before: &Catalog, after: &Catalog, output: &mut String)
                 quote(&new.description)
             );
         }
-        let ids = |section: &crate::knowledge::Section| -> Vec<String> {
-            section.nodes.iter().map(|entry| entry.id.clone()).collect()
-        };
-        let (old_ids, new_ids) = (ids(old), ids(new));
+        let (old_ids, new_ids) = (section_ids(old), section_ids(new));
         if old_ids != new_ids {
             render_list_change("代表", &old_ids, &new_ids, output);
         }
@@ -1248,6 +1367,188 @@ fn render_catalog_change(before: &Catalog, after: &Catalog, output: &mut String)
         if !before.goals.iter().any(|old| old.id == new.id) {
             let _ = writeln!(output, "+ goal {}", new.id);
             render_goal(new, output);
+        }
+    }
+}
+
+/// 逐项对照：只列出变了的字段，没变的不显示，否则改一个字也要读完整个节点。
+fn render_compared_change(
+    change: &NodeChange,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    let (before, after) = match (&change.before, &change.after) {
+        (None, Some(after)) => {
+            let _ = writeln!(output, "+ {}", change.id);
+            output.push_str("  origin:   没有这个节点\n  revision:\n");
+            render_whole_node(after, sources, output, failures);
+            return;
+        }
+        (Some(before), None) => {
+            let _ = writeln!(output, "- {}", change.id);
+            output.push_str("  origin:\n");
+            render_whole_node(before, sources, output, failures);
+            output.push_str("  revision: 已删除\n");
+            return;
+        }
+        (Some(before), Some(after)) => (before, after),
+        (None, None) => return,
+    };
+    let _ = writeln!(output, "~ {}", change.id);
+    if before.title != after.title {
+        render_pair("title", &quote(&before.title), &quote(&after.title), output);
+    }
+    if before.description != after.description {
+        render_pair(
+            "desc",
+            &quote(&before.description),
+            &quote(&after.description),
+            output,
+        );
+    }
+    if before.related != after.related {
+        render_pair(
+            "related",
+            &join_ids(&before.related),
+            &join_ids(&after.related),
+            output,
+        );
+    }
+    if before.evidence != after.evidence {
+        output.push_str("  evidence\n    origin:\n");
+        render_evidence_lines(&before.evidence, "      ", sources, output, failures);
+        output.push_str("    revision:\n");
+        render_evidence_lines(&after.evidence, "      ", sources, output, failures);
+    }
+}
+
+fn render_pair(name: &str, origin: &str, revision: &str, output: &mut String) {
+    let _ = writeln!(output, "  {name}");
+    let _ = writeln!(output, "    origin:   {origin}");
+    let _ = writeln!(output, "    revision: {revision}");
+}
+
+/// 节点里模型能写的全部内容。
+fn render_whole_node(
+    node: &Node,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    let _ = writeln!(output, "    title: {}", quote(&node.title));
+    let _ = writeln!(output, "    desc: {}", quote(&node.description));
+    let _ = writeln!(output, "    related: {}", join_ids(&node.related));
+    render_evidence_lines(&node.evidence, "    ", sources, output, failures);
+}
+
+/// 证据一条一行，原文的内容也列出来，这样不用再查一次。
+fn render_evidence_lines(
+    evidence: &[Evidence],
+    indent: &str,
+    sources: &dyn SourceStore,
+    output: &mut String,
+    failures: &mut usize,
+) {
+    if evidence.is_empty() {
+        let _ = writeln!(output, "{indent}无");
+    }
+    for entry in evidence {
+        match entry {
+            Evidence::Node { id } => {
+                let _ = writeln!(output, "{indent}based_on: {id}");
+            }
+            Evidence::Source { source, locator } => {
+                let Locator::TextRange { start, end } = locator;
+                match sources.read(source, locator) {
+                    Ok(text) => {
+                        let _ = writeln!(
+                            output,
+                            "{indent}source: {source} {start}..{end}: {}",
+                            quote(&text)
+                        );
+                    }
+                    Err(error) => {
+                        *failures += 1;
+                        let _ = writeln!(output, "{indent}source: {source} {start}..{end}");
+                        let _ = writeln!(
+                            output,
+                            "{indent}error[E901] 原文读取失败：{error}{DOCTOR_HINT}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_compared_catalog(before: &Catalog, after: &Catalog, output: &mut String) {
+    let render_section = |section: &Section, output: &mut String| {
+        let _ = writeln!(output, "    desc: {}", quote(&section.description));
+        let _ = writeln!(output, "    代表: {}", join_ids(&section_ids(section)));
+    };
+    for old in &before.sections {
+        if !after.sections.iter().any(|new| new.name == old.name) {
+            let _ = writeln!(output, "- section {}", quote(&old.name));
+            output.push_str("  origin:\n");
+            render_section(old, output);
+            output.push_str("  revision: 已删除\n");
+        }
+    }
+    for new in &after.sections {
+        let Some(old) = before.sections.iter().find(|old| old.name == new.name) else {
+            let _ = writeln!(output, "+ section {}", quote(&new.name));
+            output.push_str("  origin:   没有这个板块\n  revision:\n");
+            render_section(new, output);
+            continue;
+        };
+        let (old_ids, new_ids) = (section_ids(old), section_ids(new));
+        if old.description == new.description && old_ids == new_ids {
+            continue;
+        }
+        let _ = writeln!(output, "~ section {}", quote(&new.name));
+        if old.description != new.description {
+            render_pair(
+                "desc",
+                &quote(&old.description),
+                &quote(&new.description),
+                output,
+            );
+        }
+        if old_ids != new_ids {
+            render_pair("代表", &join_ids(&old_ids), &join_ids(&new_ids), output);
+        }
+    }
+    let render_goal_side = |goal: &Goal, output: &mut String| {
+        let mut text = String::new();
+        render_goal(goal, &mut text);
+        for line in text.lines() {
+            let _ = writeln!(output, "    {line}");
+        }
+    };
+    for old in &before.goals {
+        match after.goals.iter().find(|new| new.id == old.id) {
+            None => {
+                let _ = writeln!(output, "- goal {}", old.id);
+                output.push_str("  origin:\n");
+                render_goal_side(old, output);
+                output.push_str("  revision: 已结束或已删除\n");
+            }
+            Some(new) if new != old => {
+                let _ = writeln!(output, "~ goal {}", old.id);
+                output.push_str("  origin:\n");
+                render_goal_side(old, output);
+                output.push_str("  revision:\n");
+                render_goal_side(new, output);
+            }
+            Some(_) => {}
+        }
+    }
+    for new in &after.goals {
+        if !before.goals.iter().any(|old| old.id == new.id) {
+            let _ = writeln!(output, "+ goal {}", new.id);
+            output.push_str("  origin:   没有这个目标\n  revision:\n");
+            render_goal_side(new, output);
         }
     }
 }

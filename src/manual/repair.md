@@ -61,6 +61,6 @@ warning: send-sync 依据 borrowing，证据变了，它可能需要复查
 
 ## 改错了
 
-还没有 `save`：用 `revision display` 看改了什么，`discard` 放弃全部未保存的修改，或者写新的修改改回来。
+还没有 `save`：用 `comparison display` 看改了什么，`discard` 放弃全部未保存的修改，或者写新的修改改回来。
 
 已经 `save`：没有撤销指令。用 `revision timeline node 节点` 查它经历过什么，再写新的修改改回来。

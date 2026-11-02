@@ -67,9 +67,11 @@ pub fn check(
                 Diagnostic::new(
                     "E301",
                     located.span,
-                    "当前会话是只读的，不能修改记忆、保存或导出",
+                    "这个调用是只读的，不能修改记忆、保存或导出",
                 )
-                .with_hint("只读会话只能用 revision 和 origin 开头的读语句，以及 revision display"),
+                .with_hint(
+                    "换可写的入口重新提交整段脚本：MCP 用 memory_write，命令行用 memweave run --write",
+                ),
             );
             continue;
         }
@@ -101,7 +103,15 @@ pub fn check(
         }
         checker.statement(&located.statement);
     }
-    checker.finish();
+    // 重放时没有 save，这些脚本当时已经检查过了。
+    if mode == Mode::ReadWrite
+        && let Some(Located {
+            statement: Statement::Save,
+            span,
+        }) = statements.last()
+    {
+        checker.require_new_nodes_reachable(*span);
+    }
     checker.errors
 }
 
@@ -152,7 +162,7 @@ struct Checker<'a> {
     removed_ever: HashSet<String>,
     /// 模拟到当前语句时的总表：板块的名字和代表节点。
     sections: Vec<(String, Vec<String>)>,
-    /// 本脚本新建的节点，脚本结束时要确认它们有路可达。
+    /// 本脚本新建的节点，保存时报错用它们的位置。
     new_nodes: Vec<Name>,
     /// 本脚本已经导出过的路径。
     export_targets: HashSet<String>,
@@ -228,7 +238,7 @@ impl Checker<'_> {
         match statement {
             Statement::Versioned(Version::Revision, inner) => self.statement(inner),
             Statement::Versioned(Version::Origin, inner) => self.origin_read(inner),
-            Statement::RevisionDisplay(_) | Statement::Save | Statement::Discard => {}
+            Statement::RevisionDisplay { .. } | Statement::Save | Statement::Discard => {}
             Statement::CatalogShow | Statement::Check | Statement::Timeline { .. } => {}
             Statement::Board(_) => unreachable!("工作板语句在 check 里单独处理"),
             Statement::Log(text) => self.nonblank(text, "要记下的内容"),
@@ -649,34 +659,95 @@ impl Checker<'_> {
         list.retain(|other| *other != cited);
     }
 
-    /// 脚本结束时，新节点必须有路可达：它是板块的代表，或者有已接入的节点关联它。
-    /// 新节点只是互相关联不算接入。已有节点本身是否可达由 `check` 负责。
-    fn finish(&mut self) {
-        let mut waiting = std::mem::take(&mut self.new_nodes);
-        loop {
-            let before = waiting.len();
-            let unjoined: HashSet<String> = waiting.iter().map(|id| id.text.clone()).collect();
-            waiting.retain(|id| !self.joined(&id.text, &unjoined));
-            if waiting.len() == before {
-                break;
-            }
-        }
+    /// 保存时，草稿里所有新节点都必须接入图。草稿期间可以暂时没接上，那时候还不算数。
+    fn require_new_nodes_reachable(&mut self, save: Span) {
+        let new_nodes: HashSet<String> = self
+            .memory
+            .draft_new_nodes()
+            .into_iter()
+            .chain(self.added.iter().cloned())
+            .filter(|id| self.exists(id))
+            .collect();
+        let representatives: HashSet<&str> = self
+            .sections
+            .iter()
+            .flat_map(|(_, nodes)| nodes.iter().map(String::as_str))
+            .collect();
+        let mut waiting: Vec<String> = new_nodes
+            .iter()
+            .filter(|id| !self.has_way_in(id, &new_nodes, &representatives))
+            .cloned()
+            .collect();
+        waiting.sort();
         for id in waiting {
+            // 这段脚本里建的就指向那一行，之前的脚本里建的只能指向 save。
+            let span = self
+                .new_nodes
+                .iter()
+                .find(|name| name.text == id)
+                .map_or(save, |name| name.span);
             self.errors.push(
-                Diagnostic::new("E208", id.span, format!("从总表到达不了节点 {}", id.text))
-                    .with_hint(format!(
-                        "在这段脚本里接入它：写 related_by，或 link 某节点 -> {0}，或 catalog add {0} to \"板块\"",
-                        id.text
-                    )),
+                Diagnostic::new("E208", span, format!("从总表到达不了节点 {id}，不能保存")).with_hint(
+                    format!(
+                        "保存前接入它：link 某节点 -> {id}，或 catalog add {id} to \"板块\"。不要了就 remove {id}"
+                    ),
+                ),
             );
         }
     }
 
-    fn joined(&self, id: &String, unjoined: &HashSet<String>) -> bool {
-        self.sections.iter().any(|(_, nodes)| nodes.contains(id))
-            || self.related.iter().any(|(from, list)| {
-                !unjoined.contains(from) && self.exists(from) && list.contains(id)
-            })
+    /// 这个新节点有没有接入：它是代表，或者有已有节点关联它，或者有已接入的新节点关联它。
+    /// 只在新节点之间走，不走完全图，所以保存的时间和图的大小无关。已有节点本身是否可达由 `check`
+    /// 负责，新节点只是互相关联不算接入。
+    fn has_way_in(
+        &self,
+        id: &str,
+        new_nodes: &HashSet<String>,
+        representatives: &HashSet<&str>,
+    ) -> bool {
+        let mut seen = HashSet::from([id.to_owned()]);
+        let mut pending = vec![id.to_owned()];
+        while let Some(current) = pending.pop() {
+            if representatives.contains(current.as_str()) {
+                return true;
+            }
+            for from in self.pointing_at(&current) {
+                if !new_nodes.contains(&from) {
+                    return true;
+                }
+                if seen.insert(from.clone()) {
+                    pending.push(from);
+                }
+            }
+        }
+        false
+    }
+
+    /// 模拟到当前语句时，哪些节点关联了 `id`。
+    fn pointing_at(&self, id: &str) -> Vec<String> {
+        // 脚本前面的语句改过的关联，以模拟的结果为准。
+        let mut from: Vec<String> = self
+            .related
+            .iter()
+            .filter(|(other, list)| self.exists(other) && list.iter().any(|to| to == id))
+            .map(|(other, _)| other.clone())
+            .collect();
+        // 本脚本删除过的节点，内存里的关联已经不算数了。
+        if !self.removed_ever.contains(id)
+            && let Some(node) = self.memory.node(id)
+        {
+            from.extend(
+                node.related_by()
+                    .map(|other| other.id())
+                    .filter(|other| {
+                        self.exists(other)
+                            && !self.removed_ever.contains(*other)
+                            && !self.related.contains_key(*other)
+                    })
+                    .map(str::to_owned),
+            );
+        }
+        from
     }
 
     /// 读已保存的版本。脚本前面的修改和草稿都不影响它。
