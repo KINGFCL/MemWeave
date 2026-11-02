@@ -93,7 +93,7 @@ cargo run --release --example bench_retrieve  # retrieve()
 记忆层用 C++ 实现，编译需要支持 C++20 的编译器。
 
 ```bash
-cargo install memweave --version 0.1.0-alpha.3.2
+cargo install memweave --version 0.1.0-alpha.4
 ```
 
 ## 使用
@@ -279,6 +279,14 @@ memweave purge <知识库目录> <文字>    # 彻底清除一段文字，包括
 ```
 
 这些命令要独占知识库，服务运行时不能做。有未保存的修改时 `compact` 和 `purge` 会拒绝，先 `save` 或 `discard`。升级 memweave 前建议先 `compact`。
+
+### 从 0.1.0-alpha.3.x 升级到 0.1.0-alpha.4
+
+这是不兼容的改动：
+
+- 读语句要写 `revision` 或 `origin`，比如 `revision show 节点`。不写时报 `E224`，提示里有正确的写法。
+- 所有修改先进草稿，`save` 才算保存。在代码里调用 `Session::run` 的，成功不再代表已写入磁盘；打开知识库后还要调用 `Journal::restore_draft` 接上没保存的草稿。
+- 旧知识库和旧日志能直接打开。但新版保存过之后，日志就是第 2 版，**旧版程序打不开这个知识库**。旧版报错时还会建议运行 `doctor --fix`，**不要运行**：它会跳过读不懂的日志行，这些修改就不在修复后的知识库里了（备份目录里还有）。要退回旧版，先用新版 `compact`，让日志合并进快照。
 
 ## 知识库格式
 
