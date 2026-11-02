@@ -52,7 +52,7 @@ pub(crate) fn parse_tolerant(source: &Path) -> (Option<Catalog>, Vec<Node>, Vec<
 }
 
 /// 比这个版本新的知识库不能读：读错了可能损坏数据。
-fn check_format(source: &Path) -> Result<(), Error> {
+pub(crate) fn check_format(source: &Path) -> Result<(), Error> {
     let path = source.join(FORMAT_FILE);
     if !path.exists() {
         return Ok(());

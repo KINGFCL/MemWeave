@@ -93,7 +93,7 @@ cargo run --release --example bench_retrieve  # retrieve()
 记忆层用 C++ 实现，编译需要支持 C++20 的编译器。
 
 ```bash
-cargo install memweave --version 0.1.0-alpha.3.1
+cargo install memweave --version 0.1.0-alpha.3.2
 ```
 
 ## 使用

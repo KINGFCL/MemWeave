@@ -16,7 +16,7 @@ use crate::lang::journal::{Journal, WriteLock, complete_lines, load_current, par
 use crate::lang::{Mode, Session};
 use crate::memory::{Memory, Problem, is_valid_id};
 use crate::parse::ParsedKnowledge;
-use crate::parse::json::{JsonParser, parse_tolerant};
+use crate::parse::json::{JsonParser, check_format, parse_tolerant};
 use crate::source::file::FileSources;
 use crate::source::{SourceStore, Trusted, is_valid_source_id, source_id};
 use crate::timeline::{self, Action, Event};
@@ -245,7 +245,8 @@ struct Salvaged {
     failed_scripts: Vec<String>,
 }
 
-/// 去掉坏掉的引用，让剩下的内容能建成图。
+/// 去掉坏掉的引用，让剩下的内容能建成图。这里改掉的每一处都要写进 `problems`：加载时这些都会被
+/// 拒绝，`doctor` 不报告的话，用户就走进了死路。
 fn clean_parsed(
     catalog: Option<Catalog>,
     mut nodes: Vec<Node>,
@@ -263,24 +264,76 @@ fn clean_parsed(
     });
     let ids: HashSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
     for node in &mut nodes {
-        node.related.retain(|id| ids.contains(id));
-        node.evidence.retain(|evidence| match evidence {
-            Evidence::Node { id } => ids.contains(id),
-            Evidence::Source { source, locator } => {
-                let Locator::TextRange { start, end } = *locator;
-                is_valid_source_id(source) && start < end
+        let Node {
+            id: owner,
+            related,
+            evidence,
+            ..
+        } = node;
+        related.retain(|id| {
+            let keep = ids.contains(id);
+            if !keep {
+                problems.push(format!(
+                    "节点 {owner} 关联的节点 {id} 不存在，已去掉这条关联"
+                ));
             }
+            keep
+        });
+        evidence.retain(|item| {
+            let keep = match item {
+                Evidence::Node { id } => ids.contains(id),
+                Evidence::Source { source, locator } => {
+                    let Locator::TextRange { start, end } = *locator;
+                    is_valid_source_id(source) && start < end
+                }
+            };
+            if !keep {
+                problems.push(match item {
+                    Evidence::Node { id } => {
+                        format!("节点 {owner} 依据的节点 {id} 不存在，已去掉这条依据")
+                    }
+                    Evidence::Source { source, locator } => {
+                        let Locator::TextRange { start, end } = *locator;
+                        format!("节点 {owner} 的原文引用 {source} {start}..{end} 无效，已去掉")
+                    }
+                });
+            }
+            keep
         });
     }
     let mut names = HashSet::new();
-    catalog
-        .sections
-        .retain(|section| names.insert(section.name.clone()));
+    catalog.sections.retain(|section| {
+        let keep = names.insert(section.name.clone());
+        if !keep {
+            problems.push(format!("板块“{}”重复，只保留第一个", section.name));
+        }
+        keep
+    });
     for section in &mut catalog.sections {
-        section.nodes.retain(|entry| ids.contains(&entry.id));
+        let Section {
+            name,
+            nodes: entries,
+            ..
+        } = section;
+        entries.retain(|entry| {
+            let keep = ids.contains(&entry.id);
+            if !keep {
+                problems.push(format!(
+                    "板块“{name}”的代表节点 {} 不存在，已去掉",
+                    entry.id
+                ));
+            }
+            keep
+        });
     }
     let mut goals = HashSet::new();
-    catalog.goals.retain(|goal| goals.insert(goal.id.clone()));
+    catalog.goals.retain(|goal| {
+        let keep = goals.insert(goal.id.clone());
+        if !keep {
+            problems.push(format!("工作板上的目标 {} 重复，只保留第一个", goal.id));
+        }
+        keep
+    });
 
     let lost = store.put(LOST_SOURCE.as_bytes())?;
     let lost_evidence = Evidence::Source {
@@ -299,7 +352,11 @@ fn clean_parsed(
                 node.evidence.push(lost_evidence.clone());
             }
         }
-        attach_unreachable(&mut parsed);
+        for id in attach_unreachable(&mut parsed) {
+            problems.push(format!(
+                "从总表走不到节点 {id}，已把它放进“{RECOVERED_SECTION}”板块"
+            ));
+        }
         let found = Memory::validate(&parsed, &Trusted(store));
         if found.is_empty() {
             return Ok(parsed);
@@ -325,8 +382,8 @@ fn clean_parsed(
     Err(Error::Save("无法修复证据循环".to_owned()))
 }
 
-/// 走不到的节点放进“恢复的节点”板块，这样不会丢，模型也能看到。
-fn attach_unreachable(parsed: &mut ParsedKnowledge) {
+/// 走不到的节点放进“恢复的节点”板块，这样不会丢，模型也能看到。返回放进去的入口。
+fn attach_unreachable(parsed: &mut ParsedKnowledge) -> Vec<String> {
     let targets: HashSet<&str> = parsed
         .nodes
         .iter()
@@ -378,8 +435,9 @@ fn attach_unreachable(parsed: &mut ParsedKnowledge) {
             }
         }
     }
+    let attached = entries.iter().map(|entry| entry.id.clone()).collect();
     if entries.is_empty() {
-        return;
+        return attached;
     }
     if let Some(section) = parsed
         .catalog
@@ -395,6 +453,7 @@ fn attach_unreachable(parsed: &mut ParsedKnowledge) {
             nodes: entries,
         });
     }
+    attached
 }
 
 fn salvage(knowledge_base: &Path, store: &dyn SourceStore) -> Result<Salvaged, Error> {
@@ -452,6 +511,13 @@ fn salvage(knowledge_base: &Path, store: &dyn SourceStore) -> Result<Salvaged, E
             }
         }
     }
+    // 兜底：没发现问题，真实加载却失败时，也要报告。否则用户又走进死路：加载被拒绝，doctor 却说没事。
+    if problems.is_empty()
+        && let Err(error) = load_current(&JsonParser, store, knowledge_base)
+    {
+        problems.push(format!("知识库无法加载：{error}"));
+    }
+
     Ok(Salvaged {
         memory,
         problems,
@@ -509,6 +575,8 @@ fn replace_damaged_citations(
 /// 检查知识库，把发现的问题都列出来，不改任何东西。还会校验所有原文的哈希。
 pub fn doctor(knowledge_base: &Path) -> Result<String, Error> {
     recover_interrupted_swap(knowledge_base)?;
+    // 比这个版本新的知识库不是坏了，是要升级程序。
+    check_format(knowledge_base)?;
     let disk = FileSources::new(knowledge_base);
     let dry = DryRun {
         disk: &disk,
@@ -558,6 +626,7 @@ fn maintenance_notes(knowledge_base: &Path, memory: &Memory) -> String {
 /// 尽量恢复。恢复不了的内容如实报告，原来的目录改名保留，无法重放的脚本也存在里面。
 pub fn doctor_fix(knowledge_base: &Path) -> Result<String, Error> {
     recover_interrupted_swap(knowledge_base)?;
+    check_format(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
     let sources = FileSources::new(knowledge_base);
     let mut salvaged = salvage(knowledge_base, &sources)?;
@@ -810,6 +879,179 @@ mod tests {
         );
         assert!(doctor(&kb).unwrap().ends_with("doctor: 没有问题"));
         (dir, kb, fixed)
+    }
+
+    fn edit_json(path: &Path, change: impl Fn(&mut serde_json::Value)) {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        change(&mut value);
+        fs::write(path, value.to_string()).unwrap();
+    }
+
+    /// 真实加载拒绝这种损坏，doctor 就必须报告，修完要能加载。
+    fn refused_then_fixed(damage: impl Fn(&Path), expect: &str) -> (TempDir, PathBuf, String) {
+        damaged_and_fixed(
+            |kb| {
+                damage(kb);
+                let sources = FileSources::new(kb);
+                assert!(
+                    load_current(&JsonParser, &sources, kb).is_err(),
+                    "这种损坏应该被加载拒绝，不然这个测试没有意义"
+                );
+            },
+            expect,
+        )
+    }
+
+    #[test]
+    fn doctor_reports_a_node_nothing_leads_to() {
+        let (_dir, kb, fixed) = refused_then_fixed(
+            |kb| {
+                let mut island: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(kb.join("nodes/drop.json")).unwrap())
+                        .unwrap();
+                island["id"] = "island".into();
+                island["related"] = serde_json::json!([]);
+                fs::write(kb.join("nodes/island.json"), island.to_string()).unwrap();
+            },
+            "从总表走不到节点 island",
+        );
+        assert!(fixed.contains("fixed: 从总表走不到节点 island"), "{fixed}");
+        assert!(read(&kb, "catalog show").contains("恢复的节点"));
+        assert!(read(&kb, "show island").contains("node island"));
+    }
+
+    #[test]
+    fn doctor_reports_a_dangling_link() {
+        let (_dir, kb, _) = refused_then_fixed(
+            |kb| {
+                edit_json(&kb.join("nodes/drop.json"), |node| {
+                    node["related"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push("不存在".into());
+                });
+            },
+            "节点 drop 关联的节点 不存在 不存在",
+        );
+        assert!(!read(&kb, "show drop").contains("不存在"));
+    }
+
+    #[test]
+    fn doctor_reports_a_catalog_entry_with_no_node() {
+        let (_dir, kb, _) = refused_then_fixed(
+            |kb| {
+                edit_json(&kb.join("catalog.json"), |catalog| {
+                    catalog["sections"][0]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({ "id": "不存在", "title": "x" }));
+                });
+            },
+            "的代表节点 不存在 不存在",
+        );
+        assert!(!read(&kb, "catalog show").contains("不存在"));
+    }
+
+    #[test]
+    fn doctor_reports_a_duplicate_section() {
+        let (_dir, kb, _) = refused_then_fixed(
+            |kb| {
+                edit_json(&kb.join("catalog.json"), |catalog| {
+                    let sections = catalog["sections"].as_array_mut().unwrap();
+                    let copy = sections[0].clone();
+                    sections.push(copy);
+                });
+            },
+            "重复，只保留第一个",
+        );
+        let listed = read(&kb, "catalog show");
+        assert_eq!(
+            listed.matches("section \"Rust 内存管理\"").count(),
+            1,
+            "{listed}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_evidence_on_a_missing_node() {
+        refused_then_fixed(
+            |kb| {
+                edit_json(&kb.join("nodes/drop.json"), |node| {
+                    node["evidence"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({ "type": "node", "id": "不存在" }));
+                });
+            },
+            "节点 drop 依据的节点 不存在 不存在",
+        );
+    }
+
+    #[test]
+    fn doctor_reports_an_invalid_source_reference() {
+        refused_then_fixed(
+            |kb| {
+                edit_json(&kb.join("nodes/drop.json"), |node| {
+                    node["evidence"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "type": "source",
+                            "source": "不是地址",
+                            "locator": { "type": "text_range", "start": 0, "end": 4 },
+                        }));
+                });
+            },
+            "节点 drop 的原文引用 不是地址 0..4 无效",
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_duplicate_goal() {
+        refused_then_fixed(
+            |kb| {
+                write(
+                    kb,
+                    "goal create 重复 \"目标\"\n  desc \"\"\"描述\"\"\"\n  step \"一\"\nend",
+                );
+                compact(kb).unwrap();
+                edit_json(&kb.join("catalog.json"), |catalog| {
+                    let goals = catalog["goals"].as_array_mut().unwrap();
+                    let copy = goals[0].clone();
+                    goals.push(copy);
+                });
+            },
+            "工作板上的目标 重复 重复",
+        );
+    }
+
+    /// 比这个版本新的知识库不是坏了，不能当成坏的去“修”。
+    #[test]
+    fn doctor_leaves_a_newer_format_alone() {
+        let dir = TempDir::new().unwrap();
+        let kb = demo(&dir);
+        // 同时有损坏时，旧版本的程序也不能重写它。
+        edit_json(&kb.join("nodes/drop.json"), |node| {
+            node["related"]
+                .as_array_mut()
+                .unwrap()
+                .push("不存在".into());
+        });
+        fs::write(kb.join("format.json"), r#"{"format":999}"#).unwrap();
+        let before = fs::read_to_string(kb.join("nodes/drop.json")).unwrap();
+
+        assert!(doctor(&kb).unwrap_err().to_string().contains("999"));
+        assert!(doctor_fix(&kb).unwrap_err().to_string().contains("999"));
+
+        assert_eq!(
+            fs::read_to_string(kb.join("nodes/drop.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(kb.join("format.json")).unwrap(),
+            r#"{"format":999}"#
+        );
     }
 
     #[test]
