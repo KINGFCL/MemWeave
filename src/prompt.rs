@@ -1,3 +1,4 @@
+use serde::{Serialize, Serializer};
 use serde_json::json;
 
 use crate::knowledge::Catalog;
@@ -40,27 +41,173 @@ pub struct Candidate<'a> {
     pub sources: &'a [NodeRef<'a>],
 }
 
+/// 按顺序写出一串，不用先收集成数组。
+struct Seq<I>(I);
+
+impl<I> Serialize for Seq<I>
+where
+    I: Iterator + Clone,
+    I::Item: Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.clone())
+    }
+}
+
+// 下面三个结构决定发给模型的 JSON，字段按字典序排列。直接写字符串，不建中间的 JSON 对象：
+// 候选很多时，拼提示词是一次查询里框架最大的开销。
+
+#[derive(Serialize)]
+struct KeptJson<'a> {
+    id: &'a str,
+    title: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(bound = "Seq<R>: Serialize, Seq<S>: Serialize")]
+struct CandidateJson<'a, R, S> {
+    description: &'a str,
+    id: &'a str,
+    related: Seq<R>,
+    sources: Seq<S>,
+    title: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(bound = "Seq<C>: Serialize, Seq<K>: Serialize")]
+struct LayerJson<'a, C, K> {
+    candidates: Seq<C>,
+    kept: Seq<K>,
+    query: &'a str,
+}
+
 pub fn judge_layer(query: &str, kept: &[NodeRef<'_>], candidates: &[Candidate<'_>]) -> Prompt {
-    let kept: Vec<_> = kept
-        .iter()
-        .map(|n| json!({ "id": n.id(), "title": n.title() }))
-        .collect();
-    let candidates: Vec<_> = candidates
-        .iter()
-        .map(|c| {
-            let related: Vec<&str> = c.node.related().map(NodeRef::id).collect();
-            let sources: Vec<&str> = c.sources.iter().map(|s| s.id()).collect();
-            json!({
-                "id": c.node.id(),
-                "title": c.node.title(),
-                "description": c.node.description(),
-                "related": related,
-                "sources": sources,
-            })
-        })
-        .collect();
+    let kept = kept.iter().map(|node| KeptJson {
+        id: node.id(),
+        title: node.title(),
+    });
+    let candidates = candidates.iter().map(|candidate| CandidateJson {
+        description: candidate.node.description(),
+        id: candidate.node.id(),
+        related: Seq(candidate.node.related().map(NodeRef::id)),
+        sources: Seq(candidate.sources.iter().map(|source| source.id())),
+        title: candidate.node.title(),
+    });
+    let layer = LayerJson {
+        candidates: Seq(candidates),
+        kept: Seq(kept),
+        query,
+    };
     Prompt {
         system: JUDGE_LAYER,
-        user: json!({ "query": query, "kept": kept, "candidates": candidates }).to_string(),
+        user: serde_json::to_string(&layer).expect("这些字段都是文字，写成 JSON 不会失败"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, Section};
+    use crate::memory::Memory;
+    use crate::parse::ParsedKnowledge;
+    use crate::source::in_memory::InMemorySources;
+
+    /// 改写之前的做法，用来确认发给模型的内容一个字节都没变。
+    fn through_json_values(
+        query: &str,
+        kept: &[NodeRef<'_>],
+        candidates: &[Candidate<'_>],
+    ) -> String {
+        let kept: Vec<_> = kept
+            .iter()
+            .map(|n| json!({ "id": n.id(), "title": n.title() }))
+            .collect();
+        let candidates: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                let related: Vec<&str> = c.node.related().map(NodeRef::id).collect();
+                let sources: Vec<&str> = c.sources.iter().map(|s| s.id()).collect();
+                json!({
+                    "id": c.node.id(),
+                    "title": c.node.title(),
+                    "description": c.node.description(),
+                    "related": related,
+                    "sources": sources,
+                })
+            })
+            .collect();
+        json!({ "query": query, "kept": kept, "candidates": candidates }).to_string()
+    }
+
+    #[test]
+    fn the_layer_prompt_is_byte_for_byte_the_same() {
+        let mut sources = InMemorySources::new();
+        let source = sources.insert(b"text".to_vec());
+        let nasty = "引号\" 反斜杠\\ 换行\n 制表\t 控制\u{1} 退格\u{8} 表情😀 </script> \u{2028}";
+        let node = |id: &str, title: &str, description: &str, related: &[&str]| Node {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            evidence: vec![Evidence::Source {
+                source: source.clone(),
+                locator: Locator::TextRange { start: 0, end: 4 },
+            }],
+            related: related.iter().map(|id| (*id).to_owned()).collect(),
+        };
+        let memory = Memory::from_parsed(
+            ParsedKnowledge {
+                catalog: Catalog {
+                    goals: Vec::new(),
+                    sections: vec![Section {
+                        name: "板块".to_owned(),
+                        description: String::new(),
+                        nodes: vec![CatalogEntry {
+                            id: "甲".to_owned(),
+                            title: "甲".to_owned(),
+                        }],
+                    }],
+                },
+                nodes: vec![
+                    node("甲", nasty, nasty, &["乙", "丙"]),
+                    node("乙", "乙", "", &[]),
+                    node("丙", "标题", nasty, &["甲", "乙"]),
+                ],
+            },
+            &sources,
+        )
+        .unwrap();
+        let (first, second, third) = (
+            memory.node("甲").unwrap(),
+            memory.node("乙").unwrap(),
+            memory.node("丙").unwrap(),
+        );
+
+        // 没有已保留的节点和候选：空数组。
+        assert_eq!(
+            judge_layer(nasty, &[], &[]).user,
+            through_json_values(nasty, &[], &[])
+        );
+
+        let from_first = [first];
+        let from_both = [first, second];
+        let candidates = [
+            Candidate {
+                node: first,
+                sources: &[],
+            },
+            Candidate {
+                node: second,
+                sources: &from_first,
+            },
+            Candidate {
+                node: third,
+                sources: &from_both,
+            },
+        ];
+        let kept = [first, third];
+        assert_eq!(
+            judge_layer(nasty, &kept, &candidates).user,
+            through_json_values(nasty, &kept, &candidates)
+        );
     }
 }
