@@ -10,7 +10,8 @@
 //! - 裸图：按地址走图，这是硬件能做到的。
 //! - 语言：模型真正调用的入口 `Session::run`，并拆开看一次 `show` 的时间花在哪。
 //! - 原文：内存里和磁盘上各读一遍。
-//! - 写入：不落盘和落盘分开测，落盘的时间主要由磁盘决定。
+//! - 写入：进草稿和保存分开测，保存的时间主要由磁盘决定。
+//! - 草稿：有未保存的修改时，读两个版本分别要多少时间。
 
 use std::fs;
 use std::hint::black_box;
@@ -207,7 +208,7 @@ fn raw_graph(memory: &Memory, count: usize) {
 fn show_breakdown(memory: &mut Memory, sources: &InMemorySources, count: usize) {
     let mut random = Random(0x0bad_cafe_1234_5678);
     let scripts: Vec<String> = (0..READS)
-        .map(|_| format!("show {}", node_id(random.next() % count)))
+        .map(|_| format!("revision show {}", node_id(random.next() % count)))
         .collect();
     let (mut lexing, mut parsing, mut checking, mut executing) = (
         Duration::ZERO,
@@ -259,11 +260,13 @@ fn language(memory: &mut Memory, sources: &InMemorySources, manual: &Manual, cou
     };
 
     println!("  语言（Session::run，原文在内存里）");
-    let scripts: Vec<String> = (0..READS).map(|_| format!("show {}", pick())).collect();
+    let scripts: Vec<String> = (0..READS)
+        .map(|_| format!("revision show {}", pick()))
+        .collect();
     measure(READS, |i| {
         assert!(run(memory, &scripts[i]));
     })
-    .print("show 一个节点");
+    .print("revision show 一个节点");
 
     let start = Instant::now();
     for script in scripts.iter().cycle().take(BATCH) {
@@ -278,40 +281,44 @@ fn language(memory: &mut Memory, sources: &InMemorySources, manual: &Manual, cou
     let batches: Vec<String> = (0..READS / 4)
         .map(|_| {
             let ids: Vec<String> = (0..10).map(|_| pick()).collect();
-            format!("show {}", ids.join(", "))
+            format!("revision show {}", ids.join(", "))
         })
         .collect();
     measure(batches.len(), |i| {
         assert!(run(memory, &batches[i]));
     })
-    .print("show 一层 10 个节点");
+    .print("revision show 一层 10 个节点");
 
     measure(READS, |_| {
-        assert!(run(memory, "catalog show"));
+        assert!(run(memory, "revision catalog show"));
     })
-    .print("catalog show");
+    .print("revision catalog show");
 
     let links: Vec<String> = (0..READS / 4)
-        .map(|_| format!("links {} depth 3 limit 50", pick()))
+        .map(|_| format!("revision links {} depth 3 limit 50", pick()))
         .collect();
     measure(links.len(), |i| {
         assert!(run(memory, &links[i]));
     })
-    .print("links 走 3 层");
+    .print("revision links 走 3 层");
 
-    let evidence: Vec<String> = (0..READS).map(|_| format!("evidence {}", pick())).collect();
+    let evidence: Vec<String> = (0..READS)
+        .map(|_| format!("revision evidence {}", pick()))
+        .collect();
     measure(READS, |i| {
         assert!(run(memory, &evidence[i]));
     })
-    .print("evidence");
+    .print("revision evidence");
 
     measure(READS, |_| {
-        assert!(run(memory, "show manual-start"));
+        assert!(run(memory, "revision show manual-start"));
     })
-    .print("show manual-start");
+    .print("revision show manual-start");
 
     // 写错地址要逐个比较才能给出提示，这是唯一随节点数变慢的读路径。
-    let wrong: Vec<String> = (0..50).map(|_| format!("show {}x", pick())).collect();
+    let wrong: Vec<String> = (0..50)
+        .map(|_| format!("revision show {}x", pick()))
+        .collect();
     measure(wrong.len(), |i| {
         assert!(!run(memory, &wrong[i]));
     })
@@ -319,15 +326,15 @@ fn language(memory: &mut Memory, sources: &InMemorySources, manual: &Manual, cou
 
     // 和所有节点都不像，又和它们一样长，是最慢的情况。
     measure(50, |_| {
-        assert!(!run(memory, "show zzzzzzzzzzzzzzzzzzzzzzzz"));
+        assert!(!run(memory, "revision show zzzzzzzzzzzzzzzzzzzzzzzz"));
     })
     .print("写错地址（完全不像）");
 
     let times = if count > 100_000 { 5 } else { 50 };
     measure(times, |_| {
-        assert!(run(memory, "check"));
+        assert!(run(memory, "revision check"));
     })
-    .print("check 遍历全图");
+    .print("revision check 遍历全图");
 }
 
 fn on_disk(count: usize) {
@@ -342,7 +349,9 @@ fn on_disk(count: usize) {
     let mut pick = move || node_id(random.next() % count);
 
     println!("  磁盘（原文在文件里，写入要落盘）");
-    let scripts: Vec<String> = (0..READS).map(|_| format!("show {}", pick())).collect();
+    let scripts: Vec<String> = (0..READS)
+        .map(|_| format!("revision show {}", pick()))
+        .collect();
     measure(READS, |i| {
         let output = Session::new(&mut memory, &sources, Mode::ReadOnly)
             .with_manual(&manual)
@@ -356,14 +365,21 @@ fn on_disk(count: usize) {
     let edits: Vec<String> = (0..WRITES)
         .map(|index| format!("set {} desc \"\"\"新的描述 {index}\"\"\"", pick()))
         .collect();
-    measure(WRITES, |i| {
-        let output = Session::new(&mut memory, &sources, Mode::ReadWrite)
+    let write = |memory: &mut Memory, script: &str| {
+        let output = Session::new(memory, &sources, Mode::ReadWrite)
             .with_journal(&journal)
             .with_manual(&manual)
-            .run(&edits[i]);
+            .run(script);
         assert!(output.ok, "{}", output.text);
+    };
+    measure(WRITES, |i| write(&mut memory, &edits[i])).print("set 进草稿（不等落盘）");
+    measure(1, |_| write(&mut memory, "save")).print(&format!("save {WRITES} 段脚本（落盘一次）"));
+    measure(WRITES, |i| write(&mut memory, &edits[i])).print("set 进草稿（第二轮）");
+    measure(1, |_| write(&mut memory, "discard")).print(&format!("discard {WRITES} 段脚本"));
+    measure(WRITES, |i| {
+        write(&mut memory, &format!("{}\nsave", edits[i]));
     })
-    .print("set（落盘）");
+    .print("set 并马上 save（落盘）");
 
     let mut anchor = pick();
     let additions: Vec<String> = (0..WRITES)
@@ -375,14 +391,51 @@ fn on_disk(count: usize) {
             script
         })
         .collect();
+    measure(WRITES, |i| write(&mut memory, &additions[i])).print("source 新节点进草稿");
+    measure(1, |_| write(&mut memory, "discard")).print(&format!("discard {WRITES} 个新节点"));
     measure(WRITES, |i| {
-        let output = Session::new(&mut memory, &sources, Mode::ReadWrite)
-            .with_journal(&journal)
-            .with_manual(&manual)
-            .run(&additions[i]);
-        assert!(output.ok, "{}", output.text);
+        write(&mut memory, &format!("{}\nsave", additions[i]));
     })
-    .print("source 新节点（原文和日志落盘）");
+    .print("source 新节点并马上 save（落盘）");
+}
+
+/// 有草稿时读两个版本要多少时间。读草稿不用切换，读原版的成本和改动量成正比。
+fn drafts(memory: &mut Memory, sources: &InMemorySources, manual: &Manual, count: usize) {
+    let mut random = Random(0xfeed_beef_0000_0002);
+    let mut pick = move || node_id(random.next() % count);
+    println!("  草稿（只改内存）");
+    for changes in [10usize, 100, 1000] {
+        memory.abort_draft();
+        let changes = changes.min(count);
+        memory.begin_draft();
+        for index in 0..changes {
+            memory
+                .set_description(&node_id(index), &format!("草稿 {index}"))
+                .unwrap();
+        }
+        const READS: usize = 5000;
+        let scripts: Vec<String> = (0..READS)
+            .map(|_| format!("revision show {}", pick()))
+            .collect();
+        let origins: Vec<String> = scripts
+            .iter()
+            .map(|s| s.replacen("revision", "origin", 1))
+            .collect();
+        let run = |memory: &mut Memory, script: &str| {
+            let output = Session::new(memory, sources, Mode::ReadOnly)
+                .with_manual(manual)
+                .run(script);
+            assert!(output.ok, "{}", output.text);
+            black_box(output.text.len());
+        };
+        measure(READS, |i| run(memory, &scripts[i]))
+            .print(&format!("改了 {changes} 个节点，revision show"));
+        measure(READS, |i| run(memory, &origins[i]))
+            .print(&format!("改了 {changes} 个节点，origin show"));
+        measure(200, |_| run(memory, "revision display"))
+            .print(&format!("改了 {changes} 个节点，revision display"));
+    }
+    memory.abort_draft();
 }
 
 fn writes_in_memory(memory: &mut Memory, sources: &InMemorySources, manual: &Manual, count: usize) {
@@ -441,6 +494,8 @@ fn main() {
         show_breakdown(&mut memory, &sources, count);
         language(&mut memory, &sources, &manual, count);
         writes_in_memory(&mut memory, &sources, &manual, count);
+        memory.abort_draft();
+        drafts(&mut memory, &sources, &manual, count);
         drop(memory);
         on_disk(count);
     }

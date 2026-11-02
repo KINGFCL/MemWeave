@@ -41,6 +41,11 @@ pub trait SourceStore {
     fn put(&self, _bytes: &[u8]) -> Result<SourceId, Error> {
         Err(Error::Source("这里不能写入新来源".to_owned()))
     }
+
+    /// 和 [`SourceStore::put`] 一样，但不用等落盘。草稿用它：保存时日志里有这段内容，文件丢了能恢复。
+    fn put_unsynced(&self, bytes: &[u8]) -> Result<SourceId, Error> {
+        self.put(bytes)
+    }
 }
 
 /// 不检查原文的来源：`size` 总是说够大，`read` 不读文件。
@@ -63,6 +68,10 @@ impl SourceStore for Trusted<'_> {
 
     fn put(&self, bytes: &[u8]) -> Result<SourceId, Error> {
         self.0.put(bytes)
+    }
+
+    fn put_unsynced(&self, bytes: &[u8]) -> Result<SourceId, Error> {
+        self.0.put_unsynced(bytes)
     }
 }
 

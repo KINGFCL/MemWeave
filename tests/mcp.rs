@@ -183,7 +183,7 @@ fn legacy_clients_get_the_instructions_from_initialize() {
     let response = client.raw_request("ping", json!({}));
     assert!(response.get("error").is_none(), "{response}");
     check_tools(&mut client);
-    let (ok, text) = client.read("catalog show");
+    let (ok, text) = client.read("revision catalog show");
     assert!(ok, "{text}");
     assert!(text.contains("Rust 内存管理"), "{text}");
     client.stop();
@@ -192,7 +192,10 @@ fn legacy_clients_get_the_instructions_from_initialize() {
     fresh.modern = false;
     let response = fresh.initialize();
     let instructions = response["result"]["instructions"].as_str().unwrap();
-    assert!(instructions.contains("show manual-start"), "{instructions}");
+    assert!(
+        instructions.contains("revision show manual-start"),
+        "{instructions}"
+    );
     assert_eq!(response["result"]["serverInfo"]["name"], "memweave");
     fresh.stop();
 }
@@ -219,11 +222,11 @@ fn modern_clients_get_the_instructions_from_discover() {
         result["instructions"]
             .as_str()
             .unwrap()
-            .contains("show manual-start"),
+            .contains("revision show manual-start"),
         "{response}"
     );
     check_tools(&mut client);
-    let (ok, text) = client.read("catalog show");
+    let (ok, text) = client.read("revision catalog show");
     assert!(ok, "{text}");
     client.stop();
 }
@@ -240,12 +243,12 @@ fn writes_survive_a_restart_and_read_tools_cannot_write() {
 
     let (ok, text) = client.write("set ownership title \"新标题\"");
     assert!(ok, "{text}");
-    let (ok, text) = client.read("show ownership");
+    let (ok, text) = client.read("revision show ownership");
     assert!(ok && text.contains("新标题"), "{text}");
     client.stop();
 
     let mut restarted = Client::start(&kb, false);
-    let (ok, text) = restarted.read("show ownership");
+    let (ok, text) = restarted.read("revision show ownership");
     assert!(ok && text.contains("新标题"), "{text}");
     restarted.stop();
 }
@@ -269,7 +272,7 @@ fn script_errors_are_tool_errors_the_model_can_read() {
         json!({ "name": "memory_read", "arguments": {} }),
     );
     assert!(response["error"].is_object(), "{response}");
-    let (ok, text) = client.read("catalog show");
+    let (ok, text) = client.read("revision catalog show");
     assert!(ok, "服务应该还活着：{text}");
     client.stop();
 }
@@ -280,7 +283,7 @@ fn the_manual_is_read_like_memory() {
     let kb = demo_copy(&dir);
     let mut client = Client::start(&kb, true);
 
-    let (ok, text) = client.read("show manual-start");
+    let (ok, text) = client.read("revision show manual-start");
     assert!(ok && text.contains("这是你的长期记忆"), "{text}");
     assert!(text.contains("related: manual-recall"), "{text}");
     for (node, expected) in [
@@ -290,17 +293,17 @@ fn the_manual_is_read_like_memory() {
         ("manual-language", "catalog create"),
         ("manual-errors", "E217"),
     ] {
-        let (ok, text) = client.read(&format!("show {node}"));
+        let (ok, text) = client.read(&format!("revision show {node}"));
         assert!(ok && text.contains(expected), "{node}：{text}");
     }
     // 其他读语句也能用，所以模型学到的走法在说明里就能练。
-    let (ok, text) = client.read("links manual-repair\nevidence manual-repair\nfull_source manual-repair limit 100\nrelated_by manual-repair");
+    let (ok, text) = client.read("revision links manual-repair\nrevision evidence manual-repair\nrevision full_source manual-repair limit 100\nrevision related_by manual-repair");
     assert!(
         ok && text.contains("manual-repair -> manual-repair-delete"),
         "{text}"
     );
     // 写错了地址，提示里有内置节点。
-    let (ok, text) = client.read("show manual-recal");
+    let (ok, text) = client.read("revision show manual-recal");
     assert!(!ok && text.contains("manual-recall"), "{text}");
     client.stop();
 }
@@ -312,11 +315,11 @@ fn a_new_knowledge_base_already_has_the_manual() {
     let kb = dir.path().join("新记忆");
     let mut client = Client::start(&kb, true);
 
-    let (ok, text) = client.read("catalog show");
+    let (ok, text) = client.read("revision catalog show");
     assert!(ok, "{text}");
     assert!(text.contains("section \"记忆系统使用说明\""), "{text}");
     assert!(text.contains("catalog: 空"), "内置说明不算记忆：{text}");
-    let (ok, text) = client.read("show manual-start\ncheck\ntimeline");
+    let (ok, text) = client.read("revision show manual-start\nrevision check\nrevision timeline");
     assert!(ok && text.contains("check: 没有问题"), "{text}");
     client.stop();
     assert!(
@@ -355,7 +358,7 @@ fn the_manual_cannot_be_changed() {
         let (ok, text) = client.write(script);
         assert!(!ok && text.contains("error[E223]"), "{script}：{text}");
     }
-    let (ok, text) = client.read("check");
+    let (ok, text) = client.read("revision check");
     assert!(ok && text.contains("check: 没有问题"), "{text}");
     client.stop();
 
@@ -372,11 +375,11 @@ fn the_manual_stays_out_of_the_knowledge_base() {
     let mut client = Client::start(&kb, true);
 
     let (ok, text) = client.write(&format!(
-        "show manual-start\nlog \"\"\"读完了说明\"\"\"\nexport \"{}\"",
+        "revision show manual-start\nlog \"\"\"读完了说明\"\"\"\nrevision export \"{}\"",
         target.display()
     ));
     assert!(ok, "{text}");
-    let (ok, text) = client.read("timeline");
+    let (ok, text) = client.read("revision timeline");
     assert!(ok && !text.contains("manual-"), "{text}");
     client.stop();
 
@@ -388,7 +391,7 @@ fn the_manual_stays_out_of_the_knowledge_base() {
 
     // 重启后重放日志，读说明的语句不会妨碍加载。
     let mut client = Client::start(&kb, true);
-    let (ok, text) = client.read("show manual-start");
+    let (ok, text) = client.read("revision show manual-start");
     assert!(ok, "{text}");
     client.stop();
 }
@@ -403,7 +406,7 @@ fn old_nodes_with_the_reserved_prefix_still_load_and_can_be_moved() {
     fs::write(kb.join("journal.jsonl"), format!("{entry}\n")).unwrap();
 
     let mut client = Client::start(&kb, true);
-    let (ok, text) = client.read("show manual-old\ncheck");
+    let (ok, text) = client.read("revision show manual-old\nrevision check");
     assert!(ok && text.contains("旧版本建的"), "{text}");
     assert!(
         text.contains("note: 节点 manual-old 用了内置说明的前缀"),
@@ -412,7 +415,7 @@ fn old_nodes_with_the_reserved_prefix_still_load_and_can_be_moved() {
     assert!(text.contains("check: 没有问题"), "{text}");
     let (ok, text) = client.write("remove manual-old");
     assert!(ok, "{text}");
-    let (ok, text) = client.read("check");
+    let (ok, text) = client.read("revision check");
     assert!(ok && !text.contains("note:"), "{text}");
     client.stop();
 }
@@ -422,7 +425,7 @@ fn only_one_process_owns_a_knowledge_base() {
     let dir = TempDir::new().unwrap();
     let kb = demo_copy(&dir);
     let mut client = Client::start(&kb, true);
-    assert!(client.read("catalog show").0);
+    assert!(client.read("revision catalog show").0);
 
     let second = Command::new(env!("CARGO_BIN_EXE_memweave"))
         .arg("mcp")
@@ -446,7 +449,7 @@ fn only_one_process_owns_a_knowledge_base() {
     let read = Command::new(env!("CARGO_BIN_EXE_memweave"))
         .arg("run")
         .arg(&kb)
-        .arg("catalog show")
+        .arg("revision catalog show")
         .output()
         .unwrap();
     assert!(read.status.success());
@@ -470,7 +473,7 @@ fn a_missing_or_empty_directory_becomes_an_empty_knowledge_base() {
 
     for kb in [dir.path().join("新目录/记忆"), empty] {
         let mut client = Client::start(&kb, true);
-        let (ok, text) = client.read("catalog show\ncheck");
+        let (ok, text) = client.read("revision catalog show\nrevision check");
         assert!(ok, "{text}");
         assert!(text.contains("catalog: 空"), "{text}");
 
@@ -480,7 +483,7 @@ fn a_missing_or_empty_directory_becomes_an_empty_knowledge_base() {
         client.stop();
 
         let mut restarted = Client::start(&kb, false);
-        let (ok, text) = restarted.read("show a");
+        let (ok, text) = restarted.read("revision show a");
         assert!(ok && text.contains("原文"), "{text}");
         restarted.stop();
     }
@@ -530,16 +533,17 @@ fn large_output_is_cut_at_the_limit_with_a_note() {
         modern: true,
     };
 
-    let (ok, text) = client.read("show ownership\nshow borrowing\nshow drop");
+    let (ok, text) =
+        client.read("revision show ownership\nrevision show borrowing\nrevision show drop");
 
     assert!(ok);
     assert!(text.contains("输出超过上限"), "{text}");
     assert!(
-        text.contains("第 1 行的 show ownership 没有显示完"),
+        text.contains("第 1 行的 revision show ownership 没有显示完"),
         "{text}"
     );
     assert!(text.contains("后面还有 2 条语句"), "{text}");
-    assert!(!text.contains("show drop\n"), "{text}");
+    assert!(!text.contains("revision show drop\n"), "{text}");
     client.stop();
 }
 
@@ -567,7 +571,7 @@ fn walking_the_graph_does_not_repeat_the_catalog() {
     let mut client = Client::start(&kb, true);
 
     // 第一次调用带上。
-    let blocks = call_blocks(&mut client, "memory_read", "show ownership");
+    let blocks = call_blocks(&mut client, "memory_read", "revision show ownership");
     assert_eq!(blocks.len(), 2, "{blocks:?}");
     assert!(blocks[0].starts_with("node ownership"), "{blocks:?}");
     assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
@@ -578,17 +582,17 @@ fn walking_the_graph_does_not_repeat_the_catalog() {
 
     // 之后沿关联走多少层都不带。
     for script in [
-        "show borrowing, drop",
-        "show send-sync",
-        "evidence send-sync",
-        "check",
-        "timeline",
+        "revision show borrowing, drop",
+        "revision show send-sync",
+        "revision evidence send-sync",
+        "revision check",
+        "revision timeline",
     ] {
         let blocks = call_blocks(&mut client, "memory_read", script);
         assert_eq!(blocks.len(), 1, "{script}：{blocks:?}");
     }
     // 读说明也不带。
-    let blocks = call_blocks(&mut client, "memory_read", "show manual-recall");
+    let blocks = call_blocks(&mut client, "memory_read", "revision show manual-recall");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     client.stop();
 }
@@ -600,25 +604,29 @@ fn the_first_call_brings_the_catalog_whatever_it_is() {
 
     // 说明。
     let mut client = Client::start(&kb, true);
-    let blocks = call_blocks(&mut client, "memory_read", "show manual-work");
+    let blocks = call_blocks(&mut client, "memory_read", "revision show manual-work");
     assert!(blocks[0].contains("工作板"), "{blocks:?}");
     assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
     client.stop();
 
     // 报错的脚本。什么都没执行，但模型正好需要总表来改正。
     let mut client = Client::start(&kb, true);
-    let result = client.call("memory_read", json!({ "script": "show 没有" }));
+    let result = client.call("memory_read", json!({ "script": "revision show 没有" }));
     assert_eq!(result["isError"], true);
     let blocks = all_text(&result);
     assert!(blocks[0].contains("error[E201]"), "{blocks:?}");
     assert!(blocks[1].contains(ATTACHED), "{blocks:?}");
-    let result = client.call("memory_read", json!({ "script": "show 也没有" }));
+    let result = client.call("memory_read", json!({ "script": "revision show 也没有" }));
     assert_eq!(all_text(&result).len(), 1);
     client.stop();
 
     // 写了 catalog show 但脚本报错时，输出里其实没有总表，要带上。
     let mut client = Client::start(&kb, true);
-    let blocks = call_blocks(&mut client, "memory_read", "catalog show\nshow 没有");
+    let blocks = call_blocks(
+        &mut client,
+        "memory_read",
+        "revision catalog show\nrevision show 没有",
+    );
     assert_eq!(blocks.len(), 2, "{blocks:?}");
     client.stop();
 }
@@ -630,17 +638,21 @@ fn listing_the_catalog_is_not_repeated() {
     let mut client = Client::start(&kb, true);
 
     // 输出里已经有了，不再带，之后也不带。
-    let blocks = call_blocks(&mut client, "memory_read", " catalog show\n");
+    let blocks = call_blocks(&mut client, "memory_read", " revision catalog show\n");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     assert!(
         blocks[0].contains("section \"Rust 内存管理\""),
         "{blocks:?}"
     );
-    let blocks = call_blocks(&mut client, "memory_read", "show drop");
+    let blocks = call_blocks(&mut client, "memory_read", "revision show drop");
     assert_eq!(blocks.len(), 1, "{blocks:?}");
 
     // 上层每次查询开始时都可以再看一次。
-    let blocks = call_blocks(&mut client, "memory_read", "catalog show\nshow drop");
+    let blocks = call_blocks(
+        &mut client,
+        "memory_read",
+        "revision catalog show\nrevision show drop",
+    );
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     assert!(blocks[0].contains("section"), "{blocks:?}");
     client.stop();
@@ -651,7 +663,10 @@ fn the_catalog_comes_back_only_when_it_changes() {
     let dir = TempDir::new().unwrap();
     let kb = demo_copy(&dir);
     let mut client = Client::start(&kb, true);
-    assert_eq!(call_blocks(&mut client, "memory_read", "check").len(), 2);
+    assert_eq!(
+        call_blocks(&mut client, "memory_read", "revision check").len(),
+        2
+    );
 
     // 只写节点和 log，总表和工作板都没变。
     let note = "source a\n title \"t\"\n desc \"d\"\n text \"原文\"\n related_by drop\nend";
@@ -676,7 +691,7 @@ fn the_catalog_comes_back_only_when_it_changes() {
     assert_eq!(blocks.len(), 2, "{blocks:?}");
     assert!(blocks[1].contains("section \"新领域\""), "{blocks:?}");
     assert_eq!(
-        call_blocks(&mut client, "memory_read", "show drop").len(),
+        call_blocks(&mut client, "memory_read", "revision show drop").len(),
         1
     );
 
@@ -687,7 +702,7 @@ fn the_catalog_comes_back_only_when_it_changes() {
     let blocks = call_blocks(&mut client, "memory_write", "step done g 1");
     assert!(blocks[1].contains("[>] 2 \"二\""), "{blocks:?}");
     assert_eq!(
-        call_blocks(&mut client, "memory_read", "show drop").len(),
+        call_blocks(&mut client, "memory_read", "revision show drop").len(),
         1
     );
 
@@ -703,13 +718,13 @@ fn the_catalog_comes_back_only_when_it_changes() {
     let blocks = call_blocks(
         &mut client,
         "memory_write",
-        "catalog create \"甲\" desc \"d\"\ncatalog show",
+        "catalog create \"甲\" desc \"d\"\nrevision catalog show",
     );
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     let blocks = call_blocks(
         &mut client,
         "memory_write",
-        "catalog show\ncatalog create \"乙\" desc \"d\"",
+        "revision catalog show\ncatalog create \"乙\" desc \"d\"",
     );
     assert_eq!(blocks.len(), 2, "{blocks:?}");
     assert!(blocks[1].contains("section \"乙\""), "{blocks:?}");
@@ -728,7 +743,7 @@ fn the_board_is_still_there_in_the_next_session() {
     client.stop();
 
     let mut next = Client::start(&kb, false);
-    let blocks = all_text(&next.call("memory_read", json!({ "script": "check" })));
+    let blocks = all_text(&next.call("memory_read", json!({ "script": "revision check" })));
     assert!(blocks[1].contains("[x] 1 \"一\""), "{blocks:?}");
     assert!(blocks[1].contains("[>] 2 \"二\""), "{blocks:?}");
     next.stop();
@@ -757,10 +772,13 @@ fn an_oversized_catalog_cannot_crowd_out_the_result() {
         modern: true,
     };
 
-    let blocks = all_text(&client.call("memory_read", json!({ "script": "check" })));
+    let blocks = all_text(&client.call("memory_read", json!({ "script": "revision check" })));
 
     assert!(blocks[0].contains("check: 没有问题"), "{blocks:?}");
-    assert!(blocks[1].contains("用 catalog show 看全"), "{blocks:?}");
+    assert!(
+        blocks[1].contains("用 revision catalog show 看全"),
+        "{blocks:?}"
+    );
     client.stop();
 }
 
@@ -779,7 +797,7 @@ fn a_full_disk_leaves_the_journal_intact() {
             .output()
             .unwrap()
     };
-    assert!(run("log \"第一条\"").status.success());
+    assert!(run("log \"第一条\"\nsave").status.success());
     let journal = kb.join("journal.jsonl");
     let size = fs::metadata(&journal).unwrap().len();
 
@@ -790,19 +808,19 @@ fn a_full_disk_leaves_the_journal_intact() {
         .arg("trap '' XFSZ; ulimit -f 1; exec \"$0\" run --write \"$1\" \"$2\"")
         .arg(bin)
         .arg(&kb)
-        .arg(format!("log \"{long}\""))
+        .arg(format!("log \"{long}\"\nsave"))
         .output()
         .unwrap();
 
     assert!(!limited.status.success());
     let text = String::from_utf8_lossy(&limited.stdout);
-    assert!(text.contains("写入日志失败"), "{text}");
+    assert!(text.contains("error[E903] 保存失败"), "{text}");
     assert_eq!(fs::metadata(&journal).unwrap().len(), size, "半行要去掉");
     assert!(run("log \"磁盘恢复后\"").status.success());
     let check = Command::new(bin)
         .arg("run")
         .arg(&kb)
-        .arg("timeline")
+        .arg("revision timeline")
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&check.stdout);
@@ -844,7 +862,7 @@ fn a_damaged_knowledge_base_points_to_doctor_and_doctor_fixes_it() {
     );
 
     let mut client = Client::start(&kb, true);
-    let (ok, text) = client.read("check");
+    let (ok, text) = client.read("revision check");
     assert!(ok && text.contains("没有问题"), "{text}");
     client.stop();
 }
@@ -855,12 +873,12 @@ fn maintenance_waits_for_the_server_to_exit() {
     let kb = demo_copy(&dir);
     let bin = env!("CARGO_BIN_EXE_memweave");
     let mut client = Client::start(&kb, true);
-    assert!(client.write("log \"x\"").0);
+    assert!(client.write("log \"x\"\nsave").0);
 
     let compact = Command::new(bin).arg("compact").arg(&kb).output().unwrap();
     assert!(!compact.status.success());
     assert!(String::from_utf8_lossy(&compact.stderr).contains("另一个进程正在写"));
-    assert!(client.read("timeline").0);
+    assert!(client.read("revision timeline").0);
     client.stop();
 
     let compact = Command::new(bin).arg("compact").arg(&kb).output().unwrap();
@@ -871,6 +889,97 @@ fn maintenance_waits_for_the_server_to_exit() {
     );
     assert!(!kb.join("journal.jsonl").exists());
     let mut next = Client::start(&kb, true);
-    assert!(next.read("timeline").1.contains("log x"));
+    assert!(next.read("revision timeline").1.contains("log x"));
     next.stop();
+}
+
+#[test]
+fn the_draft_gate_works_over_the_tools() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+
+    let (ok, text) = client.read("revision display");
+    assert!(ok && text.starts_with("has_revision: false"), "{text}");
+    let (ok, text) = client.write("set drop title \"草稿里的标题\"");
+    assert!(ok && text.contains("revision: 1 段脚本未保存"), "{text}");
+    let (ok, text) = client.read("revision display");
+    assert!(ok && text.starts_with("has_revision: true"), "{text}");
+    assert!(text.contains("草稿里的标题"), "{text}");
+    let (ok, text) = client.read("origin show drop");
+    assert!(ok && !text.contains("草稿里的标题"), "{text}");
+    assert!(!kb.join("journal.jsonl").exists(), "没有 save 就不写日志");
+
+    // 只读工具不能保存。
+    let (ok, text) = client.read("save");
+    assert!(!ok && text.contains("E301"), "{text}");
+
+    let (ok, text) = client.write("save");
+    assert!(ok && text.contains("saved 1 段脚本"), "{text}");
+    let (ok, text) = client.read("revision display");
+    assert!(ok && text.starts_with("has_revision: false"), "{text}");
+    client.stop();
+
+    let mut restarted = Client::start(&kb, true);
+    let (ok, text) = restarted.read("origin show drop");
+    assert!(ok && text.contains("草稿里的标题"), "{text}");
+    restarted.stop();
+}
+
+#[test]
+fn unsaved_changes_wait_for_the_model_after_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let mut client = Client::start(&kb, true);
+    assert!(client.write("set drop title \"没保存的标题\"").0);
+    client.stop();
+
+    let mut restarted = Client::start(&kb, true);
+    // 第一次调用附带的总表上写着还有没保存的修改。
+    let blocks = call_blocks(&mut restarted, "memory_read", "revision check");
+    assert!(blocks[1].contains("revision: 1 段脚本未保存"), "{blocks:?}");
+    let (ok, text) = restarted.read("revision show drop");
+    assert!(ok && text.contains("没保存的标题"), "{text}");
+    let (ok, text) = restarted.write("discard");
+    assert!(ok && text.contains("discarded 1 段脚本"), "{text}");
+    let (ok, text) = restarted.read("revision show drop");
+    assert!(ok && !text.contains("没保存的标题"), "{text}");
+    restarted.stop();
+}
+
+#[test]
+fn the_command_line_carries_a_draft_across_calls() {
+    let dir = TempDir::new().unwrap();
+    let kb = demo_copy(&dir);
+    let bin = env!("CARGO_BIN_EXE_memweave");
+    let run = |flag: Option<&str>, script: &str| {
+        let mut command = Command::new(bin);
+        command.arg("run");
+        if let Some(flag) = flag {
+            command.arg(flag);
+        }
+        let output = command.arg(&kb).arg(script).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    run(Some("--write"), "set drop title \"第一次调用\"");
+    run(Some("--write"), "set drop desc \"\"\"第二次调用\"\"\"");
+    let text = run(None, "revision display");
+    assert!(text.starts_with("has_revision: true\nscripts: 2"), "{text}");
+    // 只读的调用不动草稿。
+    assert!(kb.join("draft.jsonl").exists());
+    assert!(!run(None, "origin show drop").contains("第一次调用"));
+    let text = run(Some("--write"), "save");
+    assert!(text.contains("saved 2 段脚本"), "{text}");
+    let text = run(None, "origin show drop");
+    assert!(
+        text.contains("第一次调用") && text.contains("第二次调用"),
+        "{text}"
+    );
+    assert_eq!(run(None, "revision display").trim(), "has_revision: false");
 }

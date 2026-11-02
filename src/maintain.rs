@@ -104,6 +104,7 @@ fn directory_size(dir: &Path) -> u64 {
 pub fn compact(knowledge_base: &Path) -> Result<String, Error> {
     recover_interrupted_swap(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
+    Journal::new(knowledge_base).refuse_unsaved(knowledge_base)?;
     let sources = FileSources::new(knowledge_base);
     let memory = load_current(&JsonParser, &sources, knowledge_base)?;
     let before = directory_size(knowledge_base);
@@ -126,6 +127,8 @@ pub fn purge(knowledge_base: &Path, secret: &str) -> Result<String, Error> {
     }
     recover_interrupted_swap(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
+    // 草稿文件里可能就有这段文字，不能留着它说清除完成了。
+    Journal::new(knowledge_base).refuse_unsaved(knowledge_base)?;
     let sources = FileSources::new(knowledge_base);
     let mut memory = load_current(&JsonParser, &sources, knowledge_base)?;
     let in_use = uses_of(&memory, &sources, secret)?;
@@ -475,11 +478,20 @@ fn salvage(knowledge_base: &Path, store: &dyn SourceStore) -> Result<Salvaged, E
     for (index, line) in complete_lines(&bytes).enumerate() {
         match parse_entry(line) {
             Ok(entry) => {
-                let output = Session::new(&mut memory, store, Mode::ReadWrite)
-                    .replay(&entry.script, entry.at);
-                if !output.ok {
+                // 一行是一次保存，要么全部生效，要么都不生效。
+                let scripts = entry.scripts();
+                memory.begin_draft();
+                let replayed = scripts.iter().all(|part| {
+                    Session::new(&mut memory, store, Mode::ReadWrite)
+                        .replay(&part.script, part.at)
+                        .ok
+                });
+                if replayed {
+                    memory.commit_draft();
+                } else {
+                    memory.abort_draft();
                     problems.push(format!("日志第 {} 行无法重放，已跳过", index + 1));
-                    failed_scripts.push(entry.script);
+                    failed_scripts.extend(scripts.into_iter().map(|part| part.script));
                 }
             }
             Err(error) => {
@@ -617,10 +629,17 @@ fn maintenance_notes(knowledge_base: &Path, memory: &Memory) -> String {
         })
         .unwrap_or(0);
     let journal = fs::metadata(knowledge_base.join("journal.jsonl")).map_or(0, |m| m.len());
-    format!(
+    let mut notes = format!(
         "note: {} 个节点，日志 {journal} 字节，{orphans} 份原文没有节点引用。memweave compact 可以合并日志并删除它们\n",
         memory.node_count()
-    )
+    );
+    let pending = Journal::new(knowledge_base).pending_draft();
+    if pending > 0 {
+        notes.push_str(&format!(
+            "note: 有 {pending} 段未保存的修改，上面的检查只看已保存的部分。用 memweave run --write 执行 save 或 discard 处理\n"
+        ));
+    }
+    notes
 }
 
 /// 尽量恢复。恢复不了的内容如实报告，原来的目录改名保留，无法重放的脚本也存在里面。
@@ -628,6 +647,7 @@ pub fn doctor_fix(knowledge_base: &Path) -> Result<String, Error> {
     recover_interrupted_swap(knowledge_base)?;
     check_format(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
+    let pending = Journal::new(knowledge_base).pending_draft();
     let sources = FileSources::new(knowledge_base);
     let mut salvaged = salvage(knowledge_base, &sources)?;
     if salvaged.problems.is_empty() {
@@ -656,6 +676,12 @@ pub fn doctor_fix(knowledge_base: &Path) -> Result<String, Error> {
     let mut report = String::new();
     for problem in &salvaged.problems {
         report.push_str(&format!("fixed: {problem}\n"));
+    }
+    if pending > 0 {
+        report.push_str(&format!(
+            "note: {pending} 段未保存的修改没有带过来，它们留在 {}\n",
+            backup.join("draft.jsonl").display()
+        ));
     }
     report.push_str(&format!(
         "doctor: 修复完成，{} 个节点。原来的目录保留在 {}",
@@ -693,13 +719,17 @@ mod tests {
         kb
     }
 
+    fn saved(script: &str) -> String {
+        format!("{script}\nsave")
+    }
+
     fn write(kb: &Path, script: &str) -> String {
         let sources = FileSources::new(kb);
         let journal = Journal::new(kb);
         let mut memory = load_current(&JsonParser, &sources, kb).unwrap();
         let output = Session::new(&mut memory, &sources, Mode::ReadWrite)
             .with_journal(&journal)
-            .run(script);
+            .run(&saved(script));
         assert!(output.ok, "{}", output.text);
         output.text
     }
@@ -715,6 +745,98 @@ mod tests {
     const NOTE: &str = "source note\n title \"t\"\n desc \"d\"\n text \"\"\"要保留的原文\"\"\"\n related_by ownership\nend";
     const THROWAWAY: &str = "source gone\n title \"t\"\n desc \"d\"\n text \"\"\"没人引用的原文\"\"\"\n related_by ownership\nend\nremove gone";
 
+    fn write_unsaved(kb: &Path, script: &str) {
+        let sources = FileSources::new(kb);
+        let journal = Journal::new(kb);
+        let mut memory = load_current(&JsonParser, &sources, kb).unwrap();
+        journal.restore_draft(&mut memory, &sources, true);
+        let output = Session::new(&mut memory, &sources, Mode::ReadWrite)
+            .with_journal(&journal)
+            .run(script);
+        assert!(output.ok, "{}", output.text);
+    }
+
+    #[test]
+    fn maintenance_refuses_while_changes_are_unsaved() {
+        let dir = TempDir::new().unwrap();
+        let kb = demo(&dir);
+        write_unsaved(&kb, "log \"\"\"秘密\"\"\"");
+
+        for error in [compact(&kb).unwrap_err(), purge(&kb, "秘密").unwrap_err()] {
+            assert!(error.to_string().contains("未保存的修改"), "{error}");
+        }
+        assert!(kb.join("draft.jsonl").exists());
+        let report = doctor(&kb).unwrap();
+        assert!(report.contains("1 段未保存的修改"), "{report}");
+        assert!(report.contains("doctor: 没有问题"), "{report}");
+
+        write_unsaved(&kb, "discard");
+        assert!(!kb.join("draft.jsonl").exists());
+        compact(&kb).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_draft_of_a_finished_save_does_not_block_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let kb = demo(&dir);
+        write_unsaved(&kb, "log \"\"\"一\"\"\"");
+        let leftover = fs::read(kb.join("draft.jsonl")).unwrap();
+        write_unsaved(&kb, "save");
+        fs::write(kb.join("draft.jsonl"), leftover).unwrap();
+        compact(&kb).unwrap();
+        assert!(!kb.join("draft.jsonl").exists());
+    }
+
+    #[test]
+    fn discarded_text_is_on_disk_until_compact_removes_it() {
+        let dir = TempDir::new().unwrap();
+        let kb = demo(&dir);
+        let before = fs::read_dir(kb.join("sources")).unwrap().count();
+        write_unsaved(
+            &kb,
+            "source 甲\n title \"t\"\n desc \"\"\"d\"\"\"\n text \"\"\"放弃的原文\"\"\"\n related_by drop\nend",
+        );
+        assert_eq!(
+            fs::read_dir(kb.join("sources")).unwrap().count(),
+            before + 1
+        );
+        write_unsaved(&kb, "discard");
+        assert_eq!(
+            fs::read_dir(kb.join("sources")).unwrap().count(),
+            before + 1
+        );
+        compact(&kb).unwrap();
+        assert_eq!(fs::read_dir(kb.join("sources")).unwrap().count(), before);
+    }
+
+    #[test]
+    fn a_save_lost_midway_replays_as_a_whole_or_not_at_all_in_salvage() {
+        let dir = TempDir::new().unwrap();
+        let kb = demo(&dir);
+        write_unsaved(&kb, "log \"\"\"一\"\"\"");
+        write_unsaved(&kb, "remove send-sync");
+        write_unsaved(&kb, "save");
+        // 让这次保存里后面的脚本重放不了：把 send-sync 改掉，第二段就找不到它了。
+        let line = fs::read_to_string(kb.join("journal.jsonl")).unwrap();
+        assert!(line.contains("\"scripts\""), "{line}");
+        fs::write(
+            kb.join("journal.jsonl"),
+            line.replace("remove send-sync", "remove 不存在"),
+        )
+        .unwrap();
+        let report = doctor(&kb).unwrap();
+        assert!(report.contains("日志第 1 行无法重放"), "{report}");
+        // 第一段的 log 也不能留下。
+        let sources = FileSources::new(&kb);
+        let store = DryRun {
+            disk: &sources,
+            written: std::cell::RefCell::new(HashMap::new()),
+        };
+        let salvaged = salvage(&kb, &store).unwrap();
+        assert_eq!(salvaged.memory.timeline().len(), 0);
+        assert_eq!(salvaged.failed_scripts.len(), 2);
+    }
+
     #[test]
     fn compact_merges_the_journal_and_drops_orphan_sources() {
         let dir = TempDir::new().unwrap();
@@ -725,7 +847,10 @@ mod tests {
             &kb,
             "goal create g \"目标\"\n desc \"d\"\n step \"一\"\nend\nlog \"做过\"",
         );
-        let before = read(&kb, "show note\ncatalog show\ntimeline");
+        let before = read(
+            &kb,
+            "revision show note\nrevision catalog show\nrevision timeline",
+        );
         assert_eq!(fs::read_dir(kb.join("sources")).unwrap().count(), 3);
 
         let report = compact(&kb).unwrap();
@@ -733,12 +858,18 @@ mod tests {
         assert!(report.contains("压缩完成"), "{report}");
         assert!(!kb.join("journal.jsonl").exists());
         assert_eq!(fs::read_dir(kb.join("sources")).unwrap().count(), 2);
-        assert_eq!(read(&kb, "show note\ncatalog show\ntimeline"), before);
+        assert_eq!(
+            read(
+                &kb,
+                "revision show note\nrevision catalog show\nrevision timeline"
+            ),
+            before
+        );
         assert!(!sibling(&kb, ".swap-old").unwrap().exists());
         assert!(!sibling(&kb, ".swap-new").unwrap().exists());
         // 压缩后可以接着写。
         write(&kb, "log \"压缩之后\"");
-        assert!(read(&kb, "timeline limit 1").contains("压缩之后"));
+        assert!(read(&kb, "revision timeline limit 1").contains("压缩之后"));
     }
 
     #[test]
@@ -761,14 +892,14 @@ mod tests {
         write(&kb, NOTE);
         let new = sibling(&kb, ".swap-new").unwrap();
         let old = sibling(&kb, ".swap-old").unwrap();
-        let expected = read(&kb, "show note");
+        let expected = read(&kb, "revision show note");
 
         // 新快照写了一半：丢掉它，旧的知识库不变。
         fs::create_dir(&new).unwrap();
         fs::write(new.join("半个文件"), "x").unwrap();
         recover_interrupted_swap(&kb).unwrap();
         assert!(!new.exists());
-        assert_eq!(read(&kb, "show note"), expected);
+        assert_eq!(read(&kb, "revision show note"), expected);
 
         // 旧的已经改名，新的还没换上。
         let sources = FileSources::new(&kb);
@@ -776,14 +907,14 @@ mod tests {
         JsonExporter.export(&memory, &sources, &new).unwrap();
         fs::rename(&kb, &old).unwrap();
         recover_interrupted_swap(&kb).unwrap();
-        assert_eq!(read(&kb, "show note"), expected);
+        assert_eq!(read(&kb, "revision show note"), expected);
         assert!(!new.exists() && !old.exists());
 
         // 只差删除旧的。
         copy_dir(&kb, &old);
         recover_interrupted_swap(&kb).unwrap();
         assert!(!old.exists());
-        assert_eq!(read(&kb, "show note"), expected);
+        assert_eq!(read(&kb, "revision show note"), expected);
     }
 
     fn grep(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
@@ -835,8 +966,8 @@ mod tests {
         );
         assert_eq!(grep(dir.path(), secret.as_bytes()), Vec::<PathBuf>::new());
         // 别的记忆和时间线都还在。
-        assert!(read(&kb, "show note").contains("要保留的原文"));
-        assert!(read(&kb, "timeline").contains("（已清除）"));
+        assert!(read(&kb, "revision show note").contains("要保留的原文"));
+        assert!(read(&kb, "revision timeline").contains("（已清除）"));
         assert!(purge(&kb, "  ").is_err());
     }
 
@@ -868,7 +999,7 @@ mod tests {
         assert!(fixed.contains("修复完成"), "{fixed}");
         assert!(fixed.contains(".damaged-"), "{fixed}");
         // 修复后能正常加载、检查和写入，备份还在。
-        let check = read(&kb, "check");
+        let check = read(&kb, "revision check");
         assert_eq!(check.trim(), "check: 没有问题", "{check}");
         write(&kb, "log \"修复之后\"");
         assert!(
@@ -917,8 +1048,8 @@ mod tests {
             "从总表走不到节点 island",
         );
         assert!(fixed.contains("fixed: 从总表走不到节点 island"), "{fixed}");
-        assert!(read(&kb, "catalog show").contains("恢复的节点"));
-        assert!(read(&kb, "show island").contains("node island"));
+        assert!(read(&kb, "revision catalog show").contains("恢复的节点"));
+        assert!(read(&kb, "revision show island").contains("node island"));
     }
 
     #[test]
@@ -934,7 +1065,7 @@ mod tests {
             },
             "节点 drop 关联的节点 不存在 不存在",
         );
-        assert!(!read(&kb, "show drop").contains("不存在"));
+        assert!(!read(&kb, "revision show drop").contains("不存在"));
     }
 
     #[test]
@@ -950,7 +1081,7 @@ mod tests {
             },
             "的代表节点 不存在 不存在",
         );
-        assert!(!read(&kb, "catalog show").contains("不存在"));
+        assert!(!read(&kb, "revision catalog show").contains("不存在"));
     }
 
     #[test]
@@ -965,7 +1096,7 @@ mod tests {
             },
             "重复，只保留第一个",
         );
-        let listed = read(&kb, "catalog show");
+        let listed = read(&kb, "revision catalog show");
         assert_eq!(
             listed.matches("section \"Rust 内存管理\"").count(),
             1,
@@ -1061,10 +1192,10 @@ mod tests {
             "drop.json",
         );
         // 别的节点和日志里的修改都在，指向它的关联去掉了。
-        assert!(read(&kb, "show note").contains("要保留的原文"));
-        assert!(read(&kb, "show ownership").contains("note"));
-        assert!(read(&kb, "show drop").contains("E201"));
-        assert!(read(&kb, "timeline").contains("修复前的历史"));
+        assert!(read(&kb, "revision show note").contains("要保留的原文"));
+        assert!(read(&kb, "revision show ownership").contains("note"));
+        assert!(read(&kb, "revision show drop").contains("E201"));
+        assert!(read(&kb, "revision timeline").contains("修复前的历史"));
     }
 
     #[test]
@@ -1073,9 +1204,9 @@ mod tests {
             |kb| fs::write(kb.join("catalog.json"), "{").unwrap(),
             "catalog.json",
         );
-        let catalog = read(&kb, "catalog show");
+        let catalog = read(&kb, "revision catalog show");
         assert!(catalog.contains(RECOVERED_SECTION), "{catalog}");
-        assert!(read(&kb, "show note").contains("要保留的原文"));
+        assert!(read(&kb, "revision show note").contains("要保留的原文"));
     }
 
     #[test]
@@ -1092,9 +1223,9 @@ mod tests {
         );
         assert!(fixed.contains("已去掉这条引用"), "{fixed}");
         // 节点还在，并且如实说明依据丢了。
-        assert!(read(&kb, "show drop").contains("依据已经丢失"));
+        assert!(read(&kb, "revision show drop").contains("依据已经丢失"));
         // 日志里写过的原文不受影响。
-        assert!(read(&kb, "show note").contains("要保留的原文"));
+        assert!(read(&kb, "revision show note").contains("要保留的原文"));
     }
 
     #[test]
@@ -1110,8 +1241,8 @@ mod tests {
             "日志第 2 行损坏",
         );
         // 坏行前后的修改都恢复了。
-        assert!(read(&kb, "show note").contains("要保留的原文"));
-        assert!(read(&kb, "timeline").contains("修复前的历史"));
+        assert!(read(&kb, "revision show note").contains("要保留的原文"));
+        assert!(read(&kb, "revision timeline").contains("修复前的历史"));
         assert!(fixed.contains("已跳过"), "{fixed}");
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -1138,7 +1269,7 @@ mod tests {
             },
             "无法重放",
         );
-        assert!(read(&kb, "timeline").contains("还能重放"));
+        assert!(read(&kb, "revision timeline").contains("还能重放"));
     }
 
     #[test]

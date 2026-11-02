@@ -218,7 +218,7 @@ fn language_walk(
         calls: 1,
         system: Duration::ZERO,
         total: Duration::ZERO,
-        script_bytes: "catalog show".len(),
+        script_bytes: "revision catalog show".len(),
         output_bytes: 0,
     };
     let everything = Instant::now();
@@ -229,7 +229,7 @@ fn language_walk(
         .with_manual(manual)
         .with_time(None)
         .with_output_limit(usize::MAX / 2)
-        .run("catalog show");
+        .run("revision catalog show");
     walk.system += start.elapsed();
     assert!(output.ok, "{}", output.text);
     walk.output_bytes += output.text.len();
@@ -242,7 +242,7 @@ fn language_walk(
         let mut next = Vec::new();
         for chunk in layer.chunks(batch) {
             script.clear();
-            script.push_str("show ");
+            script.push_str("revision show ");
             script.push_str(&chunk.join(", "));
             let start = Instant::now();
             let output = Session::new(memory, sources, Mode::ReadOnly)

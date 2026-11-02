@@ -12,6 +12,7 @@
 cite borrowing text """用户纠正：同一时刻可以有多个共享引用，或者一个可变引用，两者不能并存。"""
 uncite borrowing source sha256:95b2eaa8612c4c91a340e14f884b6af3dabb03a762db88ec68aea84217ce0e49 161..344
 set borrowing desc """同一时刻可以有多个共享引用，或者一个可变引用，两者不能并存。"""
+save
 ```
 
 写反了会被拒绝：
@@ -52,7 +53,7 @@ warning: send-sync 依据 borrowing，证据变了，它可能需要复查
 
 这个提醒只出现这一次，不会保存，所以**必须当场处理**：
 
-1. `show` 那个结论，看它的描述和依据。
+1. `revision show` 那个结论，看它的描述和依据。
 2. 还成立：不用改，告诉用户查过了。
 3. 描述要调整：`set desc`。
 4. 不再成立：换依据（`base`、`unbase`），或者按下面的规则删除。
@@ -60,4 +61,6 @@ warning: send-sync 依据 borrowing，证据变了，它可能需要复查
 
 ## 改错了
 
-没有撤销指令。用 `timeline node 节点` 查它经历过什么，再写新的修改改回来。
+还没有 `save`：用 `revision display` 看改了什么，`discard` 放弃全部未保存的修改，或者写新的修改改回来。
+
+已经 `save`：没有撤销指令。用 `revision timeline node 节点` 查它经历过什么，再写新的修改改回来。

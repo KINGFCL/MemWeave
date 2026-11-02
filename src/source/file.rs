@@ -143,6 +143,20 @@ impl SourceStore for FileSources {
         self.verified.borrow_mut().remove(&id);
         Ok(id)
     }
+
+    /// 草稿用：不等落盘。先写临时文件再改名，已有的原文不会因为崩溃变成半个文件。
+    fn put_unsynced(&self, bytes: &[u8]) -> Result<SourceId, Error> {
+        let id = source_id(bytes);
+        let path = self.path(&id)?;
+        if fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return Ok(id);
+        }
+        let failed = |e: std::io::Error| Error::Save(format!("{}：{e}", path.display()));
+        durable::create_private_dir(&self.dir).map_err(failed)?;
+        durable::write_replace(&path, bytes).map_err(failed)?;
+        self.verified.borrow_mut().remove(&id);
+        Ok(id)
+    }
 }
 
 #[cfg(test)]

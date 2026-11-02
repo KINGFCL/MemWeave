@@ -18,6 +18,7 @@ source arc-atomic
   related send-sync
   related_by ownership
 end
+save
 ```
 
 - **由已有知识推出：** 用 `add`，必须写 `based_on`。可以同时补一段原文，但不能只有原文。
@@ -29,9 +30,10 @@ add thread-safety-from-borrowing
   based_on borrowing, send-sync
   related_by send-sync
 end
+save
 ```
 
-- **引用已有原文的一段：** 地址和范围抄 `show` 的输出。
+- **引用已有原文的一段：** 地址和范围抄 `revision show` 的输出。
 
 ```memweave
 source drop-order
@@ -40,6 +42,7 @@ source drop-order
   source sha256:95b2eaa8612c4c91a340e14f884b6af3dabb03a762db88ec68aea84217ce0e49 345..462
   related_by drop
 end
+save
 ```
 
 ## 怎么写 `text`
@@ -57,4 +60,5 @@ def f():
 """"
   related_by ownership
 end
+save
 ```

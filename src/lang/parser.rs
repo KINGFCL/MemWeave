@@ -2,11 +2,15 @@
 
 use crate::board::BoardOp;
 
-use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Statement};
+use super::ast::{AddNode, Citation, Field, Label, Located, Name, SourceRef, Statement, Version};
 use super::diagnostic::{Diagnostic, Span, closest};
 use super::lexer::{Token, TokenKind};
 
-pub(crate) const KEYWORDS: [&str; 23] = [
+pub(crate) const KEYWORDS: [&str; 27] = [
+    "revision",
+    "origin",
+    "save",
+    "discard",
     "catalog",
     "check",
     "export",
@@ -52,6 +56,19 @@ const SOURCE_CLAUSES: [&str; 7] = [
 ];
 /// 写这些的人想搜索，但这个系统靠走图回忆。
 const SEARCH_WORDS: [&str; 7] = ["search", "find", "grep", "list", "ls", "query", "lookup"];
+/// 可以写在 `revision` 和 `origin` 后面的语句。
+const READ_COMMANDS: [&str; 10] = [
+    "catalog show",
+    "show",
+    "links",
+    "evidence",
+    "based_by",
+    "related_by",
+    "full_source",
+    "check",
+    "timeline",
+    "export",
+];
 const CATALOG_COMMANDS: [&str; 7] = [
     "show", "create", "describe", "rename", "delete", "add", "remove",
 ];
@@ -65,6 +82,15 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 const MAX_TIMELINE_LIMIT: usize = 1000;
 const GOAL_COMMANDS: [&str; 3] = ["create", "done", "drop"];
 const STEP_COMMANDS: [&str; 5] = ["add", "start", "done", "block", "remove"];
+
+fn not_a_read(span: Span, version: &str, what: &str, hint: &str) -> Diagnostic {
+    Diagnostic::new(
+        "E101",
+        span,
+        format!("{version} 后面只能写读语句，不能写 {what}"),
+    )
+    .with_hint(hint)
+}
 
 pub fn parse(tokens: Vec<Token>) -> (Vec<Located>, Vec<Diagnostic>) {
     let mut parser = Parser {
@@ -123,15 +149,14 @@ impl Parser {
         let keyword = keyword.clone();
         self.position += 1;
         let statement = match keyword.as_str() {
+            "revision" => self.versioned(token, Version::Revision)?,
+            "origin" => self.versioned(token, Version::Origin)?,
+            "save" => Statement::Save,
+            "discard" => Statement::Discard,
             "catalog" => self.catalog(token)?,
-            "export" => Statement::Export(self.label("导出路径")?),
-            "check" => Statement::Check,
-            "show" => self.for_each_name(Statement::Show)?,
-            "evidence" => self.for_each_name(Statement::Evidence)?,
-            "based_by" => self.for_each_name(Statement::BasedBy)?,
-            "related_by" => self.for_each_name(Statement::RelatedBy)?,
+            "export" | "check" | "show" | "evidence" | "based_by" | "related_by" | "links"
+            | "full_source" | "timeline" => self.read_statement(&keyword)?,
             "remove" => Statement::Remove(self.name("节点地址")?),
-            "links" => self.links()?,
             "link" => {
                 let (from, to) = self.arrow()?;
                 Statement::Link { from, to }
@@ -149,12 +174,10 @@ impl Parser {
                 let (id, on) = self.on()?;
                 Statement::Unbase { id, on }
             }
-            "full_source" => self.full_source()?,
             "cite" => self.cite()?,
             "goal" => self.goal(token)?,
             "step" => self.step(token)?,
             "log" => Statement::Log(self.label("要记下的内容")?),
-            "timeline" => self.timeline()?,
             "uncite" => {
                 let id = self.name("节点地址")?;
                 self.expect_word("source", "写法：uncite 节点 source sha256:... 起始..结束")?;
@@ -170,7 +193,7 @@ impl Parser {
                     Diagnostic::new("E101", token.span, format!("没有 {other} 这条指令"));
                 error = if SEARCH_WORDS.contains(&other) {
                     error.with_hint(
-                        "这里没有搜索，也不能列出所有节点。想查一个词，就想它属于哪个领域，从 catalog show 开始，沿关联一层层走",
+                        "这里没有搜索，也不能列出所有节点。想查一个词，就想它属于哪个领域，从 revision catalog show 开始，沿关联一层层走",
                     )
                 } else {
                     match closest(other, KEYWORDS.into_iter()) {
@@ -183,6 +206,62 @@ impl Parser {
         };
         self.end_of_line()?;
         Ok(statement)
+    }
+
+    /// 除了 `catalog show` 以外的读语句。指令本身已经读过了。
+    fn read_statement(&mut self, command: &str) -> Result<Statement, Skip> {
+        match command {
+            "export" => Ok(Statement::Export(self.label("导出路径")?)),
+            "check" => Ok(Statement::Check),
+            "show" => self.for_each_name(Statement::Show),
+            "evidence" => self.for_each_name(Statement::Evidence),
+            "based_by" => self.for_each_name(Statement::BasedBy),
+            "related_by" => self.for_each_name(Statement::RelatedBy),
+            "links" => self.links(),
+            "full_source" => self.full_source(),
+            "timeline" => self.timeline(),
+            _ => unreachable!("调用方只传读语句"),
+        }
+    }
+
+    /// `revision` 或 `origin` 后面的部分。
+    fn versioned(&mut self, keyword: &Token, version: Version) -> Result<Statement, Skip> {
+        let name = version.keyword();
+        let hint = format!("可以写：{}", READ_COMMANDS.join("、"));
+        let Some(token) = self.peek_word() else {
+            return self.fail(
+                Diagnostic::new("E102", keyword.span, format!("{name} 后面要写读语句"))
+                    .with_hint(hint),
+            );
+        };
+        let command = word_of(&token);
+        if version == Version::Revision && command == "display" {
+            self.position += 1;
+            let node = match self.peek_word() {
+                Some(_) => Some(self.name("节点地址")?),
+                None => None,
+            };
+            return Ok(Statement::RevisionDisplay(node));
+        }
+        let statement = if command == "catalog" {
+            self.position += 1;
+            let statement = self.catalog(&token)?;
+            if statement != Statement::CatalogShow {
+                return self.fail(not_a_read(token.span, name, "catalog 的修改", &hint));
+            }
+            statement
+        } else if READ_COMMANDS.contains(&command.as_str()) {
+            self.position += 1;
+            self.read_statement(&command)?
+        } else {
+            return self.fail(not_a_read(token.span, name, &command, &hint));
+        };
+        // `show a, b` 的每个地址都是一条语句，每条都要带上版本。
+        for extra in &mut self.extra {
+            let bare = std::mem::replace(&mut extra.statement, Statement::Save);
+            extra.statement = Statement::Versioned(version, Box::new(bare));
+        }
+        Ok(Statement::Versioned(version, Box::new(statement)))
     }
 
     /// 取出 `keyword` 后面的操作名。

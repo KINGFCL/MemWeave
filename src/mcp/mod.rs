@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::export::json::JsonExporter;
 use crate::export::{Exporter, target_problem};
 use crate::knowledge::Catalog;
-use crate::lang::exec::render_overview;
+use crate::lang::exec::{render_overview, revision_note};
 use crate::lang::journal::{Journal, WriteLock, load_current};
 use crate::lang::{Mode, Output, Session};
 use crate::maintain;
@@ -47,13 +47,14 @@ pub fn serve(knowledge_base: &Path, max_output_bytes: usize) -> Result<(), Error
     create_if_empty(knowledge_base)?;
     let lock = WriteLock::acquire(knowledge_base)?;
     let sources = FileSources::new(knowledge_base);
-    let memory = load_current(&JsonParser, &sources, knowledge_base).inspect_err(|_| {
+    let mut memory = load_current(&JsonParser, &sources, knowledge_base).inspect_err(|_| {
         eprintln!(
             "运行 memweave doctor {0} 查看详情，doctor --fix 可以尽量恢复",
             knowledge_base.display()
         );
     })?;
     let journal = Journal::new(knowledge_base);
+    journal.restore_draft(&mut memory, &sources, true);
     let manual = Manual::new()?;
 
     let (jobs, queue) = mpsc::channel();
@@ -174,7 +175,7 @@ enum Listed {
 }
 
 fn listed(script: &str) -> Listed {
-    let is_listing = |line: &str| line.trim() == "catalog show";
+    let is_listing = |line: &str| line.trim() == "revision catalog show";
     let mut lines = script.lines().filter(|line| !line.trim().is_empty());
     if lines.next_back().is_some_and(is_listing) {
         Listed::Last
@@ -188,6 +189,10 @@ fn listed(script: &str) -> Listed {
 /// 附带的内容。最多占输出上限的一半，总能留出位置给脚本的结果。
 fn attached_overview(memory: &Memory, manual: &Manual, max_output_bytes: usize) -> String {
     let mut text = render_overview(memory, Some(manual));
+    // 重启后接上的草稿，模型靠这里才知道。
+    if let Some(note) = revision_note(memory) {
+        text = format!("{note}\n{text}");
+    }
     let limit = max_output_bytes / 2;
     if text.len() > limit {
         let mut end = limit;
@@ -195,7 +200,7 @@ fn attached_overview(memory: &Memory, manual: &Manual, max_output_bytes: usize) 
             end -= 1;
         }
         text.truncate(end);
-        text.push_str("\n（工作板和总表太长，被截断了，用 catalog show 看全）\n");
+        text.push_str("\n（工作板和总表太长，被截断了，用 revision catalog show 看全）\n");
     }
     format!("{ATTACHED_HEADER}\n{text}")
 }

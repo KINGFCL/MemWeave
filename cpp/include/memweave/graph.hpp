@@ -14,6 +14,7 @@
 #include <initializer_list>
 #include <limits>
 #include <new>
+#include <utility>
 
 namespace memweave {
 
@@ -504,6 +505,129 @@ inline void delete_node(Node* node) noexcept {
   delete[] node->backlinks->cold;
   node->~Node();
   ::operator delete(node, kNodeAlignment);
+}
+
+// 草稿里被改过的节点的原版：第一次改这个节点之前存下来。
+//
+// 没被改过的节点不存，两个版本共用。这里只存地址和长度，文本和列表本身不拷贝：
+// - 文本和证据：修改函数总是分配新内容，旧内容原样留着，所以只要把释放它的责任交给原版。
+// - 关联列表：修改函数会原地改，所以第一次改某个列表之前，用 own_list 给当前版本一份拷贝。
+//
+// 之后节点里的 flags 只表示当前版本自己分配的内容，原版分配的记在 header.flags 里。
+struct NodeImage {
+  Node header;
+  const NodeList* based_by;
+  const NodeList* related_by;
+};
+
+// 存下原版。内存不足时返回 nullptr，节点不变。
+inline NodeImage* save_node(Node* node) noexcept {
+  auto* image = new (std::nothrow)
+      NodeImage{*node, node->backlinks->based_by, node->backlinks->related_by};
+  if (image != nullptr) {
+    node->flags = 0;
+  }
+  return image;
+}
+
+// 让当前版本拥有这个列表自己的拷贝，之后可以原地修改。内存不足时返回 false，节点不变。
+inline bool own_list(Node* node, LinkKind kind) noexcept {
+  if ((node->flags & heap_flag(kind)) != 0) {
+    return true;
+  }
+  const NodeList* list = link_list(node, kind);
+  std::size_t capacity = std::size_t{list->count} + 1;
+  if (capacity < 4) {
+    capacity = 4;
+  }
+  if (capacity > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  char* memory = new (std::nothrow) char[sizeof(NodeList) + capacity * sizeof(Node*)];
+  if (memory == nullptr) {
+    return false;
+  }
+  auto* copy = new (memory) NodeList{list->count, static_cast<std::uint32_t>(capacity)};
+  if (list->count != 0) {
+    std::memcpy(copy->nodes(), list->nodes(), list->count * sizeof(Node*));
+  }
+  replace_link_list(node, kind, copy);
+  node->flags |= heap_flag(kind);
+  return true;
+}
+
+// 交换节点和原版的内容，交换两次就回到原样。只换地址，所以不分配内存，也不会失败。
+inline void swap_image(Node* node, NodeImage* image) noexcept {
+  std::swap(*node, image->header);
+  auto* backlinks = const_cast<Backlinks*>(node->backlinks);
+  std::swap(backlinks->based_by, image->based_by);
+  std::swap(backlinks->related_by, image->related_by);
+}
+
+inline const NodeList* image_list(const NodeImage* image, LinkKind kind) noexcept {
+  switch (kind) {
+    case LinkKind::kRelated:
+      return image->header.related;
+    case LinkKind::kBasedBy:
+      return image->based_by;
+    case LinkKind::kRelatedBy:
+      return image->related_by;
+  }
+  return nullptr;
+}
+
+// 保存草稿：留下当前版本，释放原版独有的内容和 image。不会失败。
+inline void keep_revision(Node* node, NodeImage* image) noexcept {
+  const std::uint32_t saved_flags = image->header.flags;
+  const auto settle = [&](const void* current, const void* saved, std::uint32_t flag) {
+    if (current == saved) {
+      // 这一项没改过，释放它的责任交回节点。
+      node->flags |= saved_flags & flag;
+    } else if ((saved_flags & flag) != 0) {
+      delete[] static_cast<const char*>(saved);
+    }
+  };
+  for (LinkKind kind : {LinkKind::kRelated, LinkKind::kBasedBy, LinkKind::kRelatedBy}) {
+    const NodeList* current = link_list(node, kind);
+    const NodeList* saved = image_list(image, kind);
+    const std::uint32_t flag = heap_flag(kind);
+    settle(current, saved, flag);
+    // 放得下就搬回节点的内存块：关联列表紧贴节点，遍历时才有缓存优势。
+    if (current != saved && (saved_flags & flag) == 0 && current->count <= saved->capacity) {
+      auto* home = const_cast<NodeList*>(saved);
+      home->count = current->count;
+      if (current->count != 0) {
+        std::memcpy(home->nodes(), current->nodes(), current->count * sizeof(Node*));
+      }
+      delete[] reinterpret_cast<const char*>(current);
+      replace_link_list(node, kind, home);
+      node->flags &= ~flag;
+    }
+  }
+  settle(node->title, image->header.title, kTitleOnHeap);
+  settle(node->description, image->header.description, kDescriptionOnHeap);
+  settle(node->evidence, image->header.evidence, kEvidenceOnHeap);
+  delete image;
+}
+
+// 放弃草稿：回到原版，释放当前版本独有的内容和 image。不会失败。
+inline void keep_origin(Node* node, NodeImage* image) noexcept {
+  const auto drop = [&](const void* current, const void* saved, std::uint32_t flag) {
+    if (current != saved && (node->flags & flag) != 0) {
+      delete[] static_cast<const char*>(current);
+    }
+  };
+  for (LinkKind kind : {LinkKind::kRelated, LinkKind::kBasedBy, LinkKind::kRelatedBy}) {
+    drop(link_list(node, kind), image_list(image, kind), heap_flag(kind));
+  }
+  drop(node->title, image->header.title, kTitleOnHeap);
+  drop(node->description, image->header.description, kDescriptionOnHeap);
+  drop(node->evidence, image->header.evidence, kEvidenceOnHeap);
+  auto* backlinks = const_cast<Backlinks*>(node->backlinks);
+  backlinks->based_by = image->based_by;
+  backlinks->related_by = image->related_by;
+  *node = image->header;
+  delete image;
 }
 
 // 节点的 set：文本地址到内存地址。保证 agent 用文本地址访问的节点是存在的。

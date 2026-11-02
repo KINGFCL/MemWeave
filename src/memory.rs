@@ -7,12 +7,12 @@ use std::ptr::{self, NonNull};
 use std::slice;
 use std::str;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::board::{self, BoardError, BoardOp};
 use crate::error::Error;
-use crate::ffi::{self, RawBytes, RawEvidence, RawNode, RawNodeList};
+use crate::ffi::{self, RawBytes, RawEvidence, RawImage, RawNode, RawNodeList};
 use crate::knowledge::{Catalog, CatalogEntry, Evidence, Locator, Node, NodeId, Section, SourceId};
 use crate::parse::{ParsedKnowledge, Parser};
 use crate::source::{LoadedEvidence, SourceStore, is_valid_source_id};
@@ -37,6 +37,59 @@ pub struct Memory {
     index: NonNull<ffi::RawIndex>,
     timeline: Vec<Event>,
     node_times: HashMap<NodeId, NodeTimes>,
+    /// 还没保存的修改。见 [`Memory::begin_draft`]。
+    draft: Option<Draft>,
+    /// 正在读已保存的版本时，时间线只显示这么多条。
+    origin_timeline: Option<usize>,
+}
+
+/// 草稿里的一段脚本和它执行的时间。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftScript {
+    pub script: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
+/// 草稿：图就地修改，这里只存被改过的部分原来的样子，所以占用的内存只和改动量有关。
+///
+/// 两个版本不会串，靠的是这几条：
+/// - 原版存下之后不再被修改，所有修改都落在新内容上。
+/// - 原版的列表只指向原版里的节点，当前版本的列表只指向当前版本里的节点。删节点前会先存下所有
+///   指向它的列表，反向列表保证一个都不会漏。
+/// - 进入图只有索引这一个入口，切换版本时索引一起切。
+struct Draft {
+    images: HashMap<NonNull<RawNode>, NonNull<RawImage>>,
+    /// 草稿新建的节点。它们没有原版，所以不用存；在草稿里又删掉时可以立刻释放。
+    added: HashSet<NonNull<RawNode>>,
+    /// 草稿删除的原有节点。原版还要读它们，保存时才释放。
+    removed: HashMap<NodeId, NonNull<RawNode>>,
+    /// 原版的总表和工作板，第一次改它们时才存。
+    catalog: Option<Catalog>,
+    /// 原版的时间线有多长。时间线只追加，不用另存。
+    timeline_len: usize,
+    /// 改过的节点时间原来的值。
+    node_times: HashMap<NodeId, Option<NodeTimes>>,
+    scripts: Vec<DraftScript>,
+}
+
+/// 一个节点在草稿里的变化。只比较模型能写的内容，反向列表跟着变，不算在内。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeChange {
+    pub id: NodeId,
+    /// 已保存的版本。新增的节点没有。
+    pub before: Option<Node>,
+    /// 当前草稿。被删的节点没有。
+    pub after: Option<Node>,
+}
+
+/// 草稿和已保存版本的差异。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    /// 按地址排序。
+    pub nodes: Vec<NodeChange>,
+    /// 总表或工作板变了时，改之前的样子。
+    pub catalog_before: Option<Catalog>,
 }
 
 // 整张图可以移动到另一个线程，但不实现 Sync：一张图只属于一个线程，别的线程要用就自己加载一份。
@@ -52,6 +105,7 @@ impl fmt::Debug for Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        self.abort_draft();
         let mut cursor = 0;
         loop {
             let raw = unsafe { ffi::mw_index_next(self.index.as_ptr(), &raw mut cursor) };
@@ -312,6 +366,8 @@ impl Memory {
             index,
             timeline: Vec::new(),
             node_times: HashMap::new(),
+            draft: None,
+            origin_timeline: None,
         };
         // 先创建所有节点，再连接它们，这样节点之间可以直接存地址。
         for node in &nodes {
@@ -474,6 +530,16 @@ impl Memory {
             .map(|id| self.lookup(id))
             .collect();
 
+        for target in &related_targets {
+            self.touch_list(*target, ffi::LINK_RELATED_BY)?;
+        }
+        for target in &evidence_targets {
+            self.touch_list(*target, ffi::LINK_BASED_BY)?;
+        }
+        for from in &incoming {
+            self.touch_list(*from, ffi::LINK_RELATED)?;
+        }
+
         let links_to_itself = node.related.contains(&node.id);
         let raw = new_node(&node, 0, incoming.len() + usize::from(links_to_itself))?;
 
@@ -491,6 +557,9 @@ impl Memory {
         if !reserved || self.index_insert(raw).is_err() {
             unsafe { ffi::mw_node_free(raw.as_ptr()) };
             return Err(Error::OutOfMemory);
+        }
+        if let Some(draft) = &mut self.draft {
+            draft.added.insert(raw);
         }
 
         let related: Vec<*mut RawNode> = node
@@ -607,15 +676,51 @@ impl Memory {
                 .collect(),
         };
 
+        self.touch_neighbours(raw)?;
+        self.touch_catalog();
         for section in &mut self.catalog.sections {
             section.nodes.retain(|entry| entry.id != id);
         }
         unsafe {
             ffi::mw_index_erase(self.index.as_ptr(), RawBytes::from_slice(id.as_bytes()));
             ffi::mw_node_detach(raw.as_ptr());
-            ffi::mw_node_free(raw.as_ptr());
+        }
+        // 原版还要读原有的节点，保存时才释放。
+        let keep = self.draft.as_mut().is_some_and(|draft| {
+            let keep = !draft.added.remove(&raw);
+            if keep {
+                draft.removed.insert(id.to_owned(), raw);
+            }
+            keep
+        });
+        if !keep {
+            unsafe { ffi::mw_node_free(raw.as_ptr()) };
         }
         Ok(removed)
+    }
+
+    /// 删除节点会改到所有和它相连的列表，先存下它们。节点关联自己时，它自己的列表也在内。
+    fn touch_neighbours(&mut self, raw: NonNull<RawNode>) -> Result<(), Error> {
+        if self.draft.is_none() {
+            return Ok(());
+        }
+        let node = NodeRef::new(raw);
+        let related_by: Vec<_> = node.related_by().map(|other| other.raw).collect();
+        let related: Vec<_> = node.related().map(|other| other.raw).collect();
+        let based_on: Vec<_> = node.based_on().map(|other| other.raw).collect();
+        for other in related_by {
+            self.touch_list(other, ffi::LINK_RELATED)?;
+            if other == raw {
+                self.touch_list(raw, ffi::LINK_RELATED_BY)?;
+            }
+        }
+        for other in related {
+            self.touch_list(other, ffi::LINK_RELATED_BY)?;
+        }
+        for other in based_on {
+            self.touch_list(other, ffi::LINK_BASED_BY)?;
+        }
+        Ok(())
     }
 
     /// 从总表出发沿关联走不到的节点，按 id 排序。要走遍全图，适合一批修改结束后调用一次。
@@ -693,12 +798,16 @@ impl Memory {
 
     /// 对工作板执行一个操作，返回给模型看的结果。
     pub fn apply_board(&mut self, op: &BoardOp) -> Result<String, BoardError> {
+        self.touch_catalog();
         board::apply(&mut self.catalog.goals, op)
     }
 
     /// 发生过的事，从旧到新。
     pub fn timeline(&self) -> &[Event] {
-        &self.timeline
+        match self.origin_timeline {
+            Some(len) => &self.timeline[..len],
+            None => &self.timeline,
+        }
     }
 
     /// 节点的创建和更新时间，由时间线得出。没有记录时都是 `None`。
@@ -723,6 +832,12 @@ impl Memory {
 
     /// 记下一件发生过的事，并更新相关节点的时间。
     pub fn record(&mut self, event: Event) {
+        if let Some(draft) = &mut self.draft {
+            for id in &event.nodes {
+                let current = self.node_times.get(id).copied();
+                draft.node_times.entry(id.clone()).or_insert(current);
+            }
+        }
         for (index, id) in event.nodes.iter().enumerate() {
             match (index, event.action) {
                 (0, Action::Remove) => {
@@ -750,6 +865,7 @@ impl Memory {
                 name: name.to_owned(),
             }]));
         }
+        self.touch_catalog();
         self.catalog.sections.push(Section {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -761,6 +877,7 @@ impl Memory {
     /// 修改板块的描述。
     pub fn catalog_describe(&mut self, name: &str, description: &str) -> Result<(), Error> {
         let index = self.find_section(name)?;
+        self.touch_catalog();
         description.clone_into(&mut self.catalog.sections[index].description);
         Ok(())
     }
@@ -773,6 +890,7 @@ impl Memory {
                 name: new_name.to_owned(),
             }]));
         }
+        self.touch_catalog();
         new_name.clone_into(&mut self.catalog.sections[index].name);
         Ok(())
     }
@@ -780,6 +898,7 @@ impl Memory {
     /// 删除板块，返回它原来的代表节点。节点本身保留，但可能有节点因此查不到了。
     pub fn catalog_delete(&mut self, name: &str) -> Result<Vec<CatalogEntry>, Error> {
         let index = self.find_section(name)?;
+        self.touch_catalog();
         Ok(self.catalog.sections.remove(index).nodes)
     }
 
@@ -787,6 +906,7 @@ impl Memory {
     pub fn catalog_add(&mut self, id: &str, section: &str) -> Result<(), Error> {
         let title = NodeRef::new(self.find(id)?).title().to_owned();
         let index = self.find_section(section)?;
+        self.touch_catalog();
         let nodes = &mut self.catalog.sections[index].nodes;
         if nodes.iter().any(|entry| entry.id == id) {
             return Err(Error::InvalidMemory(vec![Problem::AlreadyRepresentative {
@@ -804,6 +924,7 @@ impl Memory {
     /// 撤下板块的代表，节点本身保留。之后可能有节点查不到了，见 [`Memory::unreachable`]。
     pub fn catalog_remove(&mut self, id: &str, section: &str) -> Result<(), Error> {
         let index = self.find_section(section)?;
+        self.touch_catalog();
         let nodes = &mut self.catalog.sections[index].nodes;
         let Some(position) = nodes.iter().position(|entry| entry.id == id) else {
             return Err(Error::InvalidMemory(vec![Problem::NotRepresentative {
@@ -830,6 +951,7 @@ impl Memory {
     /// 修改节点的标题，总表里的标题也跟着改。
     pub fn set_title(&mut self, id: &str, title: &str) -> Result<(), Error> {
         self.set_text(id, ffi::TEXT_TITLE, title)?;
+        self.touch_catalog();
         for entry in self.catalog.sections.iter_mut().flat_map(|s| &mut s.nodes) {
             if entry.id == id {
                 title.clone_into(&mut entry.title);
@@ -846,6 +968,8 @@ impl Memory {
     /// 新增一条关联 `from -> to`，两个方向都会更新。
     pub fn link(&mut self, from: &str, to: &str) -> Result<(), Error> {
         let (from, to) = (self.find(from)?, self.find(to)?);
+        self.touch_list(from, ffi::LINK_RELATED)?;
+        self.touch_list(to, ffi::LINK_RELATED_BY)?;
         if unsafe { ffi::mw_node_link(from.as_ptr(), to.as_ptr()) } {
             Ok(())
         } else {
@@ -856,6 +980,8 @@ impl Memory {
     /// 去掉关联 `from -> to`，两个方向都会更新。之后可能有节点查不到了，见 [`Memory::unreachable`]。
     pub fn unlink(&mut self, from: &str, to: &str) -> Result<(), Error> {
         let (from, to) = (self.find(from)?, self.find(to)?);
+        self.touch_list(from, ffi::LINK_RELATED)?;
+        self.touch_list(to, ffi::LINK_RELATED_BY)?;
         unsafe { ffi::mw_node_unlink(from.as_ptr(), to.as_ptr()) };
         Ok(())
     }
@@ -868,6 +994,8 @@ impl Memory {
                 ids: vec![id.to_owned(), on.to_owned()],
             }]));
         }
+        self.touch(node)?;
+        self.touch_list(target, ffi::LINK_BASED_BY)?;
         if unsafe { ffi::mw_node_add_evidence(node.as_ptr(), target.as_ptr()) } {
             Ok(())
         } else {
@@ -878,7 +1006,7 @@ impl Memory {
     /// 去掉 `id` 对 `on` 的依据。节点不能因此失去所有证据。
     pub fn unbase(&mut self, id: &str, on: &str) -> Result<(), Error> {
         let raw = self.find(id)?;
-        self.find(on)?;
+        let target = self.find(on)?;
         let evidence = NodeRef::new(raw).evidence();
         let remaining = evidence
             .iter()
@@ -889,6 +1017,8 @@ impl Memory {
                 id: id.to_owned(),
             }]));
         }
+        self.touch(raw)?;
+        self.touch_list(target, ffi::LINK_BASED_BY)?;
         let bytes = RawBytes::from_slice(on.as_bytes());
         if unsafe { ffi::mw_node_remove_evidence(raw.as_ptr(), bytes) } {
             Ok(())
@@ -917,6 +1047,7 @@ impl Memory {
         if NodeRef::new(raw).evidence().contains(&citation) {
             return Ok(());
         }
+        self.touch(raw)?;
         let Locator::TextRange { start, end } = *locator;
         let bytes = RawBytes::from_slice(source.as_bytes());
         if unsafe {
@@ -950,6 +1081,7 @@ impl Memory {
                 id: id.to_owned(),
             }]));
         }
+        self.touch(raw)?;
         let bytes = RawBytes::from_slice(source.as_bytes());
         if unsafe {
             ffi::mw_node_remove_source_evidence(raw.as_ptr(), bytes, start as u64, end as u64)
@@ -962,6 +1094,7 @@ impl Memory {
 
     fn set_text(&mut self, id: &str, field: u32, text: &str) -> Result<(), Error> {
         let raw = self.find(id)?;
+        self.touch(raw)?;
         let bytes = RawBytes::from_slice(text.as_bytes());
         if unsafe { ffi::mw_node_set_text(raw.as_ptr(), field, bytes) } {
             Ok(())
@@ -991,6 +1124,257 @@ impl Memory {
         } else {
             Err(Error::OutOfMemory)
         }
+    }
+}
+
+/// 草稿：所有修改先落在这里，保存之后才算数。
+impl Memory {
+    /// 开始记录草稿。之后的修改照常改图，但都能恢复。已经有草稿时什么也不做。
+    ///
+    /// 没开始时，修改直接生效，每个写方法只多判断一次。读取的路径完全不变。
+    pub fn begin_draft(&mut self) {
+        if self.draft.is_none() {
+            self.draft = Some(Draft {
+                images: HashMap::new(),
+                added: HashSet::new(),
+                removed: HashMap::new(),
+                catalog: None,
+                timeline_len: self.timeline.len(),
+                node_times: HashMap::new(),
+                scripts: Vec::new(),
+            });
+        }
+    }
+
+    /// 有没有还没保存的修改。
+    pub fn has_revision(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// 草稿里的脚本，保存时写进日志。
+    pub fn draft_scripts(&self) -> &[DraftScript] {
+        self.draft.as_ref().map_or(&[], |draft| &draft.scripts)
+    }
+
+    /// 记下草稿里执行过的脚本。没有草稿时什么也不做。
+    pub fn note_draft_script(&mut self, script: DraftScript) {
+        if let Some(draft) = &mut self.draft {
+            draft.scripts.push(script);
+        }
+    }
+
+    /// 草稿里发生的事，从旧到新。
+    pub fn draft_events(&self) -> &[Event] {
+        self.draft
+            .as_ref()
+            .map_or(&[], |draft| &self.timeline[draft.timeline_len..])
+    }
+
+    /// 保存草稿：留下当前版本，释放原版独有的内容。写日志由调用方负责。没有草稿时什么也不做。
+    pub fn commit_draft(&mut self) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        unsafe {
+            for (raw, image) in draft.images {
+                ffi::mw_image_keep_revision(raw.as_ptr(), image.as_ptr());
+            }
+            for raw in draft.removed.into_values() {
+                ffi::mw_node_free(raw.as_ptr());
+            }
+        }
+    }
+
+    /// 放弃草稿：图回到开始时的样子，包括列表的顺序。没有草稿时什么也不做。
+    ///
+    /// 图这一层不分配内存，所以内存不足时也能恢复。
+    pub fn abort_draft(&mut self) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        for raw in &draft.added {
+            self.index_erase(*raw);
+        }
+        unsafe {
+            for (raw, image) in draft.images {
+                ffi::mw_image_keep_origin(raw.as_ptr(), image.as_ptr());
+            }
+        }
+        for raw in draft.removed.into_values() {
+            self.index_restore(raw);
+        }
+        for raw in draft.added {
+            unsafe { ffi::mw_node_free(raw.as_ptr()) };
+        }
+        if let Some(catalog) = draft.catalog {
+            self.catalog = catalog;
+        }
+        self.timeline.truncate(draft.timeline_len);
+        for (id, times) in draft.node_times {
+            match times {
+                Some(times) => self.node_times.insert(id, times),
+                None => self.node_times.remove(&id),
+            };
+        }
+    }
+
+    /// 在已保存的版本上读。没有草稿时就是当前版本。
+    ///
+    /// 把改过的地方换成原版，读完再换回来，所以两个版本走同一份读取代码。闭包只拿到 `&Memory`，
+    /// 读的时候改不了图，节点的地址也带不出去。
+    pub fn with_origin<R>(&mut self, read: impl FnOnce(&Memory) -> R) -> R {
+        struct Restore<'m>(&'m mut Memory);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.switch_version(false);
+            }
+        }
+        self.switch_version(true);
+        let restore = Restore(self);
+        read(restore.0)
+    }
+
+    /// 这个地址在已保存的版本里有没有。
+    pub fn in_origin(&self, id: &str) -> bool {
+        let Some(draft) = &self.draft else {
+            return self.contains(id);
+        };
+        draft.removed.contains_key(id)
+            || self
+                .find_raw(id)
+                .is_some_and(|raw| !draft.added.contains(&raw))
+    }
+
+    /// 草稿和已保存版本的差异。没有草稿时返回 `None`。改了又改回去的不算。
+    pub fn revision(&mut self) -> Option<Revision> {
+        let draft = self.draft.as_ref()?;
+        let mut ids: Vec<NodeId> = draft
+            .images
+            .keys()
+            .chain(&draft.added)
+            .map(|raw| NodeRef::new(*raw).id().to_owned())
+            .chain(draft.removed.keys().cloned())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let catalog_before = draft
+            .catalog
+            .as_ref()
+            .filter(|before| **before != self.catalog)
+            .cloned();
+        let after: Vec<Option<Node>> = ids
+            .iter()
+            .map(|id| self.node(id).map(NodeRef::to_node))
+            .collect();
+        let before: Vec<Option<Node>> = self.with_origin(|origin| {
+            ids.iter()
+                .map(|id| origin.node(id).map(NodeRef::to_node))
+                .collect()
+        });
+        let nodes = ids
+            .into_iter()
+            .zip(before.into_iter().zip(after))
+            .filter(|(_, (before, after))| before != after)
+            .map(|(id, (before, after))| NodeChange { id, before, after })
+            .collect();
+        Some(Revision {
+            nodes,
+            catalog_before,
+        })
+    }
+
+    /// 切换到已保存的版本，或者切回来。只换地址，不拷贝内容，成本和改动量成正比。
+    fn switch_version(&mut self, to_origin: bool) {
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        unsafe {
+            for (raw, image) in &draft.images {
+                ffi::mw_image_swap(raw.as_ptr(), image.as_ptr());
+            }
+        }
+        // 先去掉再放入：索引的大小不会超过这个版本曾经有过的大小，所以不用扩容。
+        let index = self.index;
+        let erase = |raw: NonNull<RawNode>| {
+            let id = NodeRef::new(raw).id();
+            unsafe { ffi::mw_index_erase(index.as_ptr(), RawBytes::from_slice(id.as_bytes())) };
+        };
+        let insert = |raw: NonNull<RawNode>| {
+            let inserted = unsafe { ffi::mw_index_insert(index.as_ptr(), raw.as_ptr()) };
+            assert!(inserted, "索引容量够用，不会扩容");
+        };
+        if to_origin {
+            draft.added.iter().copied().for_each(erase);
+            draft.removed.values().copied().for_each(insert);
+        } else {
+            draft.removed.values().copied().for_each(erase);
+            draft.added.iter().copied().for_each(insert);
+        }
+        if let Some(catalog) = &mut draft.catalog {
+            std::mem::swap(catalog, &mut self.catalog);
+        }
+        for (id, saved) in &mut draft.node_times {
+            let current = self.node_times.get(id).copied();
+            match *saved {
+                Some(times) => {
+                    self.node_times.insert(id.clone(), times);
+                }
+                None => {
+                    self.node_times.remove(id);
+                }
+            }
+            *saved = current;
+        }
+        self.origin_timeline = to_origin.then_some(draft.timeline_len);
+    }
+
+    /// 第一次改这个节点之前存下原版。草稿新建的节点没有原版。
+    fn touch(&mut self, raw: NonNull<RawNode>) -> Result<(), Error> {
+        let Some(draft) = &mut self.draft else {
+            return Ok(());
+        };
+        if draft.added.contains(&raw) || draft.images.contains_key(&raw) {
+            return Ok(());
+        }
+        let image =
+            NonNull::new(unsafe { ffi::mw_image_save(raw.as_ptr()) }).ok_or(Error::OutOfMemory)?;
+        draft.images.insert(raw, image);
+        Ok(())
+    }
+
+    /// 第一次改这个列表之前给当前版本一份拷贝，旧列表留给原版。列表是原地修改的，必须在改之前调用。
+    fn touch_list(&mut self, raw: NonNull<RawNode>, kind: u32) -> Result<(), Error> {
+        let Some(draft) = &self.draft else {
+            return Ok(());
+        };
+        if draft.added.contains(&raw) {
+            return Ok(());
+        }
+        self.touch(raw)?;
+        if unsafe { ffi::mw_image_own_list(raw.as_ptr(), kind) } {
+            Ok(())
+        } else {
+            Err(Error::OutOfMemory)
+        }
+    }
+
+    /// 第一次改总表或工作板之前存下原版。
+    fn touch_catalog(&mut self) {
+        if let Some(draft) = &mut self.draft
+            && draft.catalog.is_none()
+        {
+            draft.catalog = Some(self.catalog.clone());
+        }
+    }
+
+    fn index_erase(&self, raw: NonNull<RawNode>) {
+        let id = NodeRef::new(raw).id();
+        unsafe { ffi::mw_index_erase(self.index.as_ptr(), RawBytes::from_slice(id.as_bytes())) };
+    }
+
+    fn index_restore(&self, raw: NonNull<RawNode>) {
+        let inserted = unsafe { ffi::mw_index_insert(self.index.as_ptr(), raw.as_ptr()) };
+        assert!(inserted, "索引容量够用，不会扩容");
     }
 }
 
@@ -2393,6 +2777,293 @@ mod tests {
             }
             assert_consistent(&memory);
         }
+    }
+
+    /// 一张图的全部状态，包括列表的顺序。遍历索引的顺序不固定，所以按地址排序。
+    fn dump(memory: &Memory) -> String {
+        let mut lines: Vec<String> = memory
+            .nodes()
+            .map(|node| {
+                format!(
+                    "{} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                    node.id(),
+                    node.title(),
+                    node.description(),
+                    node.evidence(),
+                    ids(node.related()),
+                    ids(node.based_by()),
+                    ids(node.related_by()),
+                    memory.node_times(node.id()),
+                )
+            })
+            .collect();
+        lines.sort();
+        format!(
+            "{lines:#?}\n{:?}\n{:?}",
+            memory.catalog(),
+            memory.timeline()
+        )
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as usize
+        }
+
+        fn pick(&mut self, items: &[String]) -> String {
+            items[self.next() % items.len()].clone()
+        }
+    }
+
+    /// 随机改一下：所有写方法都会碰到。有些操作不合法，失败时什么也不改，所以直接忽略结果。
+    fn random_change(memory: &mut Memory, random: &mut Random, serial: &mut usize) {
+        // 遍历索引的顺序不固定，排好序，同样的随机数才会选中同样的节点。
+        let mut live: Vec<String> = memory.nodes().map(|n| n.id().to_owned()).collect();
+        live.sort();
+        if live.is_empty() {
+            *serial += 1;
+            let new = node(&format!("n{serial}"), &[]);
+            memory.add_node(new, &[], &sources()).unwrap();
+            return;
+        }
+        let (a, b) = (random.pick(&live), random.pick(&live));
+        let section = format!("板块{}", random.next() % 3);
+        let range = Locator::TextRange {
+            start: random.next() % 3,
+            end: 3,
+        };
+        let source = source_id(TEXT.as_bytes());
+        let at = Some(random.next() as u64 % 1000);
+        match random.next() % 18 {
+            0 | 1 => {
+                *serial += 1;
+                let mut new = node(&format!("n{serial}"), &[]);
+                new.related = vec![a.clone()];
+                if random.next().is_multiple_of(3) {
+                    new.related.push(new.id.clone());
+                }
+                new.evidence.push(Evidence::Node { id: b.clone() });
+                let _ = memory.add_node(new, std::slice::from_ref(&b), &sources());
+            }
+            2 => {
+                // 删掉再用同一个地址新建：两个版本里同名，但不是同一个节点。
+                if memory.remove_node(&a).is_ok() {
+                    memory.add_node(node(&a, &[]), &[], &sources()).unwrap();
+                }
+            }
+            3 | 4 => {
+                let _ = memory.remove_node(&a);
+            }
+            5 | 6 => {
+                let _ = memory.link(&a, &b);
+            }
+            7 | 8 => {
+                let _ = memory.unlink(&a, &b);
+            }
+            9 => {
+                let _ = memory.set_title(&a, &format!("标题{}", random.next() % 100));
+            }
+            10 => {
+                let _ = memory.set_description(&a, &format!("描述{}", random.next() % 100));
+            }
+            11 => {
+                let _ = memory.base(&a, &b);
+            }
+            12 => {
+                let _ = memory.unbase(&a, &b);
+            }
+            13 => {
+                let _ = memory.cite(&a, &source, &range, &sources());
+            }
+            14 => {
+                let _ = memory.uncite(&a, &source, &range);
+            }
+            15 => {
+                let _ = memory.catalog_create(&section, "描述");
+                let _ = memory.catalog_add(&a, &section);
+            }
+            16 => {
+                let _ = memory.catalog_remove(&a, &section);
+            }
+            _ => {
+                let _ = memory.catalog_delete(&section);
+            }
+        }
+        memory.record(Event {
+            at,
+            text: format!("改了 {a}"),
+            nodes: vec![a, b],
+            action: Action::Change,
+        });
+    }
+
+    fn start_of_random_graph(random: &mut Random, serial: &mut usize) -> Memory {
+        let mut memory = memory_of(&["根"], vec![node("根", &[])]);
+        for _ in 0..200 {
+            random_change(&mut memory, random, serial);
+        }
+        memory
+    }
+
+    #[test]
+    fn discarding_a_draft_restores_everything_exactly() {
+        let mut random = Random(0x1234_5678_9abc_def1);
+        let mut serial = 0;
+        let mut memory = start_of_random_graph(&mut random, &mut serial);
+        for round in 0..300 {
+            let before = dump(&memory);
+            memory.begin_draft();
+            for _ in 0..(round % 40) {
+                random_change(&mut memory, &mut random, &mut serial);
+                assert_consistent(&memory);
+            }
+            memory.abort_draft();
+            assert_eq!(dump(&memory), before);
+            assert_consistent(&memory);
+            assert!(!memory.has_revision());
+        }
+    }
+
+    #[test]
+    fn the_origin_stays_readable_and_unchanged_during_a_draft() {
+        let mut random = Random(0x0bad_cafe_dead_beef);
+        let mut serial = 0;
+        let mut memory = start_of_random_graph(&mut random, &mut serial);
+        for round in 0..200 {
+            let origin = dump(&memory);
+            memory.begin_draft();
+            for _ in 0..(round % 30) {
+                random_change(&mut memory, &mut random, &mut serial);
+                let current = dump(&memory);
+                memory.with_origin(|view| {
+                    assert_eq!(dump(view), origin);
+                    assert_consistent(view);
+                });
+                // 换回来之后，当前版本也不能变。
+                assert_eq!(dump(&memory), current);
+                assert_consistent(&memory);
+            }
+            if round % 2 == 0 {
+                memory.commit_draft();
+            } else {
+                memory.abort_draft();
+            }
+            assert_consistent(&memory);
+        }
+    }
+
+    #[test]
+    fn saving_a_draft_keeps_exactly_what_the_draft_showed() {
+        let mut random = Random(0xfeed_face_0123_4567);
+        let mut serial = 0;
+        let mut memory = start_of_random_graph(&mut random, &mut serial);
+        for round in 0..300 {
+            memory.begin_draft();
+            for _ in 0..(round % 40) {
+                random_change(&mut memory, &mut random, &mut serial);
+            }
+            let draft = dump(&memory);
+            memory.commit_draft();
+            assert_eq!(dump(&memory), draft);
+            assert_consistent(&memory);
+            // 保存之后再改、再放弃，要回到保存时的样子。
+            memory.begin_draft();
+            random_change(&mut memory, &mut random, &mut serial);
+            memory.abort_draft();
+            assert_eq!(dump(&memory), draft);
+        }
+    }
+
+    #[test]
+    fn the_same_changes_give_the_same_graph_with_or_without_a_draft() {
+        let (mut direct_random, mut draft_random) = (Random(0xabcd_ef01), Random(0xabcd_ef01));
+        let (mut direct_serial, mut draft_serial) = (0, 0);
+        let mut direct = memory_of(&["根"], vec![node("根", &[])]);
+        let mut drafted = memory_of(&["根"], vec![node("根", &[])]);
+        for round in 0..200 {
+            drafted.begin_draft();
+            for _ in 0..(round % 25) {
+                random_change(&mut direct, &mut direct_random, &mut direct_serial);
+                random_change(&mut drafted, &mut draft_random, &mut draft_serial);
+                assert_eq!(dump(&drafted), dump(&direct));
+            }
+            drafted.commit_draft();
+            assert_eq!(dump(&drafted), dump(&direct));
+            assert_consistent(&drafted);
+        }
+    }
+
+    #[test]
+    fn removing_a_node_that_links_to_itself_can_be_undone() {
+        let mut memory = memory_of(&["a"], vec![node("a", &["a", "b"]), node("b", &[])]);
+        let before = dump(&memory);
+        memory.begin_draft();
+        memory.remove_node("a").unwrap();
+        assert!(memory.node("a").is_none());
+        memory.with_origin(|origin| assert_eq!(dump(origin), before));
+        memory.abort_draft();
+        assert_eq!(dump(&memory), before);
+        assert_consistent(&memory);
+    }
+
+    #[test]
+    fn a_node_added_and_removed_in_a_draft_leaves_nothing_behind() {
+        let mut memory = memory_of(&["a"], vec![node("a", &[])]);
+        let before = dump(&memory);
+        memory.begin_draft();
+        memory
+            .add_node(node("b", &["a"]), &linked_from(&["a"]), &sources())
+            .unwrap();
+        assert!(!memory.in_origin("b"));
+        memory.remove_node("b").unwrap();
+        assert_eq!(memory.revision().unwrap().nodes, Vec::new());
+        memory.commit_draft();
+        assert_eq!(dump(&memory), before);
+    }
+
+    #[test]
+    fn revision_lists_only_what_the_model_can_see_changed() {
+        let mut memory = memory_of(
+            &["a", "c"],
+            vec![node("a", &["b"]), node("b", &[]), node("c", &[])],
+        );
+        assert_eq!(memory.revision(), None);
+        let original = memory.node("b").unwrap().description().to_owned();
+        memory.begin_draft();
+        // 改了又改回去，不算差异。
+        memory.set_description("b", "新描述").unwrap();
+        memory.set_description("b", &original).unwrap();
+        memory.link("a", "c").unwrap();
+        let revision = memory.revision().unwrap();
+        // c 只是反向列表变了，模型没有写它。
+        let changed: Vec<&str> = revision.nodes.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(changed, ["a"]);
+        assert_eq!(revision.catalog_before, None);
+    }
+
+    #[test]
+    fn replacing_a_node_shows_both_versions_under_one_address() {
+        let mut memory = memory_of(&["a"], vec![node("a", &["b"]), node("b", &[])]);
+        memory.begin_draft();
+        memory.remove_node("b").unwrap();
+        let mut new = node("b", &[]);
+        new.description = "新的 b".to_owned();
+        memory
+            .add_node(new, &linked_from(&["a"]), &sources())
+            .unwrap();
+        assert!(memory.in_origin("b"));
+        assert_eq!(memory.node("b").unwrap().description(), "新的 b");
+        let origin = memory.with_origin(|view| view.node("b").unwrap().description().to_owned());
+        assert_ne!(origin, "新的 b");
+        assert_eq!(memory.node("b").unwrap().description(), "新的 b");
+        memory.abort_draft();
+        assert_eq!(memory.node("b").unwrap().description(), origin);
+        assert_consistent(&memory);
     }
 
     fn assert_consistent(memory: &Memory) {

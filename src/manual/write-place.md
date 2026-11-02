@@ -27,7 +27,8 @@ add rust-memory-overview
 end
 catalog add rust-memory-overview to "Rust 内存管理"
 catalog remove borrowing from "Rust 内存管理"
-check
+revision check
+save
 ```
 
 ## 从空记忆开始
@@ -42,10 +43,11 @@ source hand-brew-temperature
   text """用户说：我手冲浅烘豆一般用 92 度的水。"""
 end
 catalog add hand-brew-temperature to "咖啡"
+save
 ```
 
 ## 写完之后
 
 - 对照总表。新内容超出了领域描述，就用 `catalog describe` 更新描述。发现了更好的入口，就调整代表。总表由你维护，它写得越准，以后回忆越顺。
 - 输出里的 `warning` 要处理，见 `manual-repair`。
-- 用了 `remove`、`unlink`、`catalog remove` 或 `catalog delete`，就运行 `check`。
+- 用了 `remove`、`unlink`、`catalog remove` 或 `catalog delete`，就运行 `revision check`。

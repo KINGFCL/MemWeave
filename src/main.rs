@@ -172,6 +172,8 @@ fn run_script(mode: Mode, kb: &str, script: &str) -> Result<lang::Output, String
     let mut memory = load_memory(kb)?;
     let sources = FileSources::new(path);
     let journal = Journal::new(path);
+    // 每次调用都是新进程，草稿要从文件接上。只读的进程只看，不清理。
+    journal.restore_draft(&mut memory, &sources, mode == Mode::ReadWrite);
     let manual = Manual::new().map_err(|e| e.to_string())?;
     let output = Session::new(&mut memory, &sources, mode)
         .with_journal(&journal)

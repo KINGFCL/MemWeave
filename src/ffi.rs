@@ -60,6 +60,12 @@ pub(crate) struct RawIndex {
     _opaque: [u8; 0],
 }
 
+/// C++ 的 `NodeImage`：草稿里被改过的节点的原版。
+#[repr(C)]
+pub(crate) struct RawImage {
+    _opaque: [u8; 0],
+}
+
 /// 和 C++ 的 `Backlinks` 布局相同。
 #[repr(C)]
 pub(crate) struct RawBacklinks {
@@ -162,6 +168,12 @@ unsafe extern "C" {
         start: u64,
         end: u64,
     ) -> bool;
+
+    pub(crate) fn mw_image_save(node: *mut RawNode) -> *mut RawImage;
+    pub(crate) fn mw_image_own_list(node: *mut RawNode, kind: u32) -> bool;
+    pub(crate) fn mw_image_swap(node: *mut RawNode, image: *mut RawImage);
+    pub(crate) fn mw_image_keep_revision(node: *mut RawNode, image: *mut RawImage);
+    pub(crate) fn mw_image_keep_origin(node: *mut RawNode, image: *mut RawImage);
 
     pub(crate) fn mw_index_new() -> *mut RawIndex;
     pub(crate) fn mw_index_free(index: *mut RawIndex);

@@ -260,10 +260,145 @@ class Graph {
   std::size_t next_id_ = 0;
 };
 
+bool has_evidence(const Node* node, const Node* target) {
+  for (std::size_t i = 0; i < node->evidence->count; ++i) {
+    if (node->evidence->entries()[i].node == target) return true;
+  }
+  return false;
+}
+
+// 草稿：一个节点的全部内容，包括列表的顺序。
+std::string dump(const Node* node) {
+  std::string text(node->id, node->id_len);
+  text += "|" + std::string(node->title, node->title_len);
+  text += "|" + std::string(node->description, node->description_len);
+  for (LinkKind kind : {LinkKind::kRelated, LinkKind::kBasedBy, LinkKind::kRelatedBy}) {
+    text += "|";
+    const NodeList* list = link_list(node, kind);
+    for (std::uint32_t i = 0; i < list->count; ++i) {
+      text += std::string(list->nodes()[i]->id, list->nodes()[i]->id_len) + ",";
+    }
+  }
+  text += "|";
+  for (std::size_t i = 0; i < node->evidence->count; ++i) {
+    const Evidence& entry = node->evidence->entries()[i];
+    text += std::string(entry.id, entry.id_len) + "#" + std::to_string(entry.start) + ",";
+  }
+  return text;
+}
+
+// 随机改一批节点，每次改之前先存原版。检查切换版本和放弃都能还原，保存能留下改动。
+// 所有分配和释放的责任都在这里走一遍，AddressSanitizer 会拦住重复释放、悬空指针和泄漏。
+void test_drafts(std::mt19937& random) {
+  const std::string source = "sha256:source";
+  const Evidence first{EvidenceKind::kTextRange, static_cast<std::uint32_t>(source.size()),
+                       source.data(), nullptr, 0, 4};
+  std::vector<Node*> nodes;
+  for (int i = 0; i < 80; ++i) {
+    const std::string id = "d" + std::to_string(i);
+    Node* node = new_node(bytes(id), bytes("标题"), bytes("描述"), &first, 1, 3, 2, 2);
+    if (node == nullptr) fail("分配失败");
+    nodes.push_back(node);
+  }
+  const auto snapshot = [&nodes] {
+    std::vector<std::string> all;
+    for (const Node* node : nodes) all.push_back(dump(node));
+    return all;
+  };
+
+  std::size_t saved = 0;
+  for (int round = 0; round < 3000; ++round) {
+    const std::vector<std::string> origin = snapshot();
+    std::map<Node*, NodeImage*> images;
+    const auto touch = [&images](Node* node) {
+      if (images.count(node) != 0) return;
+      NodeImage* image = save_node(node);
+      if (image == nullptr) fail("分配失败");
+      images[node] = image;
+    };
+    const auto touch_list = [&touch](Node* node, LinkKind kind) {
+      touch(node);
+      if (!own_list(node, kind)) fail("分配失败");
+    };
+
+    const int changes = static_cast<int>(random() % 12);
+    for (int change = 0; change < changes; ++change) {
+      Node* node = nodes[random() % nodes.size()];
+      Node* other = nodes[random() % nodes.size()];
+      switch (random() % 7) {
+        case 0:
+          touch(node);
+          if (!set_text(node, TextField::kDescription, bytes(std::string(random() % 90, 'x')))) {
+            fail("分配失败");
+          }
+          break;
+        case 1:
+          touch(node);
+          if (!set_text(node, TextField::kTitle, bytes(std::string(random() % 30, 'y')))) {
+            fail("分配失败");
+          }
+          break;
+        case 2:
+          touch_list(node, LinkKind::kRelated);
+          touch_list(other, LinkKind::kRelatedBy);
+          if (!link_nodes(node, other)) fail("分配失败");
+          break;
+        case 3:
+          touch_list(node, LinkKind::kRelated);
+          touch_list(other, LinkKind::kRelatedBy);
+          unlink_nodes(node, other);
+          break;
+        case 4:
+          if (node != other && !has_evidence(node, other) && !has_evidence(other, node)) {
+            touch(node);
+            touch_list(other, LinkKind::kBasedBy);
+            if (!add_node_evidence(node, other)) fail("分配失败");
+          }
+          break;
+        case 5: {
+          touch(node);
+          const std::uint64_t start = random() % 50;
+          if (!add_source_evidence(node, bytes(source), start, start + 1)) fail("分配失败");
+          break;
+        }
+        default:
+          for (std::size_t i = 0; i < node->evidence->count; ++i) {
+            const Evidence& entry = node->evidence->entries()[i];
+            if (entry.kind == EvidenceKind::kNode) {
+              const std::string id(entry.id, entry.id_len);
+              touch(node);
+              touch_list(entry.node, LinkKind::kBasedBy);
+              if (!remove_node_evidence(node, bytes(id))) fail("分配失败");
+              break;
+            }
+          }
+      }
+    }
+
+    const std::vector<std::string> revision = snapshot();
+    for (auto& [node, image] : images) swap_image(node, image);
+    if (snapshot() != origin) fail("切到原版后内容不对");
+    for (auto& [node, image] : images) swap_image(node, image);
+    if (snapshot() != revision) fail("切回当前版本后内容不对");
+
+    if (random() % 2 == 0) {
+      for (auto& [node, image] : images) keep_origin(node, image);
+      if (snapshot() != origin) fail("放弃之后没有回到原版");
+    } else {
+      for (auto& [node, image] : images) keep_revision(node, image);
+      if (snapshot() != revision) fail("保存之后内容不对");
+      ++saved;
+    }
+  }
+  for (Node* node : nodes) delete_node(node);
+  std::printf("通过：3000 轮草稿，保存 %zu 轮\n", saved);
+}
+
 }  // namespace
 
 int main() {
   std::mt19937 random(20261031);
+  test_drafts(random);
   Graph graph;
   std::size_t removed = 0;
   for (int step = 0; step < 20000; ++step) {

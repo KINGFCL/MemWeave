@@ -9,6 +9,7 @@ using memweave::Evidence;
 using memweave::EvidenceList;
 using memweave::LinkKind;
 using memweave::Node;
+using memweave::NodeImage;
 using memweave::NodeIndex;
 using memweave::TextField;
 using memweave::NodeList;
@@ -128,6 +129,22 @@ bool mw_node_add_source_evidence(Node* node, Bytes source, std::uint64_t start,
 bool mw_node_remove_source_evidence(Node* node, Bytes source, std::uint64_t start,
                                     std::uint64_t end) noexcept {
   return memweave::remove_source_evidence(node, source, start, end);
+}
+
+NodeImage* mw_image_save(Node* node) noexcept { return memweave::save_node(node); }
+
+bool mw_image_own_list(Node* node, LinkKind kind) noexcept {
+  return memweave::own_list(node, kind);
+}
+
+void mw_image_swap(Node* node, NodeImage* image) noexcept { memweave::swap_image(node, image); }
+
+void mw_image_keep_revision(Node* node, NodeImage* image) noexcept {
+  memweave::keep_revision(node, image);
+}
+
+void mw_image_keep_origin(Node* node, NodeImage* image) noexcept {
+  memweave::keep_origin(node, image);
 }
 
 NodeIndex* mw_index_new() noexcept { return new (std::nothrow) NodeIndex(); }

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::Mode;
-use super::ast::{AddNode, Citation, Label, Located, Name, SourceRef, Statement};
+use super::ast::{AddNode, Citation, Label, Located, Name, SourceRef, Statement, Version};
 use super::diagnostic::{Diagnostic, Span, closest};
 use crate::board::{self, BoardOp, Goal};
 use crate::export::target_problem;
@@ -56,15 +56,41 @@ pub fn check(
             .collect(),
         errors: Vec::new(),
     };
-    for located in statements {
+    let last = statements.len().saturating_sub(1);
+    for (position, located) in statements.iter().enumerate() {
+        if located.statement.is_bare_read() {
+            checker.errors.push(bare_read(located));
+            continue;
+        }
         if mode == Mode::ReadOnly && located.statement.needs_write_session() {
             checker.errors.push(
-                Diagnostic::new("E301", located.span, "当前会话是只读的，不能修改记忆或导出")
-                    .with_hint(
-                        "只读会话只能用 catalog show、show、links、evidence、based_by、related_by、full_source、check",
-                    ),
+                Diagnostic::new(
+                    "E301",
+                    located.span,
+                    "当前会话是只读的，不能修改记忆、保存或导出",
+                )
+                .with_hint("只读会话只能用 revision 和 origin 开头的读语句，以及 revision display"),
             );
             continue;
+        }
+        match located.statement {
+            Statement::Save if position != last => {
+                checker.errors.push(
+                    Diagnostic::new("E225", located.span, "save 只能写在脚本的最后一行")
+                        .with_hint("它保存的是这条语句之前的所有修改，后面的修改要再 save 一次"),
+                );
+            }
+            Statement::Discard if statements.len() != 1 => {
+                checker.errors.push(
+                    Diagnostic::new(
+                        "E226",
+                        located.span,
+                        "discard 要单独执行，不能和别的语句写在一起",
+                    )
+                    .with_hint("它会放弃所有未保存的修改。先单独执行 discard，再提交新的修改"),
+                );
+            }
+            _ => {}
         }
         if checker.touches_manual(&located.statement) {
             continue;
@@ -77,6 +103,26 @@ pub fn check(
     }
     checker.finish();
     checker.errors
+}
+
+/// 读语句没有写版本。
+fn bare_read(located: &Located) -> Diagnostic {
+    let example = match &located.statement {
+        Statement::CatalogShow => "catalog show".to_owned(),
+        Statement::Check => "check".to_owned(),
+        Statement::Timeline { .. } => "timeline".to_owned(),
+        Statement::Export(_) => "export \"路径\"".to_owned(),
+        Statement::Show(id) => format!("show {}", id.text),
+        Statement::Links { id, .. } => format!("links {}", id.text),
+        Statement::Evidence(id) => format!("evidence {}", id.text),
+        Statement::BasedBy(id) => format!("based_by {}", id.text),
+        Statement::RelatedBy(id) => format!("related_by {}", id.text),
+        Statement::FullSource { id, .. } => format!("full_source {}", id.text),
+        _ => unreachable!("调用方只传读语句"),
+    };
+    Diagnostic::new("E224", located.span, "读语句要写明读哪个版本").with_hint(format!(
+        "revision {example} 读当前草稿，origin {example} 读已保存的版本。没有未保存的修改时两者一样"
+    ))
 }
 
 /// 一段被引用的原文：来源地址、起始和结束。
@@ -180,6 +226,9 @@ impl Checker<'_> {
 
     fn statement(&mut self, statement: &Statement) {
         match statement {
+            Statement::Versioned(Version::Revision, inner) => self.statement(inner),
+            Statement::Versioned(Version::Origin, inner) => self.origin_read(inner),
+            Statement::RevisionDisplay(_) | Statement::Save | Statement::Discard => {}
             Statement::CatalogShow | Statement::Check | Statement::Timeline { .. } => {}
             Statement::Board(_) => unreachable!("工作板语句在 check 里单独处理"),
             Statement::Log(text) => self.nonblank(text, "要记下的内容"),
@@ -249,7 +298,7 @@ impl Checker<'_> {
                                 id.span,
                                 format!("{} 不是板块“{}”的代表", id.text, section.text),
                             )
-                            .with_hint("用 catalog show 查看现有的代表"),
+                            .with_hint("用 revision catalog show 查看现有的代表"),
                         );
                     }
                 }
@@ -630,8 +679,58 @@ impl Checker<'_> {
             })
     }
 
+    /// 读已保存的版本。脚本前面的修改和草稿都不影响它。
+    fn origin_read(&mut self, statement: &Statement) {
+        match statement {
+            Statement::Show(id)
+            | Statement::Evidence(id)
+            | Statement::BasedBy(id)
+            | Statement::RelatedBy(id)
+            | Statement::FullSource { id, .. }
+            | Statement::Links { id, .. } => {
+                let builtin = self.manual.is_some_and(|manual| manual.contains(&id.text));
+                if builtin || self.memory.in_origin(&id.text) {
+                    return;
+                }
+                let mut error = Diagnostic::new(
+                    "E201",
+                    id.span,
+                    format!("已保存的版本里没有节点 {}", id.text),
+                );
+                if self.exists(&id.text) || self.declared.contains(&id.text) {
+                    error = error.with_hint(format!(
+                        "{0} 是草稿里新建的，还没有保存。用 revision show {0} 读它",
+                        id.text
+                    ));
+                }
+                self.errors.push(error);
+            }
+            // 走不走得到要到执行时才知道，走不到时报 E902。
+            Statement::Export(path) => self.export_target(path),
+            _ => {}
+        }
+    }
+
     /// 导出的是这条语句执行时的状态，所以用模拟到这里的总表和关联判断。
     fn export(&mut self, path: &Label) {
+        self.export_target(path);
+        let lost = self.unreachable();
+        if !lost.is_empty() {
+            self.errors.push(
+                Diagnostic::new(
+                    "E217",
+                    path.span,
+                    format!("有 {} 个节点从总表到达不了，不能导出", lost.len()),
+                )
+                .with_hint(format!(
+                    "先用 catalog add 或 link 接入，或者 remove 删除：{}",
+                    lost.join(", ")
+                )),
+            );
+        }
+    }
+
+    fn export_target(&mut self, path: &Label) {
         self.nonblank(path, "导出路径");
         let hint = "换一个不存在的目录，或者空目录";
         if !self.export_targets.insert(path.text.clone()) {
@@ -646,21 +745,6 @@ impl Checker<'_> {
         } else if let Some(problem) = target_problem(Path::new(&path.text)) {
             self.errors
                 .push(Diagnostic::new("E216", path.span, problem).with_hint(hint));
-        }
-
-        let lost = self.unreachable();
-        if !lost.is_empty() {
-            self.errors.push(
-                Diagnostic::new(
-                    "E217",
-                    path.span,
-                    format!("有 {} 个节点从总表到达不了，不能导出", lost.len()),
-                )
-                .with_hint(format!(
-                    "先用 catalog add 或 link 接入，或者 remove 删除：{}",
-                    lost.join(", ")
-                )),
-            );
         }
     }
 

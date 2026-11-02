@@ -6,14 +6,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::path::Path;
 
-use super::ast::{AddNode, Citation, Field, Located, Statement};
+use super::ast::{AddNode, Citation, Field, Located, Statement, Version};
 use crate::board::{Goal, StepStatus};
 use crate::error::Error;
 use crate::export::Exporter;
 use crate::export::json::JsonExporter;
-use crate::knowledge::{Evidence, Locator, Node, SourceId};
+use crate::knowledge::{Catalog, Evidence, Locator, Node, SourceId};
 use crate::manual::{self, Manual};
-use crate::memory::{Memory, NodeRef, RemovedNode};
+use crate::memory::{Memory, NodeChange, NodeRef, RemovedNode};
 use crate::source::{SourceStore, source_id};
 use crate::timeline::{Action, Event, NodeTimes, format_time};
 
@@ -64,23 +64,52 @@ fn statement(
     manual: Option<&Manual>,
     report: &mut Report,
 ) -> Result<(), Error> {
-    if let Some(id) = node_read_by(statement) {
-        // 内置说明是另一张图，读的时候换过去。两张图之间没有边，所以不会走串。
-        return match manual.filter(|manual| manual.contains(id)) {
-            Some(manual) => read_node(statement, manual.memory(), manual.sources(), report),
-            None => read_node(statement, memory, sources, report),
-        };
+    match statement {
+        Statement::Versioned(Version::Revision, inner) => {
+            if **inner == Statement::CatalogShow
+                && let Some(note) = revision_note(memory)
+            {
+                let _ = writeln!(report.text, "{note}");
+            }
+            read(inner, memory, sources, manual, report)?;
+            if matches!(**inner, Statement::Export(_)) && memory.has_revision() {
+                report
+                    .text
+                    .push_str("warning: 导出的是未保存的草稿。之后 discard 不会删除这个目录\n");
+            }
+            return Ok(());
+        }
+        Statement::Versioned(Version::Origin, inner) => {
+            return memory.with_origin(|origin| read(inner, origin, sources, manual, report));
+        }
+        Statement::RevisionDisplay(node) => {
+            render_revision(
+                memory,
+                node.as_ref().map(|n| n.text.as_str()),
+                &mut report.text,
+            );
+            return Ok(());
+        }
+        _ => {}
     }
     let output = &mut report.text;
     match statement {
-        Statement::CatalogShow => output.push_str(&render_overview(memory, manual)),
-        Statement::Check => render_check(memory, sources, manual, output),
-        Statement::Show(_)
+        Statement::Save | Statement::Discard => unreachable!("这两条由 Session 处理"),
+        Statement::Versioned(..) | Statement::RevisionDisplay(_) => {
+            unreachable!("读语句在上面处理")
+        }
+        Statement::CatalogShow
+        | Statement::Check
+        | Statement::Timeline { .. }
+        | Statement::Export(_)
+        | Statement::Show(_)
         | Statement::Links { .. }
         | Statement::Evidence(_)
         | Statement::BasedBy(_)
         | Statement::RelatedBy(_)
-        | Statement::FullSource { .. } => unreachable!("读节点的语句在上面处理"),
+        | Statement::FullSource { .. } => {
+            unreachable!("不带版本的读语句过不了检查，重放时也跳过了")
+        }
         Statement::Board(op) => {
             let text = memory
                 .apply_board(op)
@@ -89,35 +118,6 @@ fn statement(
         }
         Statement::Log(text) => {
             let _ = writeln!(output, "logged {}", quote(&text.text));
-        }
-        Statement::Timeline {
-            limit,
-            offset,
-            node,
-        } => render_timeline(
-            memory,
-            *limit,
-            *offset,
-            node.as_ref().map(|n| n.text.as_str()),
-            output,
-        ),
-        Statement::Export(path) => {
-            match JsonExporter.export(memory, sources, Path::new(&path.text)) {
-                Ok(exported) => {
-                    let _ = writeln!(
-                        output,
-                        "exported {} nodes, {} sections, {} sources to {}",
-                        exported.nodes,
-                        exported.sections,
-                        exported.sources,
-                        quote(&path.text)
-                    );
-                }
-                Err(error) => {
-                    report.failures += 1;
-                    let _ = writeln!(output, "error[E902] 导出失败，目标目录没有变化：{error}");
-                }
-            }
         }
         Statement::CatalogCreate { name, description } => {
             memory.catalog_create(&name.text, &description.text)?;
@@ -146,7 +146,7 @@ fn statement(
                     "warning: {} 不再是这个板块的代表，节点本身保留",
                     ids.join(", ")
                 );
-                let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
+                let _ = writeln!(output, "note: 可以用 revision check 确认是否有节点查不到了");
             }
         }
         Statement::CatalogAdd { id, section } => {
@@ -179,7 +179,7 @@ fn statement(
                 id.text,
                 quote(&section.text)
             );
-            let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
+            let _ = writeln!(output, "note: 可以用 revision check 确认是否有节点查不到了");
         }
         Statement::Add(add) | Statement::Source(add) => {
             let (node, related_by) = build_node(add);
@@ -203,7 +203,7 @@ fn statement(
             let _ = writeln!(output, "unlinked {} -> {}", from.text, to.text);
             let _ = writeln!(
                 output,
-                "note: 关联减少后可能有节点查不到了，可以用 check 确认"
+                "note: 关联减少后可能有节点查不到了，可以用 revision check 确认"
             );
         }
         Statement::Set {
@@ -251,6 +251,69 @@ fn statement(
         }
     }
     Ok(())
+}
+
+/// 执行一条读语句。只读，所以可以在任何一个版本上执行。
+fn read(
+    statement: &Statement,
+    memory: &Memory,
+    sources: &dyn SourceStore,
+    manual: Option<&Manual>,
+    report: &mut Report,
+) -> Result<(), Error> {
+    if let Some(id) = node_read_by(statement) {
+        // 内置说明是另一张图，读的时候换过去。两张图之间没有边，所以不会走串。
+        return match manual.filter(|manual| manual.contains(id)) {
+            Some(manual) => read_node(statement, manual.memory(), manual.sources(), report),
+            None => read_node(statement, memory, sources, report),
+        };
+    }
+    let output = &mut report.text;
+    match statement {
+        Statement::CatalogShow => output.push_str(&render_overview(memory, manual)),
+        Statement::Check => render_check(memory, sources, manual, output),
+        Statement::Timeline {
+            limit,
+            offset,
+            node,
+        } => render_timeline(
+            memory,
+            *limit,
+            *offset,
+            node.as_ref().map(|n| n.text.as_str()),
+            output,
+        ),
+        Statement::Export(path) => {
+            match JsonExporter.export(memory, sources, Path::new(&path.text)) {
+                Ok(exported) => {
+                    let _ = writeln!(
+                        output,
+                        "exported {} nodes, {} sections, {} sources to {}",
+                        exported.nodes,
+                        exported.sections,
+                        exported.sources,
+                        quote(&path.text)
+                    );
+                }
+                Err(error) => {
+                    report.failures += 1;
+                    let _ = writeln!(output, "error[E902] 导出失败，目标目录没有变化：{error}");
+                }
+            }
+        }
+        _ => unreachable!("Versioned 里只有读语句"),
+    }
+    Ok(())
+}
+
+/// 提醒还有没保存的修改。没有时返回 `None`。
+pub fn revision_note(memory: &Memory) -> Option<String> {
+    memory.has_revision().then(|| {
+        format!(
+            "revision: {} 段脚本未保存。save 保存，discard 放弃，revision display 看差异",
+            memory.draft_scripts().len()
+        )
+    })
 }
 
 /// 这条语句要读哪个节点。
@@ -580,7 +643,11 @@ fn event_for(statement: &Statement, at: Option<u64>) -> Option<Event> {
         ),
         Statement::Board(op) => change(op.summary(), Vec::new()),
         Statement::Log(text) => change(format!("log {}", text.text), Vec::new()),
-        Statement::CatalogShow
+        Statement::Versioned(..)
+        | Statement::RevisionDisplay(_)
+        | Statement::Save
+        | Statement::Discard
+        | Statement::CatalogShow
         | Statement::Check
         | Statement::Export(_)
         | Statement::Timeline { .. }
@@ -750,7 +817,7 @@ fn render_full_source(
         if end < total {
             let _ = writeln!(
                 output,
-                "  note: 还没有显示完，下一段用 full_source {} offset {end}",
+                "  note: 还没有显示完，版本前缀不变，下一段用 full_source {} offset {end}",
                 node.id()
             );
         }
@@ -758,7 +825,7 @@ fn render_full_source(
     if seen.is_empty() {
         let _ = writeln!(
             output,
-            "  这个节点没有直接指向原文，用 show 查看 based_on 里的节点"
+            "  这个节点没有直接指向原文，用 show 查看 based_on 里的节点，版本前缀不变"
         );
     }
 }
@@ -893,7 +960,7 @@ fn render_removed(removed: &RemovedNode, output: &mut String) {
     for section in &removed.sections {
         let _ = writeln!(output, "warning: 板块 {} 少了一个代表节点", quote(section));
     }
-    let _ = writeln!(output, "note: 可以用 check 确认是否有节点查不到了");
+    let _ = writeln!(output, "note: 可以用 revision check 确认是否有节点查不到了");
 }
 
 /// 描述变了，依据它的结论可能要跟着变。
@@ -991,24 +1058,196 @@ fn render_check(
 
 /// 输出停在这条语句中间时，怎么看到剩下的内容。
 pub fn continue_hint(statement: &Statement) -> String {
-    match statement {
+    let (prefix, inner) = match statement {
+        Statement::Versioned(version, inner) => (version.keyword(), &**inner),
+        Statement::RevisionDisplay(None) => {
+            return "revision display 没有显示完，用 revision display 节点 逐个看".to_owned();
+        }
+        other => ("revision", other),
+    };
+    match inner {
         Statement::Show(id) => format!(
-            "show {0} 没有显示完，原文可以用 full_source {0} 分段读",
+            "{prefix} show {0} 没有显示完，原文可以用 {prefix} full_source {0} 分段读",
             id.text
         ),
         Statement::Evidence(id) => format!(
-            "evidence {0} 没有显示完，原文可以用 full_source 分段读，依据的节点可以单独 show",
+            "{prefix} evidence {0} 没有显示完，原文可以用 {prefix} full_source 分段读，依据的节点可以单独 {prefix} show",
             id.text
         ),
         Statement::FullSource { id, .. } => {
-            format!("full_source {} 没有显示完，用更小的 limit 分段读", id.text)
+            format!(
+                "{prefix} full_source {} 没有显示完，用更小的 limit 分段读",
+                id.text
+            )
         }
         Statement::Links { id, .. } => {
             format!(
-                "links {} 没有显示完，用更小的 limit 和 offset 分段看",
+                "{prefix} links {} 没有显示完，用更小的 limit 和 offset 分段看",
                 id.text
             )
         }
         _ => "这条语句的输出没有显示完".to_owned(),
+    }
+}
+
+/// `revision display` 的输出。第一行固定是标志，开发者可以拿它做门控，输出被截断也还在。
+fn render_revision(memory: &mut Memory, only: Option<&str>, output: &mut String) {
+    let Some(revision) = memory.revision() else {
+        output.push_str("has_revision: false\n");
+        return;
+    };
+    output.push_str("has_revision: true\n");
+    let _ = writeln!(output, "scripts: {}", memory.draft_scripts().len());
+    if let Some(id) = only {
+        match revision.nodes.iter().find(|change| change.id == id) {
+            Some(change) => render_node_change(change, output),
+            None => {
+                let _ = writeln!(output, "{id} 没有改动");
+            }
+        }
+        return;
+    }
+    for change in &revision.nodes {
+        render_node_change(change, output);
+    }
+    if let Some(before) = &revision.catalog_before {
+        render_catalog_change(before, memory.catalog(), output);
+    }
+    let events = memory.draft_events();
+    if !events.is_empty() {
+        output.push_str("修改记录\n");
+    }
+    for event in events {
+        let _ = writeln!(
+            output,
+            "  {} {}",
+            format_time(event.at),
+            one_line(&event.text)
+        );
+    }
+}
+
+fn render_node_change(change: &NodeChange, output: &mut String) {
+    let (before, after) = match (&change.before, &change.after) {
+        (None, Some(after)) => {
+            let _ = writeln!(output, "+ {} {}", change.id, quote(&after.title));
+            return;
+        }
+        (Some(before), None) => {
+            let _ = writeln!(output, "- {} {}", change.id, quote(&before.title));
+            return;
+        }
+        (Some(before), Some(after)) => (before, after),
+        (None, None) => return,
+    };
+    let _ = writeln!(output, "~ {}", change.id);
+    if before.title != after.title {
+        let _ = writeln!(
+            output,
+            "  title: {} -> {}",
+            quote(&before.title),
+            quote(&after.title)
+        );
+    }
+    if before.description != after.description {
+        let _ = writeln!(
+            output,
+            "  desc: {} -> {}",
+            quote(&before.description),
+            quote(&after.description)
+        );
+    }
+    if before.related != after.related {
+        render_list_change("related", &before.related, &after.related, output);
+    }
+    if before.evidence != after.evidence {
+        let describe = |evidence: &[Evidence]| -> Vec<String> {
+            evidence
+                .iter()
+                .map(|entry| match entry {
+                    Evidence::Node { id } => format!("based_on {id}"),
+                    Evidence::Source {
+                        source,
+                        locator: Locator::TextRange { start, end },
+                    } => format!("source {source} {start}..{end}"),
+                })
+                .collect()
+        };
+        let (old, new) = (describe(&before.evidence), describe(&after.evidence));
+        render_list_change("evidence", &old, &new, output);
+    }
+}
+
+fn render_list_change(name: &str, before: &[String], after: &[String], output: &mut String) {
+    let added: Vec<String> = after
+        .iter()
+        .filter(|item| !before.contains(item))
+        .map(|item| format!("+{item}"))
+        .collect();
+    let removed: Vec<String> = before
+        .iter()
+        .filter(|item| !after.contains(item))
+        .map(|item| format!("-{item}"))
+        .collect();
+    if added.is_empty() && removed.is_empty() {
+        let _ = writeln!(output, "  {name}: 顺序变了");
+    } else {
+        let _ = writeln!(output, "  {name}: {}", [added, removed].concat().join(" "));
+    }
+}
+
+fn render_catalog_change(before: &Catalog, after: &Catalog, output: &mut String) {
+    for old in &before.sections {
+        if !after.sections.iter().any(|new| new.name == old.name) {
+            let _ = writeln!(output, "- section {}", quote(&old.name));
+        }
+    }
+    for new in &after.sections {
+        let Some(old) = before.sections.iter().find(|old| old.name == new.name) else {
+            let _ = writeln!(output, "+ section {}", quote(&new.name));
+            for entry in &new.nodes {
+                let _ = writeln!(output, "  代表: +{}", entry.id);
+            }
+            continue;
+        };
+        if old == new {
+            continue;
+        }
+        let _ = writeln!(output, "~ section {}", quote(&new.name));
+        if old.description != new.description {
+            let _ = writeln!(
+                output,
+                "  desc: {} -> {}",
+                quote(&old.description),
+                quote(&new.description)
+            );
+        }
+        let ids = |section: &crate::knowledge::Section| -> Vec<String> {
+            section.nodes.iter().map(|entry| entry.id.clone()).collect()
+        };
+        let (old_ids, new_ids) = (ids(old), ids(new));
+        if old_ids != new_ids {
+            render_list_change("代表", &old_ids, &new_ids, output);
+        }
+    }
+    for old in &before.goals {
+        match after.goals.iter().find(|new| new.id == old.id) {
+            None => {
+                let _ = writeln!(output, "- goal {}", old.id);
+            }
+            Some(new) if new != old => {
+                let _ = writeln!(output, "~ goal {} 改之前", old.id);
+                render_goal(old, output);
+                let _ = writeln!(output, "~ goal {} 改之后", old.id);
+                render_goal(new, output);
+            }
+            Some(_) => {}
+        }
+    }
+    for new in &after.goals {
+        if !before.goals.iter().any(|old| old.id == new.id) {
+            let _ = writeln!(output, "+ goal {}", new.id);
+            render_goal(new, output);
+        }
     }
 }

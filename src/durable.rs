@@ -74,6 +74,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// 和 [`write_atomic`] 一样整个替换，但不等落盘。进程崩溃不会留下半个文件，断电可能会。
+pub fn write_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    let result = write_private(&temporary, bytes).and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// 落盘时同时用多少个线程。
 const SYNC_THREADS: usize = 16;
 

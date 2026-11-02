@@ -1,7 +1,7 @@
 //! 模型操作记忆用的指令语言。
 //!
 //! 一段脚本依次经过词法分析、语法分析和语义检查，全部通过才开始执行。写错时返回和编译器一样的
-//! 报错，记忆完全不变。语言里没有内存地址，所以从语法上就碰不到它：模型只能用文本地址引用节点，
+//! 报错，记忆完全不变。通过之后修改先进草稿，`save` 才写进日志。语言里没有内存地址，所以从语法上就碰不到它：模型只能用文本地址引用节点，
 //! 地址是否存在由 C++ 的 set 回答。只有 `export` 会写文件路径，它只会新建目录，不会覆盖已有内容。
 
 pub mod ast;
@@ -13,7 +13,7 @@ pub mod lexer;
 pub mod parser;
 
 use crate::manual::Manual;
-use crate::memory::Memory;
+use crate::memory::{DraftScript, Memory};
 use crate::source::{SourceStore, Trusted};
 use crate::timeline;
 use diagnostic::{Diagnostic, render};
@@ -27,16 +27,24 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// 放进提示词里的语言说明。
 pub const SPEC: &str = r####"用下面的语言操作记忆。每条语句占一行，# 开头是注释。节点用文本地址引用。
 
-读取：
-catalog show                             查看工作板、最近行为和总表：每个领域的名字、描述和代表节点
-show 节点, 节点                           查看节点的全部内容：标题、描述、所有关系和证据原文
-links 节点 [depth N] [limit N] [offset N] 沿关联往外看，默认 depth 1，limit 50。没看完时用 offset 接着看
-evidence 节点, 节点                       沿依据一路追到原文：依据节点的标题和描述，以及所有原文
-based_by 节点, 节点                       只列出基于这个节点推导的节点，删除节点前用它查依赖
-related_by 节点, 节点                     只列出关联了这个节点的节点，可以用来反向探索
-full_source 节点 [offset N] [limit N]     查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
-check                                    列出从总表走不到的节点、没有代表的板块和丢失的原文
-timeline [limit N] [offset N] [node 节点] 时间线，从新到旧。node 只看这个节点的历史
+所有修改都先进草稿，能读到，但 save 之后才算保存。
+
+读取都要写明版本：revision 读当前草稿，origin 读已保存的版本。没有未保存的修改时两者一样。下面只写 revision，把它换成 origin 就是读已保存的版本。
+revision catalog show                     查看工作板、最近行为和总表：每个领域的名字、描述和代表节点
+revision show 节点, 节点                  查看节点的全部内容：标题、描述、所有关系和证据原文
+revision links 节点 [depth N] [limit N] [offset N] 沿关联往外看，默认 depth 1，limit 50。没看完时用 offset 接着看
+revision evidence 节点, 节点              沿依据一路追到原文：依据节点的标题和描述，以及所有原文
+revision based_by 节点, 节点              只列出基于这个节点推导的节点，删除节点前用它查依赖
+revision related_by 节点, 节点            只列出关联了这个节点的节点，可以用来反向探索
+revision full_source 节点 [offset N] [limit N] 查看节点指向的完整原始文件，不只是它引用的那一段。文件很大时分段读
+revision check                            列出从总表走不到的节点、没有代表的板块和丢失的原文
+revision timeline [limit N] [offset N] [node 节点] 时间线，从新到旧。node 只看这个节点的历史
+revision export "路径"                    把这个版本的记忆导出成新的知识库目录，只带节点引用到的原文
+
+草稿：
+revision display [节点]                   第一行 has_revision 说明有没有未保存的修改，后面是和已保存版本的差异
+save                                      保存所有修改。可以单独执行，也可以写在脚本最后一行
+discard                                   放弃所有未保存的修改，要单独执行
 
 修改：
 add 节点                                  新增由别的节点推出的知识
@@ -71,8 +79,7 @@ base 结论 on 依据
 unbase 结论 on 依据
 cite 节点 text """原文"""                  存一段新原文，并让节点引用它
 cite 节点 source sha256:... 起始..结束     让节点引用已有原文的一段
-uncite 节点 source sha256:... 起始..结束   去掉节点对这段原文的引用，地址和范围抄 show 的输出
-export "路径"                             把当前记忆导出成新的知识库目录，只带节点引用到的原文
+uncite 节点 source sha256:... 起始..结束   去掉节点对这段原文的引用，地址和范围抄 revision show 的输出
 
 工作板：
 goal create 目标 "标题"                    新建目标，一次写完步骤，第一步自动开始
@@ -97,10 +104,11 @@ log """做了什么"""                         记下记忆之外的行为，比
 - 节点地址只能包含字母、数字、- 和 _，不能修改。manual- 开头的地址留给内置说明，只能读。
 - 证据不能形成循环。
 - 一段脚本要么全部执行，要么完全不执行。出错时会告诉你哪一行错了以及怎么改，改好后重新提交整段脚本。
+- 没 save 的修改不算数。结果里出现 revision: N 段脚本未保存 时，做完就 save，不要了就 discard。
 - 还有结论依据某个节点时不能删除它。先用 base 和 unbase 给这些结论换依据，或者先删除它们，可以写在同一段脚本里。
 - 修改描述或原文引用后，结果里的 warning 会列出依据它的结论，它们是否还成立由你判断。
 - 原文说错或过时了：写一段脚本，用 cite 引用新原文，uncite 去掉旧的，需要时用 set 改描述。原文本身不可变，节点至少要留一条证据。
-- 删除节点或减少关联后，可能有节点走不到了，用 check 确认。
+- 删除节点或减少关联后，可能有节点走不到了，用 revision check 确认。
 - export 的目标必须不存在或是空目录，不会覆盖。有节点走不到时会拒绝导出并列出它们，接入或删除后再导出。
 "####;
 
@@ -143,7 +151,10 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// 修改记忆的脚本会先记到这个日志里。
+    /// 保存时写进这个日志，没保存的脚本记在它旁边的草稿文件里。
+    ///
+    /// 打开知识库时要先调用 [`Journal::restore_draft`] 接上草稿，否则内存里没有文件里的那些脚本，
+    /// 保存时它们就丢了。
     pub fn with_journal(mut self, journal: &'a Journal) -> Self {
         self.journal = Some(journal);
         self
@@ -205,8 +216,20 @@ impl<'a> Session<'a> {
             };
         }
 
-        // 新原文要最先写：它们不可变，也不影响图，中途失败最多留下没人引用的文件。
-        if let Err(error) = self.store_new_sources(&statements) {
+        if statements[0].statement == ast::Statement::Discard {
+            return self.discard();
+        }
+        let writes = statements.iter().any(|s| s.statement.writes());
+        let saving = statements.last().map(|s| &s.statement) == Some(&ast::Statement::Save);
+        let body = if saving {
+            &statements[..statements.len() - 1]
+        } else {
+            &statements[..]
+        };
+
+        // 新原文要最先写：它们不可变，也不影响图，中途失败最多留下没人引用的文件。不用等落盘，
+        // 保存时日志里有这段原文，文件丢了能从日志恢复。
+        if let Err(error) = self.store_new_sources(&statements, false) {
             return Output {
                 ok: false,
                 text: format!("写入原文失败，没有执行任何语句：{error}"),
@@ -215,40 +238,134 @@ impl<'a> Session<'a> {
 
         let at = self.fixed_time.unwrap_or_else(timeline::now);
 
-        // 先落盘再执行：执行到一半崩溃时，重启后重放能恢复。
+        if writes {
+            // 这段脚本马上就保存的话，不用先记一遍。
+            if !saving
+                && let Some(journal) = self.journal
+                && let Err(error) = journal.append_draft(script, at)
+            {
+                return Output {
+                    ok: false,
+                    text: format!("写入草稿失败，没有执行任何语句：{error}"),
+                };
+            }
+            self.memory.begin_draft();
+        }
+
+        let report = exec::execute(body, self.memory, self.sources, self.manual, at);
+        let report = match report {
+            Ok(report) => report,
+            // 检查已经通过，只有内存不足才会走到这里。
+            Err((done, text, error)) => {
+                let shown = truncate(text, self.output_limit, "\n（输出超过上限，被截断了。）\n");
+                let number = done + 1;
+                if !writes {
+                    return Output {
+                        ok: false,
+                        text: format!(
+                            "{shown}error[E900] 第 {number} 条语句执行失败：{error}\n后面的语句没有执行。"
+                        ),
+                    };
+                }
+                let scripts = self.memory.draft_scripts().len();
+                self.memory.abort_draft();
+                if let Some(journal) = self.journal {
+                    let _ = journal.clear_draft();
+                }
+                return Output {
+                    ok: false,
+                    text: format!(
+                        "{shown}error[E900] 第 {number} 条语句执行失败：{error}\n这段脚本和草稿里之前的 {scripts} 段脚本都已经撤销，记忆回到上次保存时的样子。"
+                    ),
+                };
+            }
+        };
+        if writes {
+            self.memory.note_draft_script(DraftScript {
+                script: script.to_owned(),
+                at,
+            });
+        }
+
+        let mut text = limit_report(&report, body, self.output_limit);
+        let mut ok = report.failures == 0;
+        if !ok {
+            // 截断之后再写结论，否则结论可能被截掉。
+            text.push_str(&format!(
+                "有 {} 条语句失败，其余语句都已执行。",
+                report.failures
+            ));
+        }
+        if saving {
+            match self.save() {
+                Ok(message) => text.push_str(&message),
+                Err(error) => {
+                    ok = false;
+                    text.push_str(&format!(
+                        "error[E903] 保存失败，修改还在草稿里：{error}\n可以再次 save，或者 discard 放弃。\n"
+                    ));
+                    // 这段脚本还没记进草稿文件，马上保存才不用记。
+                    if writes
+                        && let Some(journal) = self.journal
+                        && journal.append_draft(script, at).is_err()
+                    {
+                        text.push_str(
+                            "warning: 这段脚本也没能写进草稿文件，进程退出后它的修改会丢失。\n",
+                        );
+                    }
+                }
+            }
+        }
+        if writes && let Some(note) = exec::revision_note(self.memory) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&note);
+            text.push('\n');
+        }
+        Output { ok, text }
+    }
+
+    /// 把草稿整个写进日志，一行里放下所有脚本，所以崩溃时要么全部生效，要么都不生效。
+    fn save(&mut self) -> Result<String, crate::error::Error> {
+        if !self.memory.has_revision() {
+            return Ok("没有要保存的修改\n".to_owned());
+        }
+        let scripts = self.memory.draft_scripts().len();
+        if let Some(journal) = self.journal {
+            journal.append_scripts(self.memory.draft_scripts())?;
+        }
+        self.memory.commit_draft();
+        let mut message = format!("saved {scripts} 段脚本\n");
+        // 删不掉也没关系：重启时发现日志变长了，就知道这份草稿已经保存过。
         if let Some(journal) = self.journal
-            && statements.iter().any(|s| s.statement.writes())
-            && let Err(error) = journal.append(script, at)
+            && let Err(error) = journal.clear_draft()
+        {
+            message.push_str(&format!("warning: 没能删除草稿文件：{error}\n"));
+        }
+        Ok(message)
+    }
+
+    fn discard(&mut self) -> Output {
+        if !self.memory.has_revision() {
+            return Output {
+                ok: true,
+                text: "没有要放弃的修改\n".to_owned(),
+            };
+        }
+        if let Some(journal) = self.journal
+            && let Err(error) = journal.clear_draft()
         {
             return Output {
                 ok: false,
-                text: format!("写入日志失败，没有执行任何语句：{error}"),
+                text: format!("放弃失败，修改还在草稿里：{error}\n"),
             };
         }
-
-        match exec::execute(&statements, self.memory, self.sources, self.manual, at) {
-            Ok(report) if report.failures == 0 => Output {
-                ok: true,
-                text: limit_report(&report, &statements, self.output_limit),
-            },
-            Ok(report) => Output {
-                ok: false,
-                // 截断之后再写结论，否则结论可能被截掉。
-                text: format!(
-                    "{}有 {} 条语句失败，其余语句都已执行。",
-                    limit_report(&report, &statements, self.output_limit),
-                    report.failures
-                ),
-            },
-            // 检查已经通过，只有内存不足才会走到这里。
-            Err((done, text, error)) => Output {
-                ok: false,
-                text: format!(
-                    "{}error[E900] 第 {} 条语句执行失败：{error}\n前 {done} 条语句已经生效，后面的没有执行。",
-                    truncate(text, self.output_limit, "\n（输出超过上限，被截断了。）\n",),
-                    done + 1
-                ),
-            },
+        let scripts = self.memory.draft_scripts().len();
+        self.memory.abort_draft();
+        Output {
+            ok: true,
+            text: format!("discarded {scripts} 段脚本\n"),
         }
     }
 }
@@ -275,7 +392,7 @@ impl Session<'_> {
             return failure(&errors, script, MAX_OUTPUT_BYTES);
         }
         // 日志里有原文，文件丢了也能恢复。
-        if let Err(error) = self.store_new_sources(&statements) {
+        if let Err(error) = self.store_new_sources(&statements, true) {
             return Output {
                 ok: false,
                 text: error.to_string(),
@@ -295,7 +412,11 @@ impl Session<'_> {
 }
 
 impl Session<'_> {
-    fn store_new_sources(&self, statements: &[ast::Located]) -> Result<(), crate::error::Error> {
+    fn store_new_sources(
+        &self,
+        statements: &[ast::Located],
+        durable: bool,
+    ) -> Result<(), crate::error::Error> {
         for located in statements {
             let text = match &located.statement {
                 ast::Statement::Add(add) | ast::Statement::Source(add) => add.text.as_deref(),
@@ -306,7 +427,11 @@ impl Session<'_> {
                 _ => None,
             };
             if let Some(text) = text {
-                self.sources.put(text.as_bytes())?;
+                if durable {
+                    self.sources.put(text.as_bytes())?;
+                } else {
+                    self.sources.put_unsynced(text.as_bytes())?;
+                }
             }
         }
         Ok(())

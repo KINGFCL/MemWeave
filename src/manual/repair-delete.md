@@ -2,18 +2,19 @@
 
 只有用户要求删除，或者已经确认这条记忆错误且没有保留价值时才删。内容只是过时、但还有依据的，优先改而不是删。
 
-1. `based_by` 查有没有结论依据它。
+1. `revision based_by` 查有没有结论依据它。
 2. 有的话，先给它们换依据，或者一起删除。还有依据时直接删除会报 `E213`。
-3. `remove`，然后 `check`。
+3. `remove`，然后 `revision check`。
 
 这些都可以写在一段脚本里：
 
 ```memweave
-based_by borrowing
+revision based_by borrowing
 base send-sync on ownership
 unbase send-sync on borrowing
 remove borrowing
-check
+revision check
+save
 ```
 
 删除只会清掉指向它的关联，不会改写别的节点。枢纽节点删除后，可能有节点走不到，要接回去：
@@ -21,10 +22,11 @@ check
 ```memweave
 link borrowing -> drop
 remove ownership
-check
+revision check
+save
 ```
 
-## 处理 `check` 的结果
+## 处理 `revision check` 的结果
 
 | 输出 | 怎么做 |
 | --- | --- |
@@ -33,7 +35,7 @@ check
 | `原文 x 丢失或不完整` | 告诉用户可以运行 `memweave doctor`。有别的真实内容，就用 `cite` 换掉，并 `uncite` 旧的 |
 | `check: 没有问题` | 结束 |
 
-`check` 只管找不找得到，不判断内容对不对。
+`revision check` 只管找不找得到，不判断内容对不对。
 
 ## 改名
 

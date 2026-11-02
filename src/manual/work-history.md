@@ -3,15 +3,15 @@
 记忆的每次修改都由系统记下时间，你改不了。时间是 UTC。`log` 记下的内容也在上面。
 
 ```memweave
-timeline limit 20
-timeline node drop
+revision timeline limit 20
+revision timeline node drop
 ```
 
 | 想知道什么 | 怎么做 |
 | --- | --- |
-| 这条记忆什么时候写的、最后改过没有 | `show` 里的 `created` 和 `updated`。`未知` 表示系统没有记录 |
-| 这条记忆经历过什么 | `timeline node 节点` |
-| 之前做过什么、这件事做过没有 | `timeline`，没看完就按提示用 `offset` |
+| 这条记忆什么时候写的、最后改过没有 | `revision show` 里的 `created` 和 `updated`。`未知` 表示系统没有记录 |
+| 这条记忆经历过什么 | `revision timeline node 节点` |
+| 之前做过什么、这件事做过没有 | `revision timeline`，没看完就按提示用 `offset` |
 
 ## 经验
 
@@ -25,6 +25,7 @@ source mcp-trial-verifier
   text """试验输出：失败 | 空记忆开始 | 模型记了两条，校验要求只能有一个节点。"""
 end
 catalog add mcp-trial-verifier to "经验"
+save
 ```
 
 原文要用真实发生的内容，比如用户的话、工具的输出。没有真实内容就不是经验，只是猜测。

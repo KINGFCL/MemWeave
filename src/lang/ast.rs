@@ -51,8 +51,36 @@ pub enum Citation {
     Source(SourceRef),
 }
 
+/// 读语句读哪个版本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Version {
+    /// 当前草稿。没有草稿时就是已保存的版本。
+    Revision,
+    /// 已保存的版本。
+    Origin,
+}
+
+impl Version {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Version::Revision => "revision",
+            Version::Origin => "origin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    /// `revision show a` 或 `origin show a`。里面是一条读语句或 `export`。
+    Versioned(Version, Box<Statement>),
+    /// 看有没有未保存的修改，以及具体差异。可以只看一个节点。
+    RevisionDisplay(Option<Name>),
+    /// 把草稿写进日志。
+    Save,
+    /// 放弃草稿。
+    Discard,
+    // 下面这些读语句必须写在 `Versioned` 里。旧日志里还有不带前缀的写法，所以语法上接受，
+    // 重放时读语句本来就跳过；新脚本里出现时检查会报错。
     CatalogShow,
     CatalogCreate {
         name: Label,
@@ -138,7 +166,11 @@ impl Statement {
     pub fn writes(&self) -> bool {
         !matches!(
             self,
-            Statement::CatalogShow
+            Statement::Versioned(..)
+                | Statement::RevisionDisplay(_)
+                | Statement::Save
+                | Statement::Discard
+                | Statement::CatalogShow
                 | Statement::Check
                 | Statement::Show(_)
                 | Statement::Links { .. }
@@ -187,7 +219,28 @@ impl Statement {
 
     /// 只读会话能不能执行。`export` 不改图，不写日志，但会写磁盘，所以也要写权限。
     pub fn needs_write_session(&self) -> bool {
-        self.writes() || matches!(self, Statement::Export(_))
+        match self {
+            Statement::Versioned(_, inner) => inner.needs_write_session(),
+            Statement::Export(_) | Statement::Save | Statement::Discard => true,
+            _ => self.writes(),
+        }
+    }
+
+    /// 不带版本前缀的读语句。新脚本不能这样写。
+    pub fn is_bare_read(&self) -> bool {
+        matches!(
+            self,
+            Statement::CatalogShow
+                | Statement::Check
+                | Statement::Show(_)
+                | Statement::Links { .. }
+                | Statement::Evidence(_)
+                | Statement::BasedBy(_)
+                | Statement::RelatedBy(_)
+                | Statement::FullSource { .. }
+                | Statement::Export(_)
+                | Statement::Timeline { .. }
+        )
     }
 }
 

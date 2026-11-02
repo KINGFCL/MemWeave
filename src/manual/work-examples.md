@@ -7,6 +7,7 @@ goal create publish-mcp "发布 MCP 版本"
   step "升级版本号"
   step "发布"
 end
+save
 ```
 
 做完第一步，顺便记下结果。一段脚本可以写多条：
@@ -19,6 +20,7 @@ goal create g "目标"
 end
 step done g 1
 log """回归全部通过：207 个测试。"""
+save
 ```
 
 卡住、插入、去掉步骤：
@@ -32,6 +34,7 @@ end
 step block g 1 """等用户确认版本号"""
 step add g "补一份变更说明" after 1
 step remove g 2
+save
 ```
 
 用户不要了：
@@ -42,6 +45,7 @@ goal create g "目标"
   step "一"
 end
 goal drop g """用户说这个版本先不发。"""
+save
 ```
 
 还有没完成的步骤时不能结束，报 `E221`：
